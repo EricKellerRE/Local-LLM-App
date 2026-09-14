@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Local Model</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">L</span>
+          <div><strong>Local Model</strong><small>Private, on this computer</small></div>
+        </div>
+        <button id="new-chat" class="new-chat" type="button">＋ New chat</button>
+        <button id="new-task" class="new-chat" type="button">＋ Long-running task</button>
+        <div class="sidebar-label">Tasks</div>
+        <nav id="task-list" class="task-list" aria-label="Long-running tasks"></nav>
+        <div class="sidebar-label">Chats</div>
+        <nav id="chat-list" class="chat-list" aria-label="Saved chats"></nav>
+        <button id="archive-view" class="archive-view" type="button">Archived chats</button>
+        <div class="server-state"><span id="status-dot"></span><span id="status-text">Checking model…</span></div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <button id="sidebar-toggle" class="icon-button" type="button" aria-label="Toggle conversations">☰</button>
+          <div class="title-block"><h1 id="chat-title">New chat</h1><p id="model-name"></p></div>
+          <button id="start-task" class="text-button" type="button" hidden>Start</button>
+          <button id="pause-task" class="text-button" type="button" hidden>Pause</button>
+          <button id="resume-task" class="text-button" type="button" hidden>Resume</button>
+          <button id="cancel-task" class="text-button danger" type="button" hidden>Cancel</button>
+          <button id="archive-chat" class="text-button" type="button" hidden>Archive</button>
+          <button id="delete-chat" class="text-button danger" type="button" hidden>Delete</button>
+        </header>
+
+        <section id="messages" class="messages" aria-live="polite">
+          <div id="welcome" class="welcome">
+            <div class="orb">L</div>
+            <h2>What would you like to work on?</h2>
+            <p>Your chats and scratchpad stay on this computer.</p>
+          </div>
+        </section>
+
+        <section id="task-detail" class="task-detail" aria-live="polite" hidden></section>
+
+        <form id="composer" class="composer">
+          <div class="input-wrap">
+            <div class="plugin-control">
+              <button id="plugin-menu-button" class="plus-button" type="button" aria-label="Tools and plugins" aria-expanded="false">＋</button>
+              <section id="plugin-menu" class="plugin-menu" hidden>
+                <div class="plugin-menu-heading">
+                  <div><strong>Tools</strong><small>Start an MCP server for this session</small></div>
+                  <button id="add-plugin" class="add-plugin" type="button">Add plugin</button>
+                  <input id="plugin-file" type="file" accept="application/json,.json" hidden />
+                </div>
+                <div id="plugin-list" class="plugin-list"></div>
+              </section>
+            </div>
+            <textarea id="message-input" rows="1" placeholder="Message your local model" aria-label="Message"></textarea>
+            <button id="send" type="submit" aria-label="Send message">↑</button>
+          </div>
+          <p id="composer-note">Responses may take a few minutes on CPU.</p>
+        </form>
+      </main>
+    </div>
+    <dialog id="task-dialog" class="task-dialog">
+      <div class="task-dialog-heading">
+        <div><h2>Create a long-running task</h2><p>Describe the outcome. The local model will assemble a reviewable task contract.</p></div>
+        <button id="close-task-dialog" class="text-button" type="button">Close</button>
+      </div>
+      <label for="task-request">What should continue until completion?</label>
+      <textarea id="task-request" rows="6" placeholder="For example: Compile a 100-source literature review…"></textarea>
+      <div id="task-proposal" class="task-proposal" hidden></div>
+      <p id="task-dialog-status" class="dialog-status"></p>
+      <div class="dialog-actions">
+        <button id="propose-task" class="primary-button" type="button">Assemble task</button>
+        <button id="create-task" class="primary-button" type="button" hidden>Confirm and start</button>
+      </div>
+    </dialog>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

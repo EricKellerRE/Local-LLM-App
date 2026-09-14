@@ -1,0 +1,44 @@
+{
+  "manifest_version": 1,
+  "id": "grid-workshop.powerworld",
+  "tool_namespace": "grid",
+  "name": "Grid Workshop PowerWorld",
+  "version": "0.1.0",
+  "description": "Power-system study discovery and execution through the staged PowerWorld MCP surface.",
+  "enabled": true,
+  "servers": [
+    {
+      "id": "powerworld-aux",
+      "transport": "stdio",
+      "command": "${PROJECT_ROOT}/localmodel-env/python.exe",
+      "args": [
+        "-m",
+        "powerworld_aux_agent.mcp_server",
+        "--tool-server-url",
+        "http://127.0.0.1:8000"
+      ],
+      "cwd": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent",
+      "env": {
+        "PYTHONPATH": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent"
+      },
+      "timeout_seconds": 300
+    }
+  ],
+  "guidance": [
+    {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/llm_operator_guide.md", "capability": "case"},
+    {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/context_management.md", "capability": "context"},
+    {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/scenario.md", "capability": "scenario"},
+    {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/historical_tornado_batch.md", "capability": "historical"}
+  ],
+  "policy": {
+    "default_access": "ask",
+    "allow_tools": [
+      "powerworld_route_request",
+      "powerworld_get_instructions",
+      "powerworld_list_tools",
+      "powerworld_get_tool_schema"
+    ],
+    "deny_tools": [],
+    "max_calls_per_turn": 8
+  }
+}
