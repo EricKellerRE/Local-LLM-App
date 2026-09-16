@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -28,12 +29,14 @@ class DurableToolExecutor:
         router: ToolRouter,
         data_directory: Path,
         store: TaskStore,
+        inference_lock: asyncio.Lock,
     ) -> None:
         self.model = model
         self.manager = manager
         self.router = router
         self.data_directory = data_directory
         self.store = store
+        self.inference_lock = inference_lock
 
     @staticmethod
     def _completed_context(items: list[dict[str, Any]]) -> str:
@@ -112,7 +115,11 @@ class DurableToolExecutor:
             "assumptions, and errors in the answer. Do not claim the completion check passed without evidence.\n\n"
             f"Previously completed checkpoints:\n{self._completed_context(completed_items)}"
         )
-        answer = await coordinator.respond(prompt, [], plugin_ids)
+        # Transformers generation is not safe to run concurrently. Durable work uses the
+        # same lock as ordinary chat, planning, and synthesis so foreground requests cannot
+        # race a background tool turn and shutdown can accurately report in-flight work.
+        async with self.inference_lock:
+            answer = await coordinator.respond(prompt, [], plugin_ids)
         lowered = answer.lower()
         if "approval is required" in lowered:
             self._attach_task_to_approval(activity_path, task["id"], item["id"])

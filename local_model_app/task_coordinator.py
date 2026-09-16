@@ -66,6 +66,104 @@ class ModelTaskCoordinator:
         self.generate = generate
         self.capability_catalog = capability_catalog
 
+    @staticmethod
+    def _research_work_items() -> list[ProposedWorkItem]:
+        evidence_items = [
+            ProposedWorkItem(
+                key="source-map",
+                kind="tool",
+                title="Map authoritative and primary sources",
+                instructions=(
+                    "Search broadly for authoritative reviews and landmark or recent primary studies directly "
+                    "relevant to the goal. Open the strongest sources, record exact URLs, publication details, "
+                    "study systems, and which questions each source can support. Prefer primary literature and "
+                    "authoritative institutional or scholarly sources over summaries."
+                ),
+                completion_check="A diverse source map with exact URLs and relevance notes is recorded.",
+                priority=20,
+            ),
+            ProposedWorkItem(
+                key="core-findings",
+                kind="tool",
+                title="Research the core findings and mechanisms",
+                instructions=(
+                    "Research the central claims, mechanisms, or explanations in the goal using primary and "
+                    "authoritative sources. Capture causal versus correlational evidence, relevant timescales and "
+                    "populations or study systems, competing interpretations, and exact URLs; distinguish established "
+                    "findings from inference."
+                ),
+                completion_check="The core findings are supported by traceable source evidence.",
+                priority=15,
+                depends_on=["source-map"],
+            ),
+            ProposedWorkItem(
+                key="requested-dimensions",
+                kind="tool",
+                title="Research every requested dimension and comparison",
+                instructions=(
+                    "Extract every distinct dimension, level, stage, population, comparison, or sub-question named "
+                    "in the goal. Research each one and its relationships to the others, preserving exact URLs and "
+                    "the evidence supporting every material distinction."
+                ),
+                completion_check="Every explicitly requested dimension and comparison has supporting evidence.",
+                priority=14,
+                depends_on=["source-map"],
+            ),
+            ProposedWorkItem(
+                key="boundary-conditions",
+                kind="tool",
+                title="Establish scope, chronology, and boundary conditions",
+                instructions=(
+                    "Research the scope, chronology, definitions, prerequisites, and boundary conditions relevant to "
+                    "the goal. Clearly distinguish stages or categories requested by the user and record where results "
+                    "do or do not generalize, with exact source URLs."
+                ),
+                completion_check="Scope, chronology, definitions, and boundary conditions are evidenced and distinct.",
+                priority=13,
+                depends_on=["source-map"],
+            ),
+            ProposedWorkItem(
+                key="methods-evidence",
+                kind="tool",
+                title="Compare techniques and strength of evidence",
+                instructions=(
+                    "Research the major experimental, analytical, or investigative techniques used to establish the "
+                    "findings in the goal. Compare what each technique can and cannot establish, important confounds "
+                    "and generalization limits, and representative primary evidence with exact URLs."
+                ),
+                completion_check="Techniques are compared by causal reach, limitations, and representative evidence.",
+                priority=12,
+                depends_on=["source-map"],
+            ),
+            ProposedWorkItem(
+                key="disagreements-gaps",
+                kind="tool",
+                title="Identify disagreements, limitations, and open gaps",
+                instructions=(
+                    "Search specifically for unresolved controversies, failed replications or boundary conditions, "
+                    "methodological limitations, missing cross-scale explanations, and current research gaps. Record "
+                    "which conclusions are source evidence versus synthesis and preserve exact URLs."
+                ),
+                completion_check="Material disagreements, limitations, and open questions are documented with sources.",
+                priority=11,
+                depends_on=["source-map"],
+            ),
+        ]
+        return [
+            *evidence_items,
+            ProposedWorkItem(
+                key="synthesis",
+                kind="synthesis",
+                title="Write the complete research report",
+                instructions=(
+                    "Synthesize all recorded evidence into the requested standalone report, with conclusions, "
+                    "techniques, disagreements, limitations, gaps, and exact inline source URLs."
+                ),
+                completion_check="A complete, traceable report addresses every success criterion.",
+                depends_on=[item.key for item in evidence_items if item.key],
+            ),
+        ]
+
     async def propose(self, request: str) -> TaskDefinition:
         prompt = (
             "Convert the user's request into a durable long-running task definition. "
@@ -86,6 +184,8 @@ class ModelTaskCoordinator:
         metadata = definition.get("metadata") or {}
         if metadata.get("mode") == "durable_tools":
             plugin_ids = [str(value) for value in metadata.get("plugin_ids") or []]
+            if plugin_ids == ["local.web-research"]:
+                return self._research_work_items()
             capabilities = (
                 await self.capability_catalog(plugin_ids)
                 if self.capability_catalog is not None and plugin_ids

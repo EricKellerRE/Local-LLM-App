@@ -166,8 +166,9 @@ class Runtime:
                     self.tool_router,
                     self.paths.data_directory,
                     self.tasks,
+                    self._inference_lock,
                 ),
-                "synthesis": DurableSynthesisExecutor(self.task_generate),
+                "synthesis": DurableSynthesisExecutor(self.task_synthesize),
             },
             on_status=self.deliver_task_status,
             poll_seconds=float(os.getenv("LOCAL_TASK_POLL_SECONDS", "5")),
@@ -230,7 +231,28 @@ class Runtime:
     async def task_generate(self, messages: list[dict[str, Any]]) -> str:
         async with self._inference_lock:
             await self.ensure_loaded()
-            return await asyncio.to_thread(self.model.generate, messages)
+            settings = self.model.settings
+            planner_budget = min(
+                settings.max_new_tokens,
+                max(1024, settings.tool_action_max_new_tokens),
+            )
+            return await asyncio.to_thread(
+                self.model.generate,
+                messages,
+                max_new_tokens=planner_budget,
+                temperature=settings.tool_temperature,
+            )
+
+    @tracked_activity("a final report is being written")
+    async def task_synthesize(self, messages: list[dict[str, Any]]) -> str:
+        async with self._inference_lock:
+            await self.ensure_loaded()
+            return await asyncio.to_thread(
+                self.model.generate,
+                messages,
+                max_new_tokens=self.model.settings.max_new_tokens,
+                temperature=self.model.settings.temperature,
+            )
 
     async def task_capability_catalog(self, plugin_ids: list[str]) -> list[dict[str, Any]]:
         await self.mcp.ensure_started(plugin_ids)

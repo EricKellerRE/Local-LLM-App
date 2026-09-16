@@ -1,5 +1,7 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from pydantic import ValidationError
 
@@ -7,6 +9,33 @@ from local_model_app.server import Runtime, SettingsUpdateRequest
 
 
 class RuntimePluginRequestTests(unittest.TestCase):
+    def test_task_planning_and_report_synthesis_use_separate_budgets(self) -> None:
+        calls = []
+
+        class FakeModel:
+            settings = SimpleNamespace(
+                max_new_tokens=8192,
+                tool_action_max_new_tokens=1024,
+                tool_temperature=0.0,
+                temperature=0.7,
+            )
+
+            def generate(self, messages, **kwargs):
+                calls.append(kwargs)
+                return "ok"
+
+        runtime = Runtime.__new__(Runtime)
+        runtime.model = FakeModel()
+        runtime._inference_lock = asyncio.Lock()
+        runtime._active_operations = {}
+        runtime.ensure_loaded = AsyncMock()
+
+        asyncio.run(runtime.task_generate([{"role": "user", "content": "plan"}]))
+        asyncio.run(runtime.task_synthesize([{"role": "user", "content": "report"}]))
+
+        self.assertEqual(calls[0], {"max_new_tokens": 1024, "temperature": 0.0})
+        self.assertEqual(calls[1], {"max_new_tokens": 8192, "temperature": 0.7})
+
     def test_specific_mcp_name_is_detected_in_chat_request(self) -> None:
         runtime = Runtime.__new__(Runtime)
         manifest = SimpleNamespace(

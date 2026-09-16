@@ -71,6 +71,25 @@ class TaskCoordinatorTests(unittest.TestCase):
         self.assertEqual([item.kind for item in items], ["tool", "synthesis"])
         self.assertIn("grid__case_overview", generator.messages[1]["content"])
 
+    def test_web_research_uses_fast_deterministic_evidence_plan(self) -> None:
+        generator = SequencedGenerator([])
+        coordinator = ModelTaskCoordinator(generator)
+        task = {"definition": {
+            "goal": "Research long-term memory formation and maintenance",
+            "success_criteria": ["A sourced report is complete"],
+            "metadata": {"mode": "durable_tools", "plugin_ids": ["local.web-research"]},
+        }}
+
+        items = asyncio.run(coordinator.plan_task(task))
+
+        self.assertEqual(len(items), 7)
+        self.assertEqual(items[-1].kind, "synthesis")
+        self.assertEqual(
+            set(items[-1].depends_on),
+            {item.key for item in items[:-1]},
+        )
+        self.assertEqual(generator.replies, [])
+
 
 if __name__ == "__main__":
     unittest.main()
