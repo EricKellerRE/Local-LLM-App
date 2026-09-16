@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,16 @@ class GuidanceDocument(BaseModel):
     capability: str | None = None
 
 
+@dataclass(frozen=True)
+class LoadedGuidance:
+    plugin_id: str
+    capability: str | None
+    path: str
+    version: str
+    content: str
+    truncated: bool
+
+
 class McpPluginManifest(BaseModel):
     manifest_version: Literal[1]
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]*$")
@@ -92,6 +103,8 @@ class DiscoveredTool:
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None
     annotations: dict[str, Any]
+    kind: Literal["tool", "resource", "resource_template", "prompt"] = "tool"
+    target: str | None = None
 
     def openai_spec(self) -> dict[str, Any]:
         return {
@@ -123,6 +136,74 @@ def _safe_tool_name(namespace: str, tool_name: str) -> str:
 
     suffix = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
     return f"{value[:53]}_{suffix}"
+
+
+def _uri_template_pattern(template: str) -> str:
+    """Build a conservative JSON Schema pattern for common RFC 6570 templates."""
+    pattern = "^"
+    for part in re.split(r"(\{[^{}]+\})", template):
+        if not part:
+            continue
+        if not part.startswith("{"):
+            pattern += re.escape(part)
+            continue
+        expression = part[1:-1]
+        operator = expression[:1]
+        if operator == "?":
+            pattern += r"(?:\?[^#]*)?"
+        elif operator == "&":
+            pattern += r"(?:&[^#]*)?"
+        elif operator == "#":
+            pattern += r"(?:#.*)?"
+        else:
+            pattern += r".+?"
+    return pattern + "$"
+
+
+def normalize_tool_result(tool: DiscoveredTool, result: Any) -> dict[str, Any]:
+    """Serialize a native result and quarantine malformed structured output."""
+    content = [item.model_dump(mode="json", by_alias=True, exclude_none=True) for item in result.content]
+    structured = result.structured_content
+    serialized = {
+        "content": content,
+        "structuredContent": structured,
+        "isError": bool(result.is_error),
+    }
+    if tool.output_schema is None:
+        return serialized
+
+    from jsonschema import Draft202012Validator, SchemaError
+
+    try:
+        Draft202012Validator.check_schema(tool.output_schema)
+        errors = list(Draft202012Validator(tool.output_schema).iter_errors(structured))
+    except SchemaError as exc:
+        return {
+            "content": [],
+            "structuredContent": None,
+            "isError": True,
+            "error": "invalid_output_schema",
+            "message": f"The MCP server advertised an invalid output schema: {exc.message[:500]}",
+            "rawResult": serialized,
+        }
+    if not errors:
+        return serialized
+    details = [
+        {
+            "path": "/".join(str(part) for part in error.absolute_path),
+            "message": error.message[:500],
+        }
+        for error in errors[:5]
+    ]
+    return {
+        "content": [],
+        "structuredContent": None,
+        "isError": True,
+        "error": "output_validation_failed",
+        "message": "The MCP tool returned structured content that does not match its output schema.",
+        "validationErrors": details,
+        "rawResult": serialized,
+    }
 
 
 class McpPluginRegistry:
@@ -208,10 +289,17 @@ class McpPluginRegistry:
         for plugin in self.enabled_plugins():
             for server in plugin.manifest.servers:
                 async with self.connect(server) as client:
-                    server_tools = await self.discover_connected_tools(plugin, server, client)
-                    for tool in server_tools:
+                    capabilities = getattr(client, "server_capabilities", None)
+                    server_items: list[DiscoveredTool] = []
+                    if capabilities is None or getattr(capabilities, "tools", None) is not None:
+                        server_items.extend(await self.discover_connected_tools(plugin, server, client))
+                    if capabilities is not None and getattr(capabilities, "resources", None) is not None:
+                        server_items.extend(await self.discover_connected_resources(plugin, server, client))
+                    if capabilities is not None and getattr(capabilities, "prompts", None) is not None:
+                        server_items.extend(await self.discover_connected_prompts(plugin, server, client))
+                    for tool in server_items:
                         if tool.exposed_name in names:
-                            raise PluginConfigurationError(f"Exposed MCP tool-name collision: {tool.exposed_name}")
+                            raise PluginConfigurationError(f"Exposed MCP capability-name collision: {tool.exposed_name}")
                         names.add(tool.exposed_name)
                         discovered.append(tool)
         return discovered
@@ -234,12 +322,151 @@ class McpPluginRegistry:
                         description=tool.description or "",
                         input_schema=tool.input_schema,
                         output_schema=tool.output_schema,
-                        annotations=tool.annotations.model_dump(exclude_none=True) if tool.annotations else {},
+                        annotations=(
+                            tool.annotations.model_dump(by_alias=True, exclude_none=True)
+                            if tool.annotations else {}
+                        ),
                     )
                 )
             cursor = result.next_cursor
             if not cursor:
                 return tools
+
+    async def discover_connected_resources(
+        self, plugin: LoadedPlugin, server: McpServerConfig, client: Any
+    ) -> list[DiscoveredTool]:
+        resources: list[DiscoveredTool] = []
+        cursor: str | None = None
+        while True:
+            result = await client.list_resources(cursor=cursor)
+            for resource in result.resources:
+                native_name = f"resource:{resource.name}"
+                resources.append(DiscoveredTool(
+                    exposed_name=_safe_tool_name(plugin.manifest.tool_namespace, native_name),
+                    plugin_id=plugin.manifest.id,
+                    server_id=server.id,
+                    native_name=native_name,
+                    title=resource.title or resource.name,
+                    description=resource.description or f"Read MCP resource {resource.uri}",
+                    input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                    output_schema=None,
+                    annotations={"readOnlyHint": True},
+                    kind="resource",
+                    target=str(resource.uri),
+                ))
+            cursor = result.next_cursor
+            if not cursor:
+                break
+
+        cursor = None
+        while True:
+            result = await client.list_resource_templates(cursor=cursor)
+            for template in result.resource_templates:
+                native_name = f"resource_template:{template.name}"
+                resources.append(DiscoveredTool(
+                    exposed_name=_safe_tool_name(plugin.manifest.tool_namespace, native_name),
+                    plugin_id=plugin.manifest.id,
+                    server_id=server.id,
+                    native_name=native_name,
+                    title=template.title or template.name,
+                    description=(template.description or "Read an MCP resource") + f" URI template: {template.uri_template}",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "uri": {
+                                "type": "string",
+                                "pattern": _uri_template_pattern(str(template.uri_template)),
+                                "description": f"URI matching {template.uri_template}",
+                            },
+                        },
+                        "required": ["uri"],
+                        "additionalProperties": False,
+                    },
+                    output_schema=None,
+                    annotations={"readOnlyHint": True},
+                    kind="resource_template",
+                    target=str(template.uri_template),
+                ))
+            cursor = result.next_cursor
+            if not cursor:
+                return resources
+
+    async def discover_connected_prompts(
+        self, plugin: LoadedPlugin, server: McpServerConfig, client: Any
+    ) -> list[DiscoveredTool]:
+        prompts: list[DiscoveredTool] = []
+        cursor: str | None = None
+        while True:
+            result = await client.list_prompts(cursor=cursor)
+            for prompt in result.prompts:
+                properties: dict[str, Any] = {}
+                required: list[str] = []
+                for argument in prompt.arguments or []:
+                    properties[argument.name] = {
+                        "type": "string",
+                        "description": argument.description or argument.title or "Prompt argument",
+                    }
+                    if argument.required:
+                        required.append(argument.name)
+                native_name = f"prompt:{prompt.name}"
+                schema: dict[str, Any] = {
+                    "type": "object",
+                    "properties": properties,
+                    "additionalProperties": False,
+                }
+                if required:
+                    schema["required"] = required
+                prompts.append(DiscoveredTool(
+                    exposed_name=_safe_tool_name(plugin.manifest.tool_namespace, native_name),
+                    plugin_id=plugin.manifest.id,
+                    server_id=server.id,
+                    native_name=native_name,
+                    title=prompt.title or prompt.name,
+                    description=prompt.description or f"Render MCP prompt {prompt.name}",
+                    input_schema=schema,
+                    output_schema=None,
+                    annotations={"readOnlyHint": True},
+                    kind="prompt",
+                    target=prompt.name,
+                ))
+            cursor = result.next_cursor
+            if not cursor:
+                return prompts
+
+    def guidance_for_tools(
+        self,
+        tools: list[DiscoveredTool],
+        *,
+        max_documents: int = 2,
+        max_chars_per_document: int = 6000,
+    ) -> list[LoadedGuidance]:
+        selected: list[LoadedGuidance] = []
+        seen_paths: set[Path] = set()
+        for tool in tools:
+            plugin = self.get_plugin(tool.plugin_id)
+            searchable = re.sub(r"[^a-z0-9]+", " ", f"{tool.native_name} {tool.description}".lower()).split()
+            for document in plugin.manifest.guidance:
+                capability = document.capability.lower() if document.capability else None
+                if capability and capability not in searchable:
+                    continue
+                expanded = Path(_expand_string(document.path, self.variables)).resolve()
+                if expanded in seen_paths or not expanded.is_file():
+                    continue
+                raw = expanded.read_text(encoding="utf-8")
+                digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+                selected.append(LoadedGuidance(
+                    plugin_id=tool.plugin_id,
+                    capability=document.capability,
+                    path=str(expanded),
+                    version=f"sha256:{digest}",
+                    content=raw[:max_chars_per_document],
+                    truncated=len(raw) > max_chars_per_document,
+                ))
+                seen_paths.add(expanded)
+                if len(selected) >= max_documents:
+                    return selected
+        return selected
+
 
     async def call_tool(
         self,
@@ -262,9 +489,32 @@ class McpPluginRegistry:
             raise PermissionError(f"Tool requires user approval: {tool.native_name}")
         server = next(item for item in plugin.manifest.servers if item.id == tool.server_id)
         async with self.connect(server) as client:
+            if tool.kind in {"resource", "resource_template"}:
+                uri = tool.target if tool.kind == "resource" else arguments["uri"]
+                result = await client.read_resource(uri)
+                return {
+                    "content": [],
+                    "structuredContent": {
+                        "uri": uri,
+                        "contents": [
+                            item.model_dump(mode="json", by_alias=True, exclude_none=True)
+                            for item in result.contents
+                        ],
+                    },
+                    "isError": False,
+                }
+            if tool.kind == "prompt":
+                result = await client.get_prompt(tool.target or "", arguments or None)
+                return {
+                    "content": [],
+                    "structuredContent": {
+                        "description": result.description,
+                        "messages": [
+                            item.model_dump(mode="json", by_alias=True, exclude_none=True)
+                            for item in result.messages
+                        ],
+                    },
+                    "isError": False,
+                }
             result = await client.call_tool(tool.native_name, arguments)
-        return {
-            "content": [item.model_dump(exclude_none=True) for item in result.content],
-            "structuredContent": result.structured_content,
-            "isError": bool(result.is_error),
-        }
+        return normalize_tool_result(tool, result)

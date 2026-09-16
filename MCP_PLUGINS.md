@@ -39,11 +39,13 @@ Tool annotations such as read-only, destructive, idempotent, and open-world are 
 
 1. Validate enabled manifests and resolve `${VARIABLE}` references in memory.
 2. Connect with the official MCP client and negotiate the protocol.
-3. Retrieve every page of `tools/list`.
-4. Namespace tools and expose only the planner-relevant subset.
-5. Validate proposed arguments against the advertised JSON Schema.
-6. Apply the host permission policy.
-7. Call the native tool and return `content`, `structuredContent`, and `isError`.
+3. Retrieve every page of `tools/list`, plus advertised resources, resource templates, and prompts.
+4. Store the complete catalog internally. Rank compact names, titles, and descriptions with a hybrid lexical/semantic router, then place only the four highest-ranked entries and schemas in model context initially. The sentence encoder runs locally, caches catalog vectors, and falls back to lexical routing if its optional weights are unavailable.
+5. Expand the candidate schema set in bounded batches when routing confidence is low.
+6. Namespace every callable capability and validate proposed arguments against its JSON Schema.
+7. Apply the host permission policy and per-turn call budget outside the model.
+8. Validate advertised tool outputs with JSON Schema 2020-12, retain malformed raw results in the audit log, and quarantine them from model context.
+9. Bound observations before model context, omit encoded binary payloads, and include deterministic truncation metadata.
 
 Stateful servers should return explicit case, session, or job handles and require those handles on later calls. The planner records handles in its scratchpad rather than depending on hidden connection state.
 
@@ -53,6 +55,14 @@ The composer `+` menu lists installed plugins, reports connection errors, and sh
 
 `Add plugin` imports a user-selected JSON manifest but does not start its processes automatically. The Grid Workshop plugin is installed and stopped by default. Archived chats retain their plugin selections, scratchpad, and tool activity in the compressed record, and restoration recovers all three.
 
-Each tool-enabled response writes a plan and an append-only activity log under `data/`. Arguments are schema-validated and checked against the manifest policy before execution. Tools covered by a plugin's `default_access: ask` policy are blocked until an approval interaction is added; the planner cannot bypass that boundary.
+Each tool-enabled response writes a plan and an append-only activity log under `data/`. Arguments are schema-validated and checked against the manifest policy before execution. Tools covered by a plugin's `default_access: ask` policy stop at a visible approval card. Approval displays the exact tool and arguments, is consumed once, calls with `approved=True`, and returns the observation to the model before final composition. MCP annotations are retained with their protocol aliases but never grant authority.
 
-For staged discovery surfaces, the coordinator treats explicit route/list/schema responses as protocol. It automatically performs an unambiguous next discovery call, asks the model only when a semantic choice remains, and exposes the smallest relevant tool set for that choice. When structured content is present, duplicate textual content is retained in the audit log but omitted from the next model prompt. Missing required schema inputs and approval requirements become explicit waiting responses instead of additional speculative model turns.
+Standard MCP tools, resources, and prompts remain distinct. Only tools enter model-selected function schemas. Resources are application-selected and prompts are user-selected through the explicit `/api/chats/{chat_id}/mcp-content` boundary. Static resources take no arguments, resource templates accept a validated matching `uri`, and prompts accept their advertised string arguments. The same manifest policy applies to their synthetic native names (`resource:<name>`, `resource_template:<name>`, and `prompt:<name>`).
+
+After routing, the host reads at most two manifest guidance documents whose capability labels match the routed tools. Each document is content-bounded and its resolved path, SHA-256 version, capability, and truncation status are recorded in the activity log.
+
+`LOCAL_ROUTER_MODEL_ID` selects the local Hugging Face sentence encoder and defaults to `sentence-transformers/all-MiniLM-L6-v2`; set it to an empty value for lexical-only routing. `LOCAL_ROUTER_DEVICE` defaults to CPU so routing does not consume the main generator's GPU allocation. The PowerWorld golden set records semantic cold-start and warm median/p95 latency alongside recall and abstention.
+
+`config/mcp.d/mcp-everything.json` registers the official MCP Everything reference server with `default_access: ask`. `scripts/mcp_everything_smoke.py` provides an unrelated interoperability check covering ordinary tool, resource, and prompt discovery, semantic schema routing, permission override at an explicit test boundary, and result handling.
+
+For staged discovery surfaces, the coordinator can treat explicit route/list/schema responses as an optional optimization. It automatically performs an unambiguous next discovery call, asks the model only when a semantic choice remains, and exposes the smallest relevant tool set for that choice. Servers do not need to implement this protocol: ordinary `tools/list` catalogs use the host's generic metadata router. When structured content is present, duplicate textual content is retained in the audit log but omitted from the next model prompt. Missing required schema inputs and approval requirements become explicit waiting responses instead of additional speculative model turns.

@@ -63,6 +63,12 @@ button { color: inherit; }
 @keyframes pulse { to { opacity: .2; transform: scale(.7); } }
 
 .composer { padding: 14px max(24px, calc((100% - 820px) / 2)) 22px; }
+.approval-panel { margin: 0 max(24px, calc((100% - 820px) / 2)); padding: 14px 16px; border: 1px solid #675d32; border-radius: 13px; background: #28261a; display: flex; align-items: flex-end; gap: 18px; }
+.approval-panel[hidden] { display: none; }
+.approval-panel > div:first-child { flex: 1; min-width: 0; }
+.approval-panel p { color: var(--muted); margin: 4px 0 8px; }
+.approval-panel pre { max-height: 180px; margin: 0; padding: 10px; overflow: auto; border-radius: 8px; background: #171811; color: #d9dbd2; white-space: pre-wrap; word-break: break-word; }
+.approval-actions { display: flex; gap: 9px; flex-shrink: 0; }
 .input-wrap { display: flex; align-items: flex-end; gap: 10px; background: var(--panel-2); border: 1px solid #383a32; border-radius: 18px; padding: 11px 11px 11px 17px; box-shadow: 0 12px 35px #0005; }
 .plugin-control { position: relative; }
 .plus-button { border: 0; width: 34px; height: 34px; border-radius: 10px; background: transparent; color: var(--muted); font-size: 23px; cursor: pointer; }
@@ -129,5 +135,6 @@ textarea::placeholder { color: #85887e; }
   .shell.sidebar-open .sidebar { transform: translateX(0); }
   .icon-button { display: block; }
   .messages, .composer, .task-detail { padding-left: 18px; padding-right: 18px; }
+  .approval-panel { margin-left: 18px; margin-right: 18px; flex-direction: column; align-items: stretch; }
   .bubble { max-width: 90%; }
 }

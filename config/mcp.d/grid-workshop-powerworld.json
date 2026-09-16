@@ -4,7 +4,7 @@
   "tool_namespace": "grid",
   "name": "Grid Workshop PowerWorld",
   "version": "0.1.0",
-  "description": "Power-system study discovery and execution through the staged PowerWorld MCP surface.",
+  "description": "Power-system study discovery and execution through the standard PowerWorld MCP tool catalog.",
   "enabled": true,
   "servers": [
     {
@@ -26,17 +26,28 @@
   ],
   "guidance": [
     {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/llm_operator_guide.md", "capability": "case"},
-    {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/context_management.md", "capability": "context"},
-    {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/scenario.md", "capability": "scenario"},
+    {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/context_management.md", "capability": "session"},
+    {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/scenario.md", "capability": "tornado"},
     {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/historical_tornado_batch.md", "capability": "historical"}
   ],
   "policy": {
     "default_access": "ask",
     "allow_tools": [
-      "powerworld_route_request",
-      "powerworld_get_instructions",
-      "powerworld_list_tools",
-      "powerworld_get_tool_schema"
+      "regulatory.list_tests",
+      "case.list_object_fields",
+      "case.search_object_fields",
+      "case.overview",
+      "case.list_voltage_levels",
+      "case.top_generators",
+      "case.top_loads",
+      "case.area_zone_summary",
+      "case.top_branches",
+      "case.overload_summary",
+      "session.fetch_rows",
+      "historical.read_batch_manifest",
+      "jobs.get_status",
+      "results.summarize_artifact",
+      "results.inspect_artifact"
     ],
     "deny_tools": [],
     "max_calls_per_turn": 8

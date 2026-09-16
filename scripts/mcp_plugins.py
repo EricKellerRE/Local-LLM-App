@@ -31,11 +31,12 @@ async def run(command: str, *, tool_name: str | None = None, arguments: str = "{
         json.dumps(
             {
                 "plugins": len(registry.enabled_plugins()),
-                "tools": len(tools),
+                "capabilities": len(tools),
                 "catalog": [
                     {
                         "exposed_name": tool.exposed_name,
                         "native_name": tool.native_name,
+                        "kind": tool.kind,
                         "plugin": tool.plugin_id,
                         "server": tool.server_id,
                     }

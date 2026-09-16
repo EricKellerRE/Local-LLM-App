@@ -27,10 +27,11 @@ function renderPlugins() {
     return;
   }
   list.innerHTML = state.plugins.map((plugin) => {
+    const capabilityCount = plugin.tool_count + (plugin.resource_count || 0) + (plugin.prompt_count || 0);
     const detail = plugin.selected && plugin.status === "running"
-      ? `Enabled here · ${plugin.tool_count} tools ready`
+      ? `Enabled here · ${capabilityCount} capabilities ready`
       : plugin.status === "running"
-        ? `${plugin.tool_count} tools ready for another chat`
+        ? `${capabilityCount} capabilities ready for another chat`
         : plugin.error || `${plugin.server_count} server${plugin.server_count === 1 ? "" : "s"} · stopped`;
     return `<div class="plugin-row"><div><strong>${escapeHtml(plugin.name)}</strong><small class="${plugin.error ? "plugin-error" : ""}">${escapeHtml(detail)}</small></div><label class="switch" title="${plugin.selected ? "Disable" : "Enable"} ${escapeHtml(plugin.name)} for this chat"><input type="checkbox" data-plugin-id="${escapeHtml(plugin.id)}" ${plugin.selected ? "checked" : ""} ${state.pluginBusy === plugin.id || state.currentArchived ? "disabled" : ""}><span></span></label></div>`;
   }).join("");
@@ -112,6 +113,40 @@ function renderMessages(messages) {
   el("messages").scrollTop = el("messages").scrollHeight;
 }
 
+function renderApproval(approval) {
+  const panel = el("approval-panel");
+  if (!approval || approval.status !== "waiting_for_approval") {
+    panel.hidden = true;
+    panel.innerHTML = "";
+    return;
+  }
+  const argumentsText = JSON.stringify(approval.arguments || {}, null, 2);
+  panel.innerHTML = `<div><strong>Tool approval required</strong><p>${escapeHtml(approval.tool)}</p><pre>${escapeHtml(argumentsText)}</pre></div><div class="approval-actions"><button id="deny-tool" class="text-button" type="button">Deny</button><button id="approve-tool" class="primary-button" type="button">Approve once</button></div>`;
+  panel.hidden = false;
+  el("approve-tool").addEventListener("click", () => resolveApproval("approve"));
+  el("deny-tool").addEventListener("click", () => resolveApproval("deny"));
+}
+
+async function loadApproval() {
+  if (!state.chatId || state.currentArchived) return renderApproval(null);
+  renderApproval(await api(`/api/chats/${state.chatId}/approval`));
+}
+
+async function resolveApproval(action) {
+  if (!state.chatId || state.busy) return;
+  setBusy(true);
+  try {
+    await api(`/api/chats/${state.chatId}/approval/${action}`, { method: "POST" });
+    await openChat(state.chatId, { force: true });
+    await loadChats();
+  } catch (error) {
+    window.alert(`Could not ${action} this tool call: ${error.message}`);
+    await loadApproval().catch(() => {});
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function loadChats() {
   state.chats = await api(`/api/chats?archived=${state.showArchived}`);
   el("archive-view").textContent = state.showArchived ? "← Active chats" : "Archived chats";
@@ -147,6 +182,7 @@ async function openChat(chatId, { force = false } = {}) {
   el("composer").hidden = false;
   el("task-detail").hidden = true;
   renderMessages(chat.messages);
+  await loadApproval();
   renderChats();
   await loadPlugins();
   updateComposerState();
@@ -185,6 +221,7 @@ async function openTask(taskId) {
   el("messages").hidden = true;
   el("composer").hidden = true;
   el("task-detail").hidden = false;
+  renderApproval(null);
   taskControls(task);
   renderTaskDetail(task);
   renderTasks();
@@ -259,6 +296,7 @@ function showEmptyState() {
   el("archive-chat").hidden = true;
   el("delete-chat").hidden = true;
   renderMessages([]);
+  renderApproval(null);
   loadPlugins().catch(() => {});
   updateComposerState();
 }

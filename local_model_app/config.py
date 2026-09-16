@@ -31,6 +31,9 @@ class Settings:
     tool_action_max_new_tokens: int
     tool_final_max_new_tokens: int
     tool_temperature: float
+    router_model_id: str
+    router_device: str
+    router_semantic_weight: float
     trust_remote_code: bool
 
     @classmethod
@@ -50,5 +53,11 @@ class Settings:
             tool_action_max_new_tokens=int(os.getenv("LOCAL_TOOL_ACTION_MAX_NEW_TOKENS", "96")),
             tool_final_max_new_tokens=int(os.getenv("LOCAL_TOOL_FINAL_MAX_NEW_TOKENS", "256")),
             tool_temperature=float(os.getenv("LOCAL_TOOL_TEMPERATURE", "0")),
+            router_model_id=os.getenv(
+                "LOCAL_ROUTER_MODEL_ID",
+                "sentence-transformers/all-MiniLM-L6-v2",
+            ).strip(),
+            router_device=os.getenv("LOCAL_ROUTER_DEVICE", "cpu").strip().lower(),
+            router_semantic_weight=float(os.getenv("LOCAL_ROUTER_SEMANTIC_WEIGHT", "36")),
             trust_remote_code=os.getenv("LOCAL_MODEL_TRUST_REMOTE_CODE", "false").lower() in {"1", "true", "yes"},
         )

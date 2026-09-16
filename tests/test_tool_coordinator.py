@@ -63,6 +63,24 @@ class ToolCoordinatorTests(unittest.TestCase):
         }
         self.assertEqual(_compact_result(result), {"isError": False, "data": {"ok": True, "capability": "scenario"}})
 
+    def test_compact_result_omits_binary_payloads_and_bounds_large_data(self) -> None:
+        binary = _compact_result({
+            "isError": False,
+            "structuredContent": {
+                "contents": [{"uri": "file://plot.png", "mimeType": "image/png", "blob": "A" * 1000}],
+            },
+        })
+        large = _compact_result({
+            "isError": False,
+            "structuredContent": {"rows": ["x" * 1000 for _ in range(100)]},
+        })
+
+        content = binary["data"]["contents"][0]
+        self.assertNotIn("blob", content)
+        self.assertTrue(content["payloadOmitted"])
+        self.assertTrue(large["data"]["truncated"])
+        self.assertEqual(large["truncation"]["strategy"], "deterministic_json_preview")
+
     def test_copied_windows_path_underscore_escape_is_repaired_only_if_it_exists(self) -> None:
         copied = r"E:\Data\Tornado\_Tracks\_1.csv"
         with patch("local_model_app.tool_coordinator.Path.exists", return_value=True):
@@ -94,7 +112,7 @@ class ToolCoordinatorTests(unittest.TestCase):
             self.assertEqual([name for name, _ in manager.calls], [route.exposed_name, list_tools.exposed_name, get_schema.exposed_name])
             self.assertEqual(model.chat_calls, [])
             events = [json.loads(line)["event"] for line in activity.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(events, ["plan", "tool_call", "tool_result", "tool_call", "tool_result", "tool_call", "tool_result", "waiting_for_input"])
+            self.assertEqual(events, ["plan", "tool_routing", "tool_call", "tool_result", "tool_call", "tool_result", "tool_call", "tool_result", "waiting_for_input"])
 
     def test_generic_tool_call_is_observed_before_answer(self) -> None:
         tool = make_tool("lookup", required=["query"])
@@ -114,6 +132,34 @@ class ToolCoordinatorTests(unittest.TestCase):
         self.assertEqual(model.chat_calls[0]["max_new_tokens"], 192)
         tool_message = next(message for message in model.chat_calls[1]["messages"] if message["role"] == "tool")
         self.assertNotIn("duplicate", tool_message["content"])
+
+    def test_generic_router_exposes_only_top_schema_batch(self) -> None:
+        weather = make_tool("weather_forecast", required=["city"])
+        tools = [weather] + [make_tool(name) for name in (
+            "calendar_events", "invoice_lookup", "repository_search", "send_email", "customer_record",
+        )]
+        model = FakeModel([
+            AssistantReply(content="", tool_calls=[{
+                "id": "call_weather", "type": "function",
+                "function": {"name": weather.exposed_name, "arguments": '{"city":"Chicago"}'},
+            }]),
+            AssistantReply(content="Rain is expected.", tool_calls=[]),
+        ])
+        manager = FakeManager(tools, {weather.exposed_name: {
+            "isError": False, "structuredContent": {"forecast": "rain"},
+        }})
+
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            coordinator = ToolCoordinator(
+                model, manager, Scratchpad(root / "scratchpad.jsonl"), root / "activity.jsonl",
+            )
+            answer = asyncio.run(coordinator.respond("Show the Chicago weather forecast", [], ["grid.plugin"]))
+
+        first_specs = model.chat_calls[0]["tools"]
+        self.assertEqual(answer, "Rain is expected.")
+        self.assertEqual(len(first_specs), 4)
+        self.assertIn(weather.exposed_name, [item["function"]["name"] for item in first_specs])
 
     def test_supplied_missing_input_resumes_pending_backend_without_rerouting(self) -> None:
         route = make_tool("powerworld_route_request", required=["request_text"])

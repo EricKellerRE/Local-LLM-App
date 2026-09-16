@@ -3,8 +3,15 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
-from local_model_app.mcp_plugins import DiscoveredTool, McpPluginRegistry, PluginConfigurationError, _safe_tool_name
+from local_model_app.mcp_plugins import (
+    DiscoveredTool,
+    McpPluginRegistry,
+    PluginConfigurationError,
+    _safe_tool_name,
+    normalize_tool_result,
+)
 
 
 class McpPluginRegistryTests(unittest.TestCase):
@@ -93,6 +100,84 @@ class McpPluginRegistryTests(unittest.TestCase):
 
             with self.assertRaisesRegex(PermissionError, "requires user approval"):
                 asyncio.run(registry.call_tool(tool, {}))
+
+    def test_annotations_use_mcp_alias_names(self) -> None:
+        from mcp import types
+        import asyncio
+
+        advertised = SimpleNamespace(
+            name="inspect", title=None, description="Inspect safely",
+            input_schema={"type": "object", "properties": {}}, output_schema=None,
+            annotations=types.ToolAnnotations(readOnlyHint=True, destructiveHint=False),
+        )
+        client = SimpleNamespace(list_tools=lambda **kwargs: None)
+
+        async def list_tools(**kwargs):
+            return SimpleNamespace(tools=[advertised], next_cursor=None)
+
+        client.list_tools = list_tools
+        registry = McpPluginRegistry.__new__(McpPluginRegistry)
+        plugin = SimpleNamespace(manifest=SimpleNamespace(id="demo.plugin", tool_namespace="demo"))
+        server = SimpleNamespace(id="demo")
+        discovered = asyncio.run(registry.discover_connected_tools(plugin, server, client))
+
+        self.assertEqual(discovered[0].annotations["readOnlyHint"], True)
+        self.assertNotIn("read_only_hint", discovered[0].annotations)
+
+    def test_output_schema_failure_is_quarantined(self) -> None:
+        class Dumpable:
+            def model_dump(self, **kwargs):
+                return {"type": "text", "text": "raw result"}
+
+        tool = DiscoveredTool(
+            exposed_name="demo__count", plugin_id="demo.plugin", server_id="demo",
+            native_name="count", title=None, description="Count",
+            input_schema={"type": "object"},
+            output_schema={"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "required": ["count"], "properties": {"count": {"type": "integer"}}},
+            annotations={},
+        )
+        result = SimpleNamespace(content=[Dumpable()], structured_content={"count": "three"}, is_error=False)
+
+        normalized = normalize_tool_result(tool, result)
+
+        self.assertTrue(normalized["isError"])
+        self.assertEqual(normalized["error"], "output_validation_failed")
+        self.assertIsNone(normalized["structuredContent"])
+        self.assertEqual(normalized["rawResult"]["structuredContent"], {"count": "three"})
+
+    def test_guidance_is_selected_by_routed_capability_and_versioned(self) -> None:
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            config = root / "mcp.d"
+            config.mkdir()
+            guide = root / "case-guide.md"
+            guide.write_text("Case-specific operating guidance.", encoding="utf-8")
+            (config / "demo.json").write_text(json.dumps({
+                "manifest_version": 1,
+                "id": "demo.plugin",
+                "tool_namespace": "demo",
+                "name": "Demo",
+                "version": "1",
+                "servers": [{"id": "one", "transport": "stdio", "command": "does-not-run"}],
+                "guidance": [{"path": "${GUIDE_PATH}", "capability": "case"}],
+            }), encoding="utf-8")
+            registry = McpPluginRegistry(config, project_root=root, variables={"GUIDE_PATH": str(guide)})
+            case_tool = DiscoveredTool(
+                exposed_name="demo__case_overview", plugin_id="demo.plugin", server_id="one",
+                native_name="case_overview", title=None, description="Summarize a case",
+                input_schema={"type": "object"}, output_schema=None, annotations={},
+            )
+            unrelated = DiscoveredTool(
+                exposed_name="demo__weather", plugin_id="demo.plugin", server_id="one",
+                native_name="weather", title=None, description="Get weather",
+                input_schema={"type": "object"}, output_schema=None, annotations={},
+            )
+
+            selected = registry.guidance_for_tools([unrelated, case_tool])
+
+            self.assertEqual(len(selected), 1)
+            self.assertEqual(selected[0].capability, "case")
+            self.assertTrue(selected[0].version.startswith("sha256:"))
 
 
 if __name__ == "__main__":
