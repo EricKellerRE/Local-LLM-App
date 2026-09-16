@@ -30,6 +30,7 @@ Legacy SSE is excluded for new plugins.
 - `tool_namespace`: a short collision-resistant prefix shown to the model.
 - `enabled`: whether the registry connects to the plugin.
 - `servers`: one or more stdio or Streamable HTTP servers.
+- `servers[].companions`: optional non-MCP subprocesses owned by that server. Each companion declares a command, arguments, working directory, environment, optional readiness URL, and startup timeout.
 - `guidance`: literature-backed playbooks or instructions with capability labels.
 - `policy`: host-owned access defaults, explicit allow/deny lists, and call budget.
 
@@ -38,7 +39,7 @@ Tool annotations such as read-only, destructive, idempotent, and open-world are 
 ## Runtime flow
 
 1. Validate enabled manifests and resolve `${VARIABLE}` references in memory.
-2. Connect with the official MCP client and negotiate the protocol.
+2. Start any declared companion processes, wait for their readiness URLs, then connect with the official MCP client and negotiate the protocol.
 3. Retrieve every page of `tools/list`, plus advertised resources, resource templates, and prompts.
 4. Store the complete catalog internally. Rank compact names, titles, and descriptions with a hybrid lexical/semantic router, then place only the four highest-ranked entries and schemas in model context initially. The sentence encoder runs locally, caches catalog vectors, and falls back to lexical routing if its optional weights are unavailable.
 5. Expand the candidate schema set in bounded batches when routing confidence is low.
@@ -52,6 +53,8 @@ Stateful servers should return explicit case, session, or job handles and requir
 ## Chat interface
 
 The composer `+` menu lists installed plugins, reports connection errors, and shows how many tools were discovered. Its toggles are per chat: enabling a plugin saves that choice with the chat and gives only that chat's planner the plugin's tool catalog. Chats that select the same plugin share one live MCP connection; the connection stops after the final selecting chat disables, archives, or deletes it.
+
+Companion processes share that lifecycle. Local Model refuses to start a companion when its readiness address is already occupied, so it never silently adopts a server it does not own. Normal plugin or app shutdown closes the MCP connection and then terminates every companion it started.
 
 `Add plugin` imports a user-selected JSON manifest but does not start its processes automatically. The Grid Workshop plugin is installed and stopped by default. Archived chats retain their plugin selections, scratchpad, and tool activity in the compressed record, and restoration recovers all three.
 

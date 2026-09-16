@@ -1,439 +1,294 @@
-const state = { chatId: null, chats: [], busy: false, showArchived: false, currentArchived: false, plugins: [], pluginBusy: null, mode: "chat", taskId: null, tasks: [], taskProposal: null };
+const state = {
+  chatId: null, chats: [], projects: [], pendingProjectId: null, busy: false,
+  showArchived: false, currentArchived: false, plugins: [], pluginBusy: null,
+  pendingPluginOverrides: new Map(),
+};
 const el = (id) => document.getElementById(id);
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) }, ...options,
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(body.detail || `Request failed (${response.status})`);
   }
-  if (response.status === 204) return null;
-  return response.json();
+  return response.status === 204 ? null : response.json();
 }
 
 function escapeHtml(text) {
-  const node = document.createElement("div");
-  node.textContent = text ?? "";
-  return node.innerHTML;
+  const node = document.createElement("div"); node.textContent = text ?? ""; return node.innerHTML;
+}
+function projectById(id) { return state.projects.find((project) => project.id === id) || null; }
+function setProjectLabel(id) {
+  const project = projectById(id);
+  el("chat-project").hidden = false;
+  el("chat-project").disabled = state.currentArchived;
+  el("chat-project").textContent = project ? `Folder: ${project.name}` : "No project";
+  el("chat-project").title = project?.path || "Choose a project for this chat";
+}
+function chatButton(chat) {
+  const archived = state.showArchived;
+  const archiveLabel = archived ? "Restore" : "Archive";
+  const archiveIcon = archived
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8M8 12l4-4 4 4M12 8v8"/></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M6 7v12h12V7M3 4h18v3H3zM9 11h6"/></svg>';
+  const deleteIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"/></svg>';
+  return `<div class="chat-row ${chat.id === state.chatId ? "active" : ""}">
+    <button class="chat-open" data-open-chat="${chat.id}" type="button">${escapeHtml(chat.title)}</button>
+    <div class="chat-actions">
+      <button class="chat-action" data-chat-action="archive" data-chat-id="${chat.id}" type="button" aria-label="${archiveLabel} ${escapeHtml(chat.title)}" title="${archiveLabel}">${archiveIcon}</button>
+      <button class="chat-action danger" data-chat-action="delete" data-chat-id="${chat.id}" type="button" aria-label="Delete ${escapeHtml(chat.title)}" title="Delete">${deleteIcon}</button>
+    </div>
+  </div>`;
+}
+
+function renderSidebar() {
+  el("project-list").innerHTML = state.projects.map((project) => {
+    const chats = state.chats.filter((chat) => chat.project_id === project.id);
+    return `<section class="project-group"><div class="project-heading"><button data-project-id="${project.id}" title="${escapeHtml(project.path)}">${escapeHtml(project.name)}</button><button class="project-new-chat" data-new-project-chat="${project.id}" title="New chat in ${escapeHtml(project.name)}">＋</button></div><div class="project-chat-list">${chats.map(chatButton).join("") || '<small class="empty-list">No chats yet</small>'}</div></section>`;
+  }).join("") || '<small class="empty-list">No projects yet</small>';
+  el("chat-list").innerHTML = state.chats.filter((chat) => !chat.project_id).map(chatButton).join("") || '<small class="empty-list">No chats yet</small>';
+  document.querySelectorAll("[data-open-chat]").forEach((button) => button.addEventListener("click", () => openChat(button.dataset.openChat)));
+  document.querySelectorAll("[data-chat-action]").forEach((button) => button.addEventListener("click", () => chatAction(button.dataset.chatId, button.dataset.chatAction)));
+  document.querySelectorAll("[data-new-project-chat], [data-project-id]").forEach((button) => {
+    button.addEventListener("click", () => startBlankChat(button.dataset.newProjectChat || button.dataset.projectId));
+  });
+}
+async function loadProjects() { state.projects = await api("/api/projects"); renderSidebar(); }
+async function loadChats() {
+  state.chats = await api(`/api/chats?archived=${state.showArchived}`);
+  el("archive-view").textContent = state.showArchived ? "← Active chats" : "Archived chats";
+  renderSidebar();
+}
+
+function showBlankChat(projectId = null) {
+  state.chatId = null; state.pendingProjectId = projectId || null; state.currentArchived = false;
+  state.pendingPluginOverrides.clear();
+  el("chat-title").textContent = "New chat";
+  el("messages").hidden = false; el("composer").hidden = false; el("messages").innerHTML = "";
+  setProjectLabel(state.pendingProjectId); renderApproval(null); renderSidebar(); loadPlugins().catch(() => {}); updateComposerState();
+  el("message-input").focus(); document.querySelector(".shell").classList.remove("sidebar-open");
+  updateHealth().catch(() => {});
+}
+async function startBlankChat(projectId = null) {
+  if (state.showArchived) { state.showArchived = false; await loadChats(); }
+  showBlankChat(projectId);
+  if (projectId) {
+    try { await api(`/api/projects/${projectId}/activate`, { method: "POST" }); await loadPlugins(); }
+    catch (error) { window.alert(`The project opened, but its tools could not start: ${error.message}`); }
+  }
+}
+async function createChat(projectId = state.pendingProjectId) {
+  const chat = await api("/api/chats", { method: "POST", body: JSON.stringify({ title: "New chat", project_id: projectId || null }) });
+  state.chatId = chat.id; state.pendingProjectId = chat.project_id || null;
+  try {
+    for (const [pluginId, enabled] of state.pendingPluginOverrides.entries()) {
+      await api(`/api/chats/${chat.id}/plugins/${encodeURIComponent(pluginId)}`, { method: "PATCH", body: JSON.stringify({ enabled }) });
+    }
+  } catch (error) {
+    await api(`/api/chats/${chat.id}`, { method: "DELETE" }).catch(() => {});
+    state.chatId = null;
+    throw error;
+  }
+  state.pendingPluginOverrides.clear(); await loadChats(); return chat;
+}
+async function openChat(chatId, { force = false } = {}) {
+  if (state.busy && !force) return;
+  const chat = await api(`/api/chats/${chatId}`);
+  state.chatId = chat.id; state.pendingProjectId = chat.project_id || null; state.currentArchived = Boolean(chat.archived_at);
+  state.pendingPluginOverrides.clear();
+  el("chat-title").textContent = chat.title;
+  el("messages").hidden = false; el("composer").hidden = false;
+  setProjectLabel(state.pendingProjectId); renderMessages(chat.messages); await Promise.all([loadApproval(), loadPlugins()]); renderSidebar(); updateComposerState();
+  document.querySelector(".shell").classList.remove("sidebar-open");
+}
+function renderMessages(messages) {
+  el("messages").innerHTML = messages.map((message) => `<article class="message ${message.role}"><div class="bubble">${escapeHtml(message.content)}</div></article>`).join("");
+  el("messages").scrollTop = el("messages").scrollHeight;
 }
 
 function renderPlugins() {
   const list = el("plugin-list");
-  if (!state.plugins.length) {
-    list.innerHTML = '<div class="plugin-row"><div><strong>No plugins installed</strong><small>Add a JSON plugin manifest.</small></div></div>';
-    return;
-  }
+  if (!state.plugins.length) { list.innerHTML = '<div class="plugin-row"><div><strong>No plugins installed</strong><small>Add a JSON plugin manifest.</small></div></div>'; return; }
   list.innerHTML = state.plugins.map((plugin) => {
-    const capabilityCount = plugin.tool_count + (plugin.resource_count || 0) + (plugin.prompt_count || 0);
-    const detail = plugin.selected && plugin.status === "running"
-      ? `Enabled here · ${capabilityCount} capabilities ready`
-      : plugin.status === "running"
-        ? `${capabilityCount} capabilities ready for another chat`
-        : plugin.error || `${plugin.server_count} server${plugin.server_count === 1 ? "" : "s"} · stopped`;
-    return `<div class="plugin-row"><div><strong>${escapeHtml(plugin.name)}</strong><small class="${plugin.error ? "plugin-error" : ""}">${escapeHtml(detail)}</small></div><label class="switch" title="${plugin.selected ? "Disable" : "Enable"} ${escapeHtml(plugin.name)} for this chat"><input type="checkbox" data-plugin-id="${escapeHtml(plugin.id)}" ${plugin.selected ? "checked" : ""} ${state.pluginBusy === plugin.id || state.currentArchived ? "disabled" : ""}><span></span></label></div>`;
+    const count = plugin.tool_count + (plugin.resource_count || 0) + (plugin.prompt_count || 0);
+    const detail = plugin.selected && plugin.status === "running" ? `Enabled here · ${count} capabilities ready` : plugin.status === "running" ? `${count} capabilities ready for another chat` : plugin.error || "Starts automatically when enabled";
+    return `<div class="plugin-row"><div><strong>${escapeHtml(plugin.name)}</strong><small class="${plugin.error ? "plugin-error" : ""}">${escapeHtml(detail)}</small></div><label class="switch"><input type="checkbox" data-plugin-id="${escapeHtml(plugin.id)}" ${plugin.selected ? "checked" : ""} ${state.pluginBusy === plugin.id || state.currentArchived ? "disabled" : ""}><span></span></label></div>`;
   }).join("");
-  list.querySelectorAll("input[data-plugin-id]").forEach((toggle) => {
-    toggle.addEventListener("change", () => togglePlugin(toggle.dataset.pluginId, toggle.checked));
-  });
+  list.querySelectorAll("[data-plugin-id]").forEach((toggle) => toggle.addEventListener("change", () => togglePlugin(toggle.dataset.pluginId, toggle.checked)));
 }
-
 async function loadPlugins() {
   state.plugins = await api(state.chatId ? `/api/chats/${state.chatId}/plugins` : "/api/plugins");
-  state.plugins = state.plugins.map((plugin) => ({ ...plugin, selected: Boolean(plugin.selected) }));
+  const projectPlugins = new Set(projectById(state.pendingProjectId)?.plugin_ids || []);
+  state.plugins = state.plugins.map((plugin) => ({
+    ...plugin,
+    selected: state.chatId
+      ? Boolean(plugin.selected)
+      : state.pendingPluginOverrides.has(plugin.id)
+        ? state.pendingPluginOverrides.get(plugin.id)
+        : projectPlugins.has(plugin.id),
+  }));
   renderPlugins();
 }
-
 async function togglePlugin(pluginId, enabled) {
-  if (!state.chatId) await newChat();
-  state.pluginBusy = pluginId;
-  renderPlugins();
-  try {
-    state.plugins = await api(`/api/chats/${state.chatId}/plugins/${encodeURIComponent(pluginId)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ enabled }),
-    });
-  } catch (error) {
-    window.alert(`Could not ${enabled ? "enable" : "disable"} plugin: ${error.message}`);
-  } finally {
-    state.pluginBusy = null;
-    await loadPlugins();
+  if (!state.chatId) {
+    state.pendingPluginOverrides.set(pluginId, enabled);
+    state.plugins = state.plugins.map((plugin) => plugin.id === pluginId ? { ...plugin, selected: enabled } : plugin);
+    renderPlugins();
+    return;
   }
+  state.pluginBusy = pluginId; renderPlugins();
+  try { state.plugins = await api(`/api/chats/${state.chatId}/plugins/${encodeURIComponent(pluginId)}`, { method: "PATCH", body: JSON.stringify({ enabled }) }); }
+  catch (error) { window.alert(`Could not ${enabled ? "enable" : "disable"} plugin: ${error.message}`); }
+  finally { state.pluginBusy = null; await loadPlugins(); }
 }
-
 async function installPluginFile(file) {
   if (!file) return;
   try {
-    const manifest = JSON.parse(await file.text());
-    const name = manifest.name || manifest.id || file.name;
-    if (!window.confirm(`Install ${name}? Installing registers its commands and permissions. It will not start until you turn it on.`)) return;
-    await api("/api/plugins", { method: "POST", body: JSON.stringify(manifest) });
-    await loadPlugins();
-  } catch (error) {
-    window.alert(`Could not install plugin: ${error.message}`);
-  } finally {
-    el("plugin-file").value = "";
-  }
-}
-
-function renderChats() {
-  el("chat-list").innerHTML = state.chats.map((chat) =>
-    `<button class="chat-item ${chat.id === state.chatId ? "active" : ""}" data-id="${chat.id}">${escapeHtml(chat.title)}</button>`
-  ).join("");
-  document.querySelectorAll(".chat-item").forEach((button) => {
-    button.addEventListener("click", () => openChat(button.dataset.id));
-  });
-}
-
-function statusLabel(status) {
-  return String(status || "").replaceAll("_", " ");
-}
-
-function renderTasks() {
-  el("task-list").innerHTML = state.tasks.map((task) =>
-    `<button class="task-item ${state.mode === "task" && task.id === state.taskId ? "active" : ""}" data-task-id="${task.id}"><span>${escapeHtml(task.definition.title)}</span><small>${escapeHtml(statusLabel(task.status))}</small></button>`
-  ).join("");
-  document.querySelectorAll(".task-item").forEach((button) => {
-    button.addEventListener("click", () => openTask(button.dataset.taskId));
-  });
-}
-
-async function loadTasks() {
-  state.tasks = await api("/api/tasks");
-  renderTasks();
-}
-
-function renderMessages(messages) {
-  const welcome = messages.length === 0 ? el("welcome").outerHTML : "";
-  el("messages").innerHTML = welcome + messages.map((message) =>
-    `<article class="message ${message.role}"><div class="bubble">${escapeHtml(message.content)}</div></article>`
-  ).join("");
-  el("messages").scrollTop = el("messages").scrollHeight;
+    const manifest = JSON.parse(await file.text()); const name = manifest.name || manifest.id || file.name;
+    if (!window.confirm(`Install ${name}? It will start only when a chat needs it.`)) return;
+    await api("/api/plugins", { method: "POST", body: JSON.stringify(manifest) }); await loadPlugins();
+  } catch (error) { window.alert(`Could not install plugin: ${error.message}`); }
+  finally { el("plugin-file").value = ""; }
 }
 
 function renderApproval(approval) {
   const panel = el("approval-panel");
-  if (!approval || approval.status !== "waiting_for_approval") {
-    panel.hidden = true;
-    panel.innerHTML = "";
-    return;
-  }
-  const argumentsText = JSON.stringify(approval.arguments || {}, null, 2);
-  panel.innerHTML = `<div><strong>Tool approval required</strong><p>${escapeHtml(approval.tool)}</p><pre>${escapeHtml(argumentsText)}</pre></div><div class="approval-actions"><button id="deny-tool" class="text-button" type="button">Deny</button><button id="approve-tool" class="primary-button" type="button">Approve once</button></div>`;
-  panel.hidden = false;
-  el("approve-tool").addEventListener("click", () => resolveApproval("approve"));
-  el("deny-tool").addEventListener("click", () => resolveApproval("deny"));
+  if (!approval || approval.status !== "waiting_for_approval") { panel.hidden = true; panel.innerHTML = ""; return; }
+  panel.innerHTML = `<div><strong>Tool approval required</strong><p>${escapeHtml(approval.tool)}</p><pre>${escapeHtml(JSON.stringify(approval.arguments || {}, null, 2))}</pre></div><div class="approval-actions"><button id="deny-tool" class="text-button" type="button">Deny</button><button id="approve-tool" class="primary-button" type="button">Approve once</button></div>`;
+  panel.hidden = false; el("approve-tool").addEventListener("click", () => resolveApproval("approve")); el("deny-tool").addEventListener("click", () => resolveApproval("deny"));
 }
-
-async function loadApproval() {
-  if (!state.chatId || state.currentArchived) return renderApproval(null);
-  renderApproval(await api(`/api/chats/${state.chatId}/approval`));
-}
-
+async function loadApproval() { if (!state.chatId || state.currentArchived) return renderApproval(null); renderApproval(await api(`/api/chats/${state.chatId}/approval`)); }
 async function resolveApproval(action) {
-  if (!state.chatId || state.busy) return;
-  setBusy(true);
-  try {
-    await api(`/api/chats/${state.chatId}/approval/${action}`, { method: "POST" });
-    await openChat(state.chatId, { force: true });
-    await loadChats();
-  } catch (error) {
-    window.alert(`Could not ${action} this tool call: ${error.message}`);
-    await loadApproval().catch(() => {});
-  } finally {
-    setBusy(false);
-  }
+  if (!state.chatId || state.busy) return; setBusy(true);
+  try { await api(`/api/chats/${state.chatId}/approval/${action}`, { method: "POST" }); await openChat(state.chatId, { force: true }); await loadChats(); }
+  catch (error) { window.alert(`Could not ${action} this tool call: ${error.message}`); } finally { setBusy(false); }
 }
-
-async function loadChats() {
-  state.chats = await api(`/api/chats?archived=${state.showArchived}`);
-  el("archive-view").textContent = state.showArchived ? "← Active chats" : "Archived chats";
-  renderChats();
-}
-
-async function newChat() {
-  if (state.busy) return;
-  state.showArchived = false;
-  state.mode = "chat";
-  const chat = await api("/api/chats", { method: "POST", body: JSON.stringify({ title: "New chat" }) });
-  state.chatId = chat.id;
-  await loadChats();
-  await openChat(chat.id);
-  el("message-input").focus();
-}
-
-async function openChat(chatId, { force = false } = {}) {
-  if (state.busy && !force) return;
-  const chat = await api(`/api/chats/${chatId}`);
-  state.mode = "chat";
-  state.chatId = chat.id;
-  state.currentArchived = Boolean(chat.archived_at);
-  el("chat-title").textContent = chat.title;
-  el("archive-chat").hidden = false;
-  el("archive-chat").textContent = state.currentArchived ? "Restore" : "Archive";
-  el("delete-chat").hidden = false;
-  el("start-task").hidden = true;
-  el("pause-task").hidden = true;
-  el("resume-task").hidden = true;
-  el("cancel-task").hidden = true;
-  el("messages").hidden = false;
-  el("composer").hidden = false;
-  el("task-detail").hidden = true;
-  renderMessages(chat.messages);
-  await loadApproval();
-  renderChats();
-  await loadPlugins();
-  updateComposerState();
-  document.querySelector(".shell").classList.remove("sidebar-open");
-}
-
-function taskControls(task) {
-  const terminal = ["completed", "failed", "cancelled"].includes(task.status);
-  el("start-task").hidden = task.status !== "draft";
-  el("pause-task").hidden = !["runnable", "running", "waiting"].includes(task.status);
-  el("resume-task").hidden = !["paused", "waiting", "waiting_for_input", "waiting_for_tools", "failed"].includes(task.status);
-  el("cancel-task").hidden = terminal;
-}
-
-function renderTaskDetail(task) {
-  const criteria = task.definition.success_criteria.map((criterion) => `<li>${escapeHtml(criterion)}</li>`).join("");
-  const deliverables = task.definition.deliverables.length
-    ? `<div class="task-section"><h3>Deliverables</h3><ul>${task.definition.deliverables.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>`
-    : "";
-  const items = task.work_items.length
-    ? task.work_items.map((item) => `<div class="work-item"><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(statusLabel(item.status))} · ${escapeHtml(item.kind)}</small>${item.result?.result ? `<p>${escapeHtml(item.result.result)}</p>` : item.error ? `<p class="task-error">${escapeHtml(item.error)}</p>` : ""}</div>`).join("")
-    : '<p class="working">Work items will be assembled after the task starts.</p>';
-  const summary = task.current_summary ? `<div class="task-summary">${escapeHtml(task.current_summary)}</div>` : "";
-  el("task-detail").innerHTML = `<div class="task-hero"><span class="status-chip">${escapeHtml(statusLabel(task.status))}</span><h2>${escapeHtml(task.definition.title)}</h2><p>${escapeHtml(task.definition.goal)}</p>${summary}${task.last_error ? `<p class="task-error">${escapeHtml(task.last_error)}</p>` : ""}</div><div class="task-section"><h3>Completion criteria</h3><ul>${criteria}</ul></div>${deliverables}<div class="task-section"><h3>Work items</h3>${items}</div>`;
-}
-
-async function openTask(taskId) {
-  if (state.busy) return;
-  const task = await api(`/api/tasks/${taskId}`);
-  state.mode = "task";
-  state.taskId = task.id;
-  el("chat-title").textContent = task.definition.title;
-  el("model-name").textContent = `Long-running task · ${statusLabel(task.status)}`;
-  el("archive-chat").hidden = true;
-  el("delete-chat").hidden = true;
-  el("messages").hidden = true;
-  el("composer").hidden = true;
-  el("task-detail").hidden = false;
-  renderApproval(null);
-  taskControls(task);
-  renderTaskDetail(task);
-  renderTasks();
-  renderChats();
-  document.querySelector(".shell").classList.remove("sidebar-open");
-}
-
-function renderTaskProposal(proposal) {
-  const criteria = proposal.success_criteria.map((item) => `<li>${escapeHtml(item)}</li>`).join("");
-  const deliverables = proposal.deliverables.length ? `<h4>Deliverables</h4><ul>${proposal.deliverables.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : "";
-  el("task-proposal").innerHTML = `<h3>${escapeHtml(proposal.title)}</h3><p>${escapeHtml(proposal.goal)}</p><h4>Complete when</h4><ul>${criteria}</ul>${deliverables}<p>${proposal.execution.deadline ? `Deadline: ${escapeHtml(proposal.execution.deadline)}` : "No deadline"} · ${proposal.execution.maximum_attempts ? `${proposal.execution.maximum_attempts} attempts maximum` : "Continue retrying until resolved"}</p>`;
-  el("task-proposal").hidden = false;
-}
-
-function openTaskDialog() {
-  state.taskProposal = null;
-  el("task-request").value = "";
-  el("task-proposal").hidden = true;
-  el("task-dialog-status").textContent = "";
-  el("propose-task").hidden = false;
-  el("create-task").hidden = true;
-  el("task-dialog").showModal();
-  el("task-request").focus();
-}
-
-async function proposeTask() {
-  const request = el("task-request").value.trim();
-  if (!request) return;
-  el("propose-task").disabled = true;
-  el("task-dialog-status").textContent = "Assembling the task contract locally…";
-  try {
-    state.taskProposal = await api("/api/tasks/propose", { method: "POST", body: JSON.stringify({ request }) });
-    renderTaskProposal(state.taskProposal);
-    el("propose-task").hidden = true;
-    el("create-task").hidden = false;
-    el("task-dialog-status").textContent = "Review the goal and completion criteria before starting.";
-  } catch (error) {
-    el("task-dialog-status").textContent = error.message;
-  } finally {
-    el("propose-task").disabled = false;
-  }
-}
-
-async function createAndStartTask() {
-  if (!state.taskProposal) return;
-  el("create-task").disabled = true;
-  try {
-    const request = el("task-request").value.trim();
-    const task = await api("/api/tasks", { method: "POST", body: JSON.stringify({ request, definition: state.taskProposal }) });
-    await api(`/api/tasks/${task.id}/start`, { method: "POST" });
-    el("task-dialog").close();
-    await loadTasks();
-    await openTask(task.id);
-  } catch (error) {
-    el("task-dialog-status").textContent = error.message;
-  } finally {
-    el("create-task").disabled = false;
-  }
-}
-
-async function taskAction(action) {
-  if (!state.taskId) return;
-  await api(`/api/tasks/${state.taskId}/${action}`, { method: "POST" });
-  await loadTasks();
-  await openTask(state.taskId);
-}
-
-function showEmptyState() {
-  state.chatId = null;
-  state.currentArchived = false;
-  el("chat-title").textContent = state.showArchived ? "Archived chats" : "New chat";
-  el("archive-chat").hidden = true;
-  el("delete-chat").hidden = true;
-  renderMessages([]);
-  renderApproval(null);
-  loadPlugins().catch(() => {});
-  updateComposerState();
-}
-
-async function toggleArchiveView() {
-  if (state.busy) return;
-  state.showArchived = !state.showArchived;
-  await loadChats();
-  if (state.chats.length) await openChat(state.chats[0].id);
-  else showEmptyState();
-}
-
-async function archiveCurrentChat() {
-  if (!state.chatId || state.busy) return;
-  await api(`/api/chats/${state.chatId}/archive`, {
-    method: "PATCH",
-    body: JSON.stringify({ archived: !state.currentArchived }),
-  });
-  await loadChats();
-  if (state.chats.length) await openChat(state.chats[0].id);
-  else showEmptyState();
-}
-
-async function deleteCurrentChat() {
-  if (!state.chatId || state.busy) return;
-  if (!window.confirm("Permanently delete this chat? This cannot be undone.")) return;
-  await api(`/api/chats/${state.chatId}`, { method: "DELETE" });
-  await loadChats();
-  if (state.chats.length) await openChat(state.chats[0].id);
-  else showEmptyState();
-}
-
-function setBusy(busy) {
-  state.busy = busy;
-  updateComposerState();
-}
-
+function setBusy(busy) { state.busy = busy; updateComposerState(); }
 function updateComposerState() {
-  const disabled = state.busy || state.currentArchived;
-  el("message-input").disabled = disabled;
-  el("send").disabled = disabled;
-  el("composer-note").textContent = state.currentArchived
-    ? "Restore this chat before continuing it."
-    : state.busy
-      ? "Planning and generating locally…"
-      : "Responses may take a few minutes on CPU.";
+  const disabled = state.busy || state.currentArchived; el("message-input").disabled = disabled; el("send").disabled = disabled;
+  el("composer-note").textContent = state.currentArchived ? "Restore this chat before continuing it." : state.busy ? "Working in this chat until the current step is complete…" : "Press Enter to send · longer work stays in this chat";
 }
-
 async function sendMessage(event) {
-  event.preventDefault();
-  const input = el("message-input");
-  const content = input.value.trim();
-  if (!content || state.busy || state.currentArchived) return;
-  if (!state.chatId) await newChat();
-
+  event.preventDefault(); const input = el("message-input"); const content = input.value.trim();
+  if (!content || state.busy || state.currentArchived) return; if (!state.chatId) await createChat();
   const current = await api(`/api/chats/${state.chatId}`);
   renderMessages([...current.messages, { role: "user", content }, { role: "assistant", content: "Working locally…" }]);
-  el("messages").lastElementChild.querySelector(".bubble").classList.add("working");
-  input.value = "";
-  input.style.height = "auto";
-  setBusy(true);
-  try {
-    await api(`/api/chats/${state.chatId}/messages`, { method: "POST", body: JSON.stringify({ content }) });
-    await openChat(state.chatId, { force: true });
-    await loadChats();
-  } catch (error) {
-    renderMessages([...current.messages, { role: "user", content }, { role: "assistant", content: `Sorry, the local request failed: ${error.message}` }]);
-  } finally {
-    setBusy(false);
-    input.focus();
-  }
+  el("messages").lastElementChild.querySelector(".bubble").classList.add("working"); input.value = ""; input.style.height = "auto"; setBusy(true);
+  try { await api(`/api/chats/${state.chatId}/messages`, { method: "POST", body: JSON.stringify({ content }) }); await openChat(state.chatId, { force: true }); await loadChats(); }
+  catch (error) { renderMessages([...current.messages, { role: "user", content }, { role: "assistant", content: `Sorry, the local request failed: ${error.message}` }]); }
+  finally { setBusy(false); input.focus(); }
 }
 
+function renderProjectChoices() {
+  el("project-choices").innerHTML = [`<button type="button" data-choice="">No project<small>Keep this chat unassociated</small></button>`, ...state.projects.map((project) => `<button type="button" data-choice="${project.id}">${escapeHtml(project.name)}<small>${escapeHtml(project.path)}</small></button>`), `<button type="button" id="choice-new-project">＋ Add a project folder</button>`].join("");
+  el("project-choices").querySelectorAll("[data-choice]").forEach((button) => button.addEventListener("click", async () => {
+    const projectId = button.dataset.choice || null;
+    if (state.chatId) await api(`/api/chats/${state.chatId}/project`, { method: "PATCH", body: JSON.stringify({ project_id: projectId }) });
+    state.pendingProjectId = projectId; setProjectLabel(projectId); el("project-choice-dialog").close(); await loadChats();
+    state.pendingPluginOverrides.clear();
+    if (state.chatId) await loadPlugins();
+    else if (projectId) {
+      try { await api(`/api/projects/${projectId}/activate`, { method: "POST" }); await loadPlugins(); }
+      catch (error) { window.alert(`The project was selected, but its tools could not start: ${error.message}`); }
+    }
+  }));
+  el("choice-new-project").addEventListener("click", () => { el("project-choice-dialog").close(); openProjectDialog(); });
+}
+function openProjectChoice() { renderProjectChoices(); el("project-choice-dialog").showModal(); }
+async function chooseDirectory(targetId) {
+  try { if (window.pywebview?.api?.choose_directory) { const selected = await window.pywebview.api.choose_directory(); if (selected) el(targetId).value = selected; return; } }
+  catch (error) { console.warn(error); }
+  const selected = window.prompt("Enter the full folder path:", el(targetId).value); if (selected) el(targetId).value = selected;
+}
+async function openProjectDialog() {
+  if (!state.plugins.length) await loadPlugins();
+  el("project-path").value = ""; el("project-name").value = ""; el("project-status").textContent = "";
+  el("project-plugins").innerHTML = state.plugins.map((plugin) => `<label class="checkbox-row"><input type="checkbox" value="${escapeHtml(plugin.id)}"> ${escapeHtml(plugin.name)}</label>`).join("") || "No tools installed.";
+  el("project-dialog").showModal();
+}
+async function createProject() {
+  const path = el("project-path").value.trim(); if (!path) { el("project-status").textContent = "Choose a project folder first."; return; }
+  const pluginIds = [...el("project-plugins").querySelectorAll("input:checked")].map((input) => input.value); el("create-project").disabled = true;
+  try {
+    const project = await api("/api/projects", { method: "POST", body: JSON.stringify({ path, name: el("project-name").value.trim() || null, plugin_ids: pluginIds }) });
+    el("project-dialog").close(); await loadProjects(); await startBlankChat(project.id);
+  } catch (error) { el("project-status").textContent = error.message; } finally { el("create-project").disabled = false; }
+}
+
+function formatNumber(value) { return value == null ? "?" : Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(value); }
+function renderModelResults(models) {
+  el("hf-results").innerHTML = models.map((model) => `<article class="model-card"><div><strong>${escapeHtml(model.id)}</strong><small>${formatNumber(model.parameters)} params · ${formatNumber(model.downloads)} downloads${model.gated ? " · gated" : ""}</small></div><button class="text-button" type="button" data-download-model="${escapeHtml(model.id)}">Download</button></article>`).join("") || '<small class="empty-list">No compatible models found.</small>';
+  el("hf-results").querySelectorAll("[data-download-model]").forEach((button) => button.addEventListener("click", () => downloadModel(button.dataset.downloadModel, button)));
+}
+async function searchModels() {
+  el("search-models").disabled = true; el("hf-status").textContent = "Searching Hugging Face…";
+  try { const models = await api(`/api/models/search?q=${encodeURIComponent(el("hf-search").value.trim())}`); renderModelResults(models); el("hf-status").textContent = `${models.length} compatible model${models.length === 1 ? "" : "s"}`; }
+  catch (error) { el("hf-status").textContent = error.message; } finally { el("search-models").disabled = false; }
+}
+async function downloadModel(repoId, button) {
+  button.disabled = true; button.textContent = "Starting…";
+  try {
+    let job = await api("/api/models/download", { method: "POST", body: JSON.stringify({ repo_id: repoId }) });
+    while (["queued", "downloading"].includes(job.status)) { button.textContent = "Downloading…"; await new Promise((resolve) => setTimeout(resolve, 1000)); job = await api(`/api/models/download/${job.id}`); }
+    if (job.status === "failed") throw new Error(job.error || "Download failed");
+    button.textContent = "Downloaded"; el("model-id").value = job.destination; el("hf-status").textContent = `${repoId} is ready. Save settings to make it the active model.`;
+  } catch (error) { button.disabled = false; button.textContent = "Retry"; el("hf-status").textContent = error.message; }
+}
+async function openSettings() {
+  el("settings-status").textContent = "Loading…"; el("settings-dialog").showModal();
+  try {
+    const settings = await api("/api/settings");
+    const values = { "data-directory": settings.data_directory, "models-directory": settings.models_directory, "model-id": settings.model_id, "offload-directory": settings.offload_dir, "model-kind": settings.model_kind, "model-device": settings.device, "model-dtype": settings.dtype, "cpu-memory": settings.cpu_memory_gb ?? "", "max-tokens": settings.max_new_tokens, temperature: settings.temperature, "top-p": settings.top_p };
+    Object.entries(values).forEach(([id, value]) => { el(id).value = value; }); el("trust-remote-code").checked = settings.trust_remote_code;
+    el("installed-models").innerHTML = settings.installed_models.map((model) => `<option value="${escapeHtml(model.path)}">${escapeHtml(model.name)}</option>`).join(""); el("settings-status").textContent = "";
+  } catch (error) { el("settings-status").textContent = error.message; }
+}
+async function saveSettings() {
+  const numeric = (id) => el(id).value === "" ? null : Number(el(id).value);
+  const body = { data_directory: el("data-directory").value, models_directory: el("models-directory").value, model_id: el("model-id").value.trim(), offload_dir: el("offload-directory").value.trim(), model_kind: el("model-kind").value, device: el("model-device").value, dtype: el("model-dtype").value, cpu_memory_gb: numeric("cpu-memory"), max_new_tokens: numeric("max-tokens"), temperature: numeric("temperature"), top_p: numeric("top-p"), trust_remote_code: el("trust-remote-code").checked };
+  el("save-settings").disabled = true;
+  try { const result = await api("/api/settings", { method: "PUT", body: JSON.stringify(body) }); el("settings-status").textContent = result.restart_required ? "Saved. Restart Local Model to apply these changes." : "Settings are up to date."; }
+  catch (error) { el("settings-status").textContent = error.message; } finally { el("save-settings").disabled = false; }
+}
+
+async function toggleArchiveView() { if (state.busy) return; state.showArchived = !state.showArchived; await loadChats(); showBlankChat(); }
+async function chatAction(chatId, action) {
+  if (state.busy) return;
+  if (action === "archive") {
+    await api(`/api/chats/${chatId}/archive`, { method: "PATCH", body: JSON.stringify({ archived: !state.showArchived }) });
+  } else if (action === "delete") {
+    const chat = state.chats.find((item) => item.id === chatId);
+    if (!window.confirm(`Permanently delete “${chat?.title || "this chat"}”? This cannot be undone.`)) return;
+    await api(`/api/chats/${chatId}`, { method: "DELETE" });
+  }
+  await loadChats();
+  if (state.chatId === chatId) showBlankChat();
+}
 async function updateHealth() {
-  try {
-    const health = await api("/health");
-    el("status-dot").className = health.status === "ready" ? "ready" : health.status === "error" ? "error" : "";
-    el("status-text").textContent = health.status === "ready" ? "Model ready" : health.status === "error" ? "Model error" : "Loading model…";
-    el("model-name").textContent = health.model ? health.model.split(/[\\/]/).pop() : "";
-  } catch {
-    el("status-dot").className = "error";
-    el("status-text").textContent = "Server unavailable";
-  }
+  try { const health = await api("/health"); el("status-dot").className = health.status === "ready" ? "ready" : health.status === "error" ? "error" : ""; el("status-text").textContent = health.status === "ready" ? "Model ready" : health.status === "error" ? "Model error" : "Loading model…"; el("model-name").textContent = health.model ? health.model.split(/[\\/]/).pop() : ""; }
+  catch { el("status-dot").className = "error"; el("status-text").textContent = "Local Model unavailable"; }
 }
 
-el("new-chat").addEventListener("click", newChat);
-el("new-task").addEventListener("click", openTaskDialog);
-el("close-task-dialog").addEventListener("click", () => el("task-dialog").close());
-el("propose-task").addEventListener("click", proposeTask);
-el("create-task").addEventListener("click", createAndStartTask);
-el("start-task").addEventListener("click", () => taskAction("start"));
-el("pause-task").addEventListener("click", () => taskAction("pause"));
-el("resume-task").addEventListener("click", () => taskAction("resume"));
-el("cancel-task").addEventListener("click", () => {
-  if (window.confirm("Cancel this long-running task? Its history will be retained.")) taskAction("cancel");
-});
-el("plugin-menu-button").addEventListener("click", async () => {
-  const menu = el("plugin-menu");
-  menu.hidden = !menu.hidden;
-  el("plugin-menu-button").classList.toggle("active", !menu.hidden);
-  el("plugin-menu-button").setAttribute("aria-expanded", String(!menu.hidden));
-  if (!menu.hidden) await loadPlugins();
-});
-el("add-plugin").addEventListener("click", () => el("plugin-file").click());
-el("plugin-file").addEventListener("change", (event) => installPluginFile(event.target.files[0]));
-document.addEventListener("click", (event) => {
-  if (!event.target.closest(".plugin-control")) {
-    el("plugin-menu").hidden = true;
-    el("plugin-menu-button").classList.remove("active");
-    el("plugin-menu-button").setAttribute("aria-expanded", "false");
-  }
-});
-el("archive-view").addEventListener("click", toggleArchiveView);
-el("archive-chat").addEventListener("click", archiveCurrentChat);
-el("delete-chat").addEventListener("click", deleteCurrentChat);
-el("composer").addEventListener("submit", sendMessage);
-el("sidebar-toggle").addEventListener("click", () => document.querySelector(".shell").classList.toggle("sidebar-open"));
-el("message-input").addEventListener("input", (event) => {
-  event.target.style.height = "auto";
-  event.target.style.height = `${Math.min(event.target.scrollHeight, 180)}px`;
-});
-el("message-input").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    el("composer").requestSubmit();
-  }
+el("new-chat").addEventListener("click", () => startBlankChat()); el("new-project").addEventListener("click", openProjectDialog); el("chat-project").addEventListener("click", openProjectChoice);
+el("close-project-dialog").addEventListener("click", () => el("project-dialog").close()); el("browse-project").addEventListener("click", () => chooseDirectory("project-path")); el("create-project").addEventListener("click", createProject); el("close-project-choice").addEventListener("click", () => el("project-choice-dialog").close());
+el("open-settings").addEventListener("click", openSettings); el("close-settings").addEventListener("click", () => el("settings-dialog").close()); el("save-settings").addEventListener("click", saveSettings); el("search-models").addEventListener("click", searchModels); el("hf-search").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); searchModels(); } });
+document.querySelectorAll(".browse-directory").forEach((button) => button.addEventListener("click", () => chooseDirectory(button.dataset.target)));
+el("plugin-menu-button").addEventListener("click", async () => { const menu = el("plugin-menu"); menu.hidden = !menu.hidden; el("plugin-menu-button").classList.toggle("active", !menu.hidden); if (!menu.hidden) await loadPlugins(); });
+el("add-plugin").addEventListener("click", () => el("plugin-file").click()); el("plugin-file").addEventListener("change", (event) => installPluginFile(event.target.files[0]));
+document.addEventListener("click", (event) => { if (!event.target.closest(".plugin-control")) { el("plugin-menu").hidden = true; el("plugin-menu-button").classList.remove("active"); } });
+el("archive-view").addEventListener("click", toggleArchiveView); el("composer").addEventListener("submit", sendMessage); el("sidebar-toggle").addEventListener("click", () => document.querySelector(".shell").classList.toggle("sidebar-open"));
+el("message-input").addEventListener("input", (event) => { event.target.style.height = "auto"; event.target.style.height = `${Math.min(event.target.scrollHeight, 180)}px`; }); el("message-input").addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); el("composer").requestSubmit(); } });
+el("messages").addEventListener("click", () => { if (!state.currentArchived) el("message-input").focus(); });
+document.addEventListener("keydown", (event) => {
+  if (state.busy || state.currentArchived || event.ctrlKey || event.metaKey || event.altKey || event.key.length !== 1) return;
+  if (event.target.closest("input, textarea, select, button, dialog")) return;
+  const input = el("message-input");
+  event.preventDefault(); input.focus();
+  input.setRangeText(event.key, input.selectionStart, input.selectionEnd, "end");
+  input.dispatchEvent(new Event("input", { bubbles: true }));
 });
 
-Promise.all([loadChats(), loadTasks(), updateHealth(), loadPlugins()]).then(async () => {
-  if (state.chats.length) await openChat(state.chats[0].id);
-  else showEmptyState();
-}).catch((error) => {
-  el("status-dot").className = "error";
-  el("status-text").textContent = error.message;
-});
+Promise.all([loadChats(), loadProjects(), updateHealth(), loadPlugins()]).then(() => showBlankChat()).catch((error) => { el("status-dot").className = "error"; el("status-text").textContent = error.message; });
 setInterval(updateHealth, 15000);
-setInterval(async () => {
-  await loadTasks().catch(() => {});
-  if (state.mode === "task" && state.taskId) await openTask(state.taskId).catch(() => {});
-}, 10000);

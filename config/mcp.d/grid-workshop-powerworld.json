@@ -10,17 +10,37 @@
     {
       "id": "powerworld-aux",
       "transport": "stdio",
-      "command": "${PROJECT_ROOT}/localmodel-env/python.exe",
+      "command": "${PYTHON_EXECUTABLE}",
       "args": [
         "-m",
         "powerworld_aux_agent.mcp_server",
         "--tool-server-url",
-        "http://127.0.0.1:8000"
+        "http://127.0.0.1:8766"
       ],
       "cwd": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent",
       "env": {
         "PYTHONPATH": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent"
       },
+      "companions": [
+        {
+          "id": "powerworld-tool-backend",
+          "command": "${PYTHON_EXECUTABLE}",
+          "args": [
+            "-m",
+            "powerworld_aux_agent.api.server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8766"
+          ],
+          "cwd": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent",
+          "env": {
+            "PYTHONPATH": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent"
+          },
+          "ready_url": "http://127.0.0.1:8766/tools",
+          "timeout_seconds": 30
+        }
+      ],
       "timeout_seconds": 300
     }
   ],

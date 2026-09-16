@@ -26,7 +26,7 @@ class ChatStore:
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.scratchpad_dir.mkdir(parents=True, exist_ok=True)
         self.tool_activity_dir.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._connection = sqlite3.connect(path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
@@ -53,25 +53,113 @@ class ChatStore:
                 PRIMARY KEY(chat_id, plugin_id)
             );
             CREATE INDEX IF NOT EXISTS chat_plugins_plugin_id ON chat_plugins(plugin_id);
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS project_plugins (
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                plugin_id TEXT NOT NULL,
+                enabled_at TEXT NOT NULL,
+                PRIMARY KEY(project_id, plugin_id)
+            );
             """
         )
         columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(chats)").fetchall()}
         if "archived_at" not in columns:
             self._connection.execute("ALTER TABLE chats ADD COLUMN archived_at TEXT")
+        if "project_id" not in columns:
+            self._connection.execute("ALTER TABLE chats ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL")
+        self._connection.execute("CREATE INDEX IF NOT EXISTS chats_project_id ON chats(project_id)")
         self._connection.commit()
 
-    def create_chat(self, title: str = "New chat") -> dict[str, str]:
+    def create_chat(self, title: str = "New chat", project_id: str | None = None) -> dict[str, str | None]:
+        if project_id is not None:
+            self.get_project(project_id)
         chat_id = str(uuid.uuid4())
         timestamp = _now()
         with self._lock:
             self._connection.execute(
-                "INSERT INTO chats(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (chat_id, title.strip() or "New chat", timestamp, timestamp),
+                "INSERT INTO chats(id, title, created_at, updated_at, project_id) VALUES (?, ?, ?, ?, ?)",
+                (chat_id, title.strip() or "New chat", timestamp, timestamp, project_id),
             )
+            if project_id is not None:
+                self._connection.execute(
+                    """INSERT INTO chat_plugins(chat_id, plugin_id, enabled_at)
+                       SELECT ?, plugin_id, ? FROM project_plugins WHERE project_id = ?""",
+                    (chat_id, timestamp, project_id),
+                )
             self._connection.commit()
         return self.get_chat(chat_id)
 
-    def get_chat(self, chat_id: str) -> dict[str, str]:
+    def create_project(
+        self, path: str, *, name: str | None = None, plugin_ids: list[str] | None = None
+    ) -> dict[str, object]:
+        resolved = str(Path(path).expanduser().resolve())
+        project_name = (name or Path(resolved).name).strip()
+        if not project_name:
+            raise ValueError("Project name cannot be empty.")
+        if not Path(resolved).is_dir():
+            raise ValueError("Project folder does not exist.")
+        project_id = str(uuid.uuid4())
+        timestamp = _now()
+        with self._lock:
+            existing = self._connection.execute(
+                "SELECT id FROM projects WHERE path = ?", (resolved,)
+            ).fetchone()
+            if existing is not None:
+                return self.get_project(str(existing["id"]))
+            self._connection.execute(
+                "INSERT INTO projects(id, name, path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (project_id, project_name, resolved, timestamp, timestamp),
+            )
+            self._connection.executemany(
+                "INSERT INTO project_plugins(project_id, plugin_id, enabled_at) VALUES (?, ?, ?)",
+                [(project_id, plugin_id, timestamp) for plugin_id in dict.fromkeys(plugin_ids or [])],
+            )
+            self._connection.commit()
+        return self.get_project(project_id)
+
+    def get_project(self, project_id: str) -> dict[str, object]:
+        with self._lock:
+            row = self._connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if row is None:
+                raise KeyError(project_id)
+            plugin_rows = self._connection.execute(
+                "SELECT plugin_id FROM project_plugins WHERE project_id = ? ORDER BY enabled_at", (project_id,)
+            ).fetchall()
+        return {**dict(row), "plugin_ids": [str(item["plugin_id"]) for item in plugin_rows]}
+
+    def list_projects(self) -> list[dict[str, object]]:
+        with self._lock:
+            rows = self._connection.execute("SELECT id FROM projects ORDER BY name COLLATE NOCASE").fetchall()
+        return [self.get_project(str(row["id"])) for row in rows]
+
+    def project_plugins(self, project_id: str) -> list[str]:
+        return list(self.get_project(project_id)["plugin_ids"])
+
+    def move_chat_to_project(self, chat_id: str, project_id: str | None) -> dict[str, str | None]:
+        self.get_chat(chat_id)
+        if project_id is not None:
+            self.get_project(project_id)
+        with self._lock:
+            self._connection.execute(
+                "UPDATE chats SET project_id = ?, updated_at = ? WHERE id = ?",
+                (project_id, _now(), chat_id),
+            )
+            if project_id is not None:
+                self._connection.execute(
+                    """INSERT OR IGNORE INTO chat_plugins(chat_id, plugin_id, enabled_at)
+                       SELECT ?, plugin_id, ? FROM project_plugins WHERE project_id = ?""",
+                    (chat_id, _now(), project_id),
+                )
+            self._connection.commit()
+        return self.get_chat(chat_id)
+
+    def get_chat(self, chat_id: str) -> dict[str, str | None]:
         with self._lock:
             row = self._connection.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
         if row is None:
@@ -90,6 +178,16 @@ class ChatStore:
         with self._lock:
             rows = self._connection.execute("SELECT * FROM chats WHERE archived_at IS NULL ORDER BY updated_at DESC").fetchall()
         return [dict(row) for row in rows]
+
+    def discard_empty_chats(self) -> int:
+        """Remove unsent chat shells left by older clients or interrupted startup flows."""
+        with self._lock:
+            deleted = self._connection.execute(
+                """DELETE FROM chats
+                   WHERE NOT EXISTS (SELECT 1 FROM messages WHERE messages.chat_id = chats.id)"""
+            ).rowcount
+            self._connection.commit()
+        return int(deleted)
 
     def _archive_path(self, chat_id: str) -> Path:
         try:
@@ -262,8 +360,9 @@ class ChatStore:
         try:
             with self._lock:
                 self._connection.execute(
-                    "INSERT INTO chats(id, title, created_at, updated_at, archived_at) VALUES (?, ?, ?, ?, NULL)",
-                    (chat["id"], chat["title"], chat["created_at"], restored_at),
+                    """INSERT INTO chats(id, title, created_at, updated_at, archived_at, project_id)
+                       VALUES (?, ?, ?, ?, NULL, ?)""",
+                    (chat["id"], chat["title"], chat["created_at"], restored_at, chat.get("project_id")),
                 )
                 self._connection.executemany(
                     "INSERT INTO messages(chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",

@@ -5,10 +5,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Python = Join-Path $ProjectRoot 'localmodel-env\python.exe'
+$InstalledPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+$WorkspacePython = Join-Path $ProjectRoot 'localmodel-env\python.exe'
+$Python = if (Test-Path -LiteralPath $InstalledPython) { $InstalledPython } else { $WorkspacePython }
 
 if (-not (Test-Path -LiteralPath $Python)) {
-    throw "Could not find the project environment at $Python. Recreate the localmodel-env junction."
+    throw "Local Model is not installed. Run 'Install Local LLM.cmd' first."
 }
 
-& $Python (Join-Path $ProjectRoot 'main.py') @Arguments
+& $Python (Join-Path $ProjectRoot 'launcher.py') @Arguments

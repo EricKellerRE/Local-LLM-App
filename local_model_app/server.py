@@ -6,6 +6,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -14,10 +15,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from local_model_app.app_settings import AppSettingsStore
 from local_model_app.chat_store import ChatStore
 from local_model_app.config import Settings, _load_dotenv
 from local_model_app.coordinator import Coordinator
 from local_model_app.model import TransformersModel
+from local_model_app.huggingface_service import HuggingFaceService
 from local_model_app.mcp_manager import McpPluginManager
 from local_model_app.mcp_plugins import McpPluginRegistry, PluginConfigurationError
 from local_model_app.scratchpad import Scratchpad
@@ -33,6 +36,18 @@ ROOT = Path(__file__).resolve().parents[1]
 _load_dotenv(ROOT / ".env")
 
 
+def tracked_activity(label: str):
+    def decorate(function):
+        @wraps(function)
+        async def wrapped(self, *args, **kwargs):
+            async with self.activity(label):
+                return await function(self, *args, **kwargs)
+
+        return wrapped
+
+    return decorate
+
+
 class CompletionRequest(BaseModel):
     model: str | None = None
     messages: list[dict[str, Any]]
@@ -44,6 +59,7 @@ class CompletionRequest(BaseModel):
 
 class NewChatRequest(BaseModel):
     title: str = "New chat"
+    project_id: str | None = None
 
 
 class ChatMessageRequest(BaseModel):
@@ -72,8 +88,39 @@ class CreateTaskRequest(BaseModel):
     definition: TaskDefinition
 
 
+class NewProjectRequest(BaseModel):
+    path: str = Field(min_length=1)
+    name: str | None = None
+    plugin_ids: list[str] = Field(default_factory=list)
+
+
+class MoveChatRequest(BaseModel):
+    project_id: str | None = None
+
+
+class SettingsUpdateRequest(BaseModel):
+    model_id: str = ""
+    model_kind: str = "auto"
+    device: str = "auto"
+    dtype: str = "auto"
+    cpu_memory_gb: int | None = Field(default=None, ge=1)
+    offload_dir: str = ""
+    max_new_tokens: int = Field(default=512, ge=1, le=32768)
+    temperature: float = Field(default=0.7, ge=0, le=2)
+    top_p: float = Field(default=0.9, gt=0, le=1)
+    trust_remote_code: bool = False
+    data_directory: str
+    models_directory: str
+
+
+class ModelDownloadRequest(BaseModel):
+    repo_id: str = Field(min_length=3)
+
+
 class Runtime:
     def __init__(self) -> None:
+        self.app_settings = AppSettingsStore(ROOT)
+        self.paths = self.app_settings.paths()
         settings = Settings.from_environment(ROOT)
         self.model = TransformersModel(settings)
         encoder = (
@@ -82,11 +129,14 @@ class Runtime:
             else None
         )
         self.tool_router = ToolRouter(encoder, semantic_weight=settings.router_semantic_weight)
-        self.store = ChatStore(ROOT / "data" / "chats.sqlite3")
-        self.tasks = TaskStore(ROOT / "data" / "tasks.sqlite3")
+        self.store = ChatStore(self.paths.data_directory / "chats.sqlite3")
+        self.store.discard_empty_chats()
+        self.tasks = TaskStore(self.paths.data_directory / "tasks.sqlite3")
         self.mcp = McpPluginManager(McpPluginRegistry(ROOT / "config" / "mcp.d", project_root=ROOT))
         self.load_error: str | None = None
         self.loading = False
+        self.draining = False
+        self._active_operations: dict[str, str] = {}
         self._load_lock = asyncio.Lock()
         self._inference_lock = asyncio.Lock()
         self.task_coordinator = ModelTaskCoordinator(self.task_generate)
@@ -96,6 +146,18 @@ class Runtime:
             poll_seconds=float(os.getenv("LOCAL_TASK_POLL_SECONDS", "5")),
             lease_seconds=int(os.getenv("LOCAL_TASK_LEASE_SECONDS", "1800")),
         )
+        self.huggingface = HuggingFaceService(self.app_settings, self.activity)
+
+    @property
+    def data_directory(self) -> Path:
+        """Return the active data folder, including for lightweight test runtimes."""
+        paths = getattr(self, "paths", None)
+        if paths is not None:
+            return paths.data_directory
+        store = getattr(self, "store", None)
+        if store is not None and getattr(store, "path", None) is not None:
+            return Path(store.path).parent
+        return ROOT / "data"
 
     async def ensure_loaded(self) -> None:
         if self.model.loaded:
@@ -113,6 +175,19 @@ class Runtime:
             finally:
                 self.loading = False
 
+    @asynccontextmanager
+    async def activity(self, label: str):
+        token = uuid.uuid4().hex
+        operations = getattr(self, "_active_operations", None)
+        if operations is None:
+            operations = self._active_operations = {}
+        operations[token] = label
+        try:
+            yield
+        finally:
+            operations.pop(token, None)
+
+    @tracked_activity("a response is in progress")
     async def chat_completion(self, body: CompletionRequest):
         async with self._inference_lock:
             await self.ensure_loaded()
@@ -124,40 +199,105 @@ class Runtime:
                 temperature=body.temperature,
             )
 
+    @tracked_activity("background work is in progress")
     async def task_generate(self, messages: list[dict[str, Any]]) -> str:
         async with self._inference_lock:
             await self.ensure_loaded()
             return await asyncio.to_thread(self.model.generate, messages)
 
+    @tracked_activity("a response or tool action is in progress")
     async def respond(self, chat_id: str, content: str) -> str:
         history = [{"role": item["role"], "content": item["content"]} for item in self.store.messages(chat_id)]
+        chat = self.store.get_chat(chat_id)
+        if chat.get("project_id"):
+            for plugin_id in self.store.project_plugins(str(chat["project_id"])):
+                self.store.set_plugin_selected(chat_id, plugin_id, selected=True)
         selected_plugins = self.store.selected_plugins(chat_id)
+        requested_plugins = self.requested_plugins(content)
+        for plugin_id in requested_plugins:
+            self.store.set_plugin_selected(chat_id, plugin_id, selected=True)
+        if requested_plugins:
+            selected_plugins = self.store.selected_plugins(chat_id)
         async with self._inference_lock:
             await self.ensure_loaded()
             if selected_plugins:
                 coordinator = ToolCoordinator(
                     self.model,
                     self.mcp,
-                    Scratchpad(ROOT / "data" / "scratchpads" / f"{chat_id}.jsonl"),
-                    ROOT / "data" / "tool_activity" / f"{chat_id}.jsonl",
+                    Scratchpad(self.data_directory / "scratchpads" / f"{chat_id}.jsonl"),
+                    self.data_directory / "tool_activity" / f"{chat_id}.jsonl",
                     router=self.tool_router,
                 )
                 answer = await coordinator.respond(content, history, selected_plugins)
             else:
                 coordinator = Coordinator(
                     self.model,
-                    Scratchpad(ROOT / "data" / "scratchpads" / f"{chat_id}.jsonl"),
+                    Scratchpad(self.data_directory / "scratchpads" / f"{chat_id}.jsonl"),
                 )
                 coordinator.history = history
                 answer = await asyncio.to_thread(coordinator.respond, content)
         self.store.append_exchange(chat_id, content, answer)
         return answer
 
+    def requested_plugins(self, content: str) -> list[str]:
+        def normalize(value: str) -> str:
+            return " ".join(value.lower().replace("_", " ").replace("-", " ").replace(".", " ").split())
+
+        normalized = normalize(content)
+        requested: list[str] = []
+        for plugin in self.mcp.registry.plugins:
+            manifest = plugin.manifest
+            short_id = normalize(manifest.id.rsplit(".", 1)[-1])
+            names = {
+                normalize(manifest.id),
+                normalize(manifest.name),
+                f"{normalize(manifest.tool_namespace)} server",
+                f"{normalize(manifest.tool_namespace)} mcp",
+                f"{short_id} server",
+                f"{short_id} mcp",
+            }
+            if any(name and name in normalized for name in names):
+                requested.append(manifest.id)
+        return requested
+
     async def stop_unused_plugins(self, plugin_ids: list[str]) -> None:
         for plugin_id in plugin_ids:
             if self.store.plugin_selection_count(plugin_id) == 0:
                 await self.mcp.stop(plugin_id)
 
+    def shutdown_status(self) -> dict[str, Any]:
+        running_tasks = [
+            {
+                "id": task["id"],
+                "title": task["definition"].get("title") or task["request"],
+            }
+            for task in self.tasks.list_tasks()
+            if task["status"] == "running"
+        ]
+        reasons: list[str] = []
+        if self.loading:
+            reasons.append("the model is loading")
+        active_operations = getattr(self, "_active_operations", {})
+        reasons.extend(dict.fromkeys(active_operations.values()))
+        if self._inference_lock.locked() and not active_operations:
+            reasons.append("a response or tool action is in progress")
+        if running_tasks:
+            count = len(running_tasks)
+            reasons.append(f"{count} background task{' is' if count == 1 else 's are'} finishing a step")
+        return {
+            "busy": bool(reasons),
+            "draining": self.draining,
+            "reasons": reasons,
+            "running_tasks": running_tasks,
+        }
+
+    def prepare_shutdown(self) -> dict[str, Any]:
+        """Stop taking new background episodes and let current work checkpoint."""
+        self.draining = True
+        self.task_engine.request_stop()
+        return self.shutdown_status()
+
+    @tracked_activity("local tools are starting")
     async def mcp_content_catalog(self, chat_id: str) -> list[dict[str, Any]]:
         plugin_ids = self.store.selected_plugins(chat_id)
         await self.mcp.ensure_started(plugin_ids)
@@ -173,6 +313,7 @@ class Runtime:
             "arguments": item.input_schema,
         } for item in items]
 
+    @tracked_activity("a tool action is in progress")
     async def invoke_mcp_content(self, chat_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         plugin_ids = self.store.selected_plugins(chat_id)
         await self.mcp.ensure_started(plugin_ids)
@@ -207,7 +348,7 @@ class Runtime:
 
     def approval_state(self, chat_id: str) -> dict[str, Any]:
         self.store.get_chat(chat_id)
-        state_path = ROOT / "data" / "tool_activity" / f"{chat_id}.state.json"
+        state_path = self.data_directory / "tool_activity" / f"{chat_id}.state.json"
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -221,9 +362,10 @@ class Runtime:
             "arguments": state.get("arguments") or {},
         }
 
+    @tracked_activity("an approved tool action is in progress")
     async def approve_tool_call(self, chat_id: str) -> str:
         self.store.get_chat(chat_id)
-        activity_path = ROOT / "data" / "tool_activity" / f"{chat_id}.jsonl"
+        activity_path = self.data_directory / "tool_activity" / f"{chat_id}.jsonl"
         state_path = activity_path.with_suffix(".state.json")
         async with self._inference_lock:
             state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -310,7 +452,7 @@ class Runtime:
 
     async def deny_tool_call(self, chat_id: str) -> str:
         self.store.get_chat(chat_id)
-        activity_path = ROOT / "data" / "tool_activity" / f"{chat_id}.jsonl"
+        activity_path = self.data_directory / "tool_activity" / f"{chat_id}.jsonl"
         state_path = activity_path.with_suffix(".state.json")
         async with self._inference_lock:
             state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -348,6 +490,15 @@ STATIC_ROOT = ROOT / "local_model_app" / "static"
 app.mount("/static", StaticFiles(directory=STATIC_ROOT), name="static")
 
 
+@app.middleware("http")
+async def prevent_desktop_asset_caching(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
 def runtime(request: Request) -> Runtime:
     return request.app.state.runtime
 
@@ -367,6 +518,104 @@ async def health(request: Request):
         "error": service.load_error,
         "model": service.model.settings.model_id,
     }
+
+
+@app.get("/api/lifecycle/status", include_in_schema=False)
+async def lifecycle_status(request: Request):
+    return runtime(request).shutdown_status()
+
+
+@app.post("/api/lifecycle/prepare-shutdown", include_in_schema=False)
+async def prepare_shutdown(request: Request):
+    return runtime(request).prepare_shutdown()
+
+
+@app.post("/api/lifecycle/exit", include_in_schema=False)
+async def exit_application(request: Request):
+    request_exit = getattr(request.app.state, "request_process_exit", None)
+    if request_exit is None:
+        raise HTTPException(status_code=409, detail="The desktop launcher does not own this process.")
+    request_exit()
+    return {"status": "closing"}
+
+
+@app.get("/api/settings")
+async def get_settings(request: Request):
+    service = runtime(request)
+    return {
+        **service.app_settings.public_settings(),
+        "installed_models": service.app_settings.installed_models(),
+    }
+
+
+@app.put("/api/settings")
+async def update_settings(body: SettingsUpdateRequest, request: Request):
+    service = runtime(request)
+    before = service.app_settings.public_settings()
+    try:
+        saved = service.app_settings.update(body.model_dump())
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        **saved,
+        "installed_models": service.app_settings.installed_models(),
+        "restart_required": any(saved.get(key) != before.get(key) for key in saved),
+    }
+
+
+@app.get("/api/models/search")
+async def search_models(request: Request, q: str = ""):
+    try:
+        return await runtime(request).huggingface.search(q.strip())
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Hugging Face search failed: {exc}") from exc
+
+
+@app.post("/api/models/download")
+async def download_model(body: ModelDownloadRequest, request: Request):
+    try:
+        return runtime(request).huggingface.start_download(body.repo_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/models/download/{job_id}")
+async def model_download_status(job_id: str, request: Request):
+    try:
+        return runtime(request).huggingface.status(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Download not found") from exc
+
+
+@app.get("/api/projects")
+async def list_projects(request: Request):
+    return runtime(request).store.list_projects()
+
+
+@app.post("/api/projects")
+async def create_project(body: NewProjectRequest, request: Request):
+    service = runtime(request)
+    known_plugins = {plugin.manifest.id for plugin in service.mcp.registry.plugins}
+    unknown = sorted(set(body.plugin_ids) - known_plugins)
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown tools: {', '.join(unknown)}")
+    try:
+        return service.store.create_project(body.path, name=body.name, plugin_ids=body.plugin_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/activate")
+async def activate_project(project_id: str, request: Request):
+    service = runtime(request)
+    try:
+        plugin_ids = service.store.project_plugins(project_id)
+        await service.mcp.ensure_started(plugin_ids)
+        return {"project_id": project_id, "plugin_ids": plugin_ids}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not start project tools: {exc}") from exc
 
 
 @app.get("/api/plugins")
@@ -428,7 +677,10 @@ async def chat_completions(body: CompletionRequest, request: Request):
 
 @app.post("/api/chats")
 async def create_chat(body: NewChatRequest, request: Request):
-    return runtime(request).store.create_chat(body.title)
+    try:
+        return runtime(request).store.create_chat(body.title, project_id=body.project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
 
 
 @app.get("/api/chats")
@@ -440,7 +692,11 @@ async def list_chats(request: Request, archived: bool = False):
 async def get_chat(chat_id: str, request: Request):
     try:
         chat = runtime(request).store.get_chat(chat_id)
-        return {**chat, "messages": runtime(request).store.messages(chat_id)}
+        project = (
+            runtime(request).store.get_project(str(chat["project_id"]))
+            if chat.get("project_id") else None
+        )
+        return {**chat, "project": project, "messages": runtime(request).store.messages(chat_id)}
     except KeyError as exc:
         try:
             chat = runtime(request).store.get_archived_chat(chat_id)
@@ -454,6 +710,7 @@ async def chat_plugins(chat_id: str, request: Request):
     service = runtime(request)
     try:
         selected = set(service.store.selected_plugins(chat_id))
+        await service.mcp.ensure_started(list(selected))
     except KeyError as exc:
         try:
             selected = set(service.store.archived_plugins(chat_id))
@@ -478,6 +735,18 @@ async def select_chat_plugin(chat_id: str, plugin_id: str, body: PluginSelection
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     selected = set(service.store.selected_plugins(chat_id))
     return [{**plugin, "selected": plugin["id"] in selected} for plugin in service.mcp.status()]
+
+
+@app.patch("/api/chats/{chat_id}/project")
+async def move_chat_to_project(chat_id: str, body: MoveChatRequest, request: Request):
+    service = runtime(request)
+    try:
+        chat = service.store.move_chat_to_project(chat_id, body.project_id)
+        if body.project_id:
+            await service.mcp.ensure_started(service.store.project_plugins(body.project_id))
+        return chat
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Chat or project not found") from exc
 
 
 @app.get("/api/chats/{chat_id}/mcp-content")
@@ -507,8 +776,8 @@ async def delete_chat(chat_id: str, request: Request):
         except KeyError:
             plugin_ids = []
         service.store.delete_chat(chat_id)
-        (ROOT / "data" / "scratchpads" / f"{chat_id}.jsonl").unlink(missing_ok=True)
-        (ROOT / "data" / "tool_activity" / f"{chat_id}.jsonl").unlink(missing_ok=True)
+        (service.paths.data_directory / "scratchpads" / f"{chat_id}.jsonl").unlink(missing_ok=True)
+        (service.paths.data_directory / "tool_activity" / f"{chat_id}.jsonl").unlink(missing_ok=True)
         await service.stop_unused_plugins(plugin_ids)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Chat not found") from exc
@@ -533,7 +802,7 @@ async def get_scratchpad(chat_id: str, request: Request):
         runtime(request).store.get_chat(chat_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Chat not found") from exc
-    pad = Scratchpad(ROOT / "data" / "scratchpads" / f"{chat_id}.jsonl")
+    pad = Scratchpad(runtime(request).paths.data_directory / "scratchpads" / f"{chat_id}.jsonl")
     return {"entries": pad.recent(limit=20)}
 
 

@@ -45,11 +45,15 @@ class UniversalTaskEngine:
         self._runner = asyncio.create_task(self._run(), name="universal-task-worker")
 
     async def stop(self) -> None:
-        self._stop_event.set()
-        self._wake_event.set()
+        self.request_stop()
         if self._runner:
             await self._runner
             self._runner = None
+
+    def request_stop(self) -> None:
+        """Stop after the current checkpointable episode finishes."""
+        self._stop_event.set()
+        self._wake_event.set()
 
     def wake(self) -> None:
         self._wake_event.set()

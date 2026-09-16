@@ -1,17 +1,43 @@
+import asyncio
 import json
 import os
+import socket
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from local_model_app.mcp_plugins import (
+    CompanionProcessConfig,
     DiscoveredTool,
     McpPluginRegistry,
     PluginConfigurationError,
     _safe_tool_name,
     normalize_tool_result,
 )
+
+
+class CompanionProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_owned_companion_starts_becomes_ready_and_stops(self) -> None:
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            companion = CompanionProcessConfig(
+                id="test-http",
+                command=os.sys.executable,
+                args=["-m", "http.server", str(port), "--bind", "127.0.0.1"],
+                cwd=directory,
+                ready_url=f"http://127.0.0.1:{port}",
+                timeout_seconds=10,
+            )
+            registry = McpPluginRegistry.__new__(McpPluginRegistry)
+
+            processes = await registry._start_companions([companion])
+            self.assertTrue(await asyncio.to_thread(registry._url_is_ready, companion.ready_url))
+            await registry._stop_companions(processes)
+
+            self.assertIsNotNone(processes[0].returncode)
 
 
 class McpPluginRegistryTests(unittest.TestCase):
@@ -32,7 +58,14 @@ class McpPluginRegistryTests(unittest.TestCase):
                         "transport": "stdio",
                         "command": "${PROJECT_ROOT}/python.exe",
                         "args": ["server.py"],
-                        "cwd": "${SERVER_ROOT}"
+                        "cwd": "${SERVER_ROOT}",
+                        "companions": [{
+                            "id": "backend",
+                            "command": "${PYTHON_EXECUTABLE}",
+                            "args": ["-m", "demo.backend"],
+                            "cwd": "${SERVER_ROOT}",
+                            "ready_url": "http://127.0.0.1:9000/health"
+                        }]
                     }
                 ]
             }
@@ -41,6 +74,8 @@ class McpPluginRegistryTests(unittest.TestCase):
             server = registry._expanded_server(registry.plugins[0].manifest.servers[0])
             self.assertEqual(server.command, f"{root.resolve()}/python.exe")
             self.assertEqual(server.cwd, "C:/example")
+            self.assertEqual(server.companions[0].command, os.sys.executable)
+            self.assertEqual(server.companions[0].cwd, "C:/example")
 
     def test_missing_variable_is_rejected(self) -> None:
         with TemporaryDirectory(dir=Path.cwd()) as directory:
