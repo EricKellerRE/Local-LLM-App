@@ -43,7 +43,7 @@ The OpenAI-compatible chat endpoint also supports function definitions, assistan
 - Read model settings from `.env` or environment variables. Do not hard-code a model ID in Python.
 - Keep planner output constrained and treat it as model-generated guidance, not executable instructions.
 - Keep tool execution in allow-listed adapters. The model may propose a typed call; the adapter owns validation, authorization, execution, timeouts, and error handling.
-- Prefer staged tool discovery for large tool sets. Do not place an entire backend registry or every schema into a local model's context.
+- Prefer host-side hybrid lexical/semantic metadata routing and progressive schema disclosure for large tool sets. Do not place an entire backend registry or every schema into a local model's context; semantic failure must retain a deterministic lexical fallback.
 - Prefer atomic, composable tools over prompt-specific workflow scripts. Routing and skills should help the planner discover constraints and schemas, not duplicate the planner's sequencing work.
 - Keep a compound backend operation only when it provides a real boundary: transactionality, copy-on-write safety, deterministic reduction of large data, simulator lifecycle management, or durable detached-job handling.
 - Plans must identify dependencies and a completion condition. Execute only the next valid step, append its observation to the scratchpad, then continue or replan; never blindly execute an entire generated plan.
@@ -51,8 +51,8 @@ The OpenAI-compatible chat endpoint also supports function definitions, assistan
 - Archive chats as self-contained gzip files outside the active SQLite database. Include messages and scratchpad data, write atomically before deleting active rows, and support lossless restoration.
 - Persist enabled plugin ids per chat. Share one live MCP connection across chats using the same plugin, while exposing only each chat's selected tools to its planner.
 - Record plans, tool calls, arguments, results, and final-answer summaries in an inspectable per-chat activity log; include that log in gzip archives.
-- Treat staged MCP discovery as coordinator protocol: automatically follow unambiguous route/list/schema transitions, expose only the decision-relevant schema, compact duplicate results, checkpoint pending workflows across chat turns, and pause on missing required inputs or permissions.
-- Build routine MCP gateway wrappers deterministically after schema selection. Normalize copied `\_` Windows-path escapes only when the repaired source exists; leave planning and ambiguous choices to the model.
+- Treat server-provided staged gateways as optional optimizations, not requirements. Standard MCP catalogs must work through the generic host router.
+- Normalize copied `\_` Windows-path escapes only when the repaired source exists; leave planning and ambiguous choices to the model.
 - Prefer clear errors for unavailable CUDA, model-loading failures, or missing packages.
 - Write tests without loading a model. Hardware-dependent inference remains a manual smoke test.
 
@@ -76,23 +76,23 @@ Copy `.env.example` to `.env` and adjust:
 ## Plan
 
 1. Done: build the local UI for starting, listing, and resuming saved chats.
-2. Done: add OpenAI-compatible function calls and validate the staged PowerWorld route/list loop.
+2. Done: add OpenAI-compatible function calls and validate the standard PowerWorld MCP catalog loop.
 3. Add streaming model output to the API and UI.
 4. Add chat rename. Gzip archive/restore and permanent delete are complete.
 5. Define and import a versioned schema for literature-backed study playbooks from the workflow-research workspace.
-6. In progress: the composer plugin menu installs manifests and persists toggles per chat; selected chats share persistent MCP connections and receive only their selected tool catalogs. Planning and tool activity are logged and archived. Next, add interactive call approval, running-call status, cancellation, and activity-log UI.
+6. In progress: the composer plugin menu installs manifests and persists toggles per chat; selected chats share persistent MCP connections. The host stores complete catalogs internally, uses a measured hybrid semantic router over compact metadata, reveals schemas in bounded batches, keeps resources/prompts outside model-selected tools, validates and bounds observations, attaches capability guidance selectively, and supports one-shot approval in the UI. The official MCP Everything server is registered as an unrelated interoperability fixture. Planning and tool activity are logged and archived. Next, add running-call status, cancellation, activity-log UI, and protocol conformance automation.
 7. Package the server, UI, environment bootstrap, PowerWorld adapter, and model-location selection into a downloadable desktop app.
 8. Done: add the tool-agnostic long-running task engine, proposal/confirmation UI, durable work queue, bounded background worker, retry/backoff, lease recovery, task controls, and completion-audit records. Task-specific MCP executors and deterministic domain auditors remain future additions.
 
 ## PowerWorld integration
 
-`Grid-Workshop/powerworld-aux-agent` already provides a useful discovery and safety hierarchy. The local planner should see its compact MCP surface (`route`, `instructions`, `list`, `schema`, `call`, and `status`, plus the three common ranking shortcuts), not all backend schemas at once. That hierarchy is not the workflow planner: after discovery, Gemma should choose and replan around atomic backend calls, while the coordinator performs routine schema-to-gateway wrapping. Existing combined workflows should be decomposed when they merely encode a fixed call sequence, while deterministic reducers, simulator transactions, copy-on-write operations, and detached jobs remain legitimate compound tools.
+`Grid-Workshop/powerworld-aux-agent` now advertises its ordinary MCP tool catalog. Local Model retains every schema internally, ranks compact metadata, and initially exposes only the top four schemas. Gemma chooses and replans around atomic backend calls. Existing combined workflows should be decomposed when they merely encode a fixed call sequence, while deterministic reducers, simulator transactions, copy-on-write operations, and detached jobs remain legitimate compound tools.
 
-The existing PowerWorld agent loop can use this server through `http://127.0.0.1:8765/v1/chat/completions`; no LM Studio model server is involved. Route and discovery calls are safe first tests. Simulator reads and mutations remain subject to the PowerWorld adapter's existing path, copy-on-write, and detached-job conventions.
+The existing PowerWorld agent loop can use this server through `http://127.0.0.1:8765/v1/chat/completions`; no LM Studio model server is involved. Conservative catalog, field-discovery, case-summary, artifact-summary, manifest, and job-status calls are explicitly allowed. Mutations and simulator execution remain approval-gated and subject to the PowerWorld adapter's path, copy-on-write, and detached-job conventions.
 
 Generic MCP integration is configured through versioned drop-in manifests under `config/mcp.d/`; see `MCP_PLUGINS.md`. Local Model owns connection lifecycle and permissions, while Grid Workshop owns power-domain MCP implementations and literature-backed study playbooks.
 
-The first live Gemma/MCP smoke test completed a plan, emitted a structured `grid__powerworld_route_request` call, consumed the real MCP result, and returned the correct `comparison` classification. A longer tornado test then completed route, list, and schema discovery but exceeded a 30-minute request while reprocessing duplicated results. The coordinator now follows unambiguous discovery transitions itself, narrows model-visible tools at decision points, sends only structured MCP content when available, uses phase-specific generation budgets, and stops immediately when a schema exposes missing required inputs. `tests/mcp_state_machine_smoke.py` validates that behavior against the real Grid MCP server without loading model weights. The corresponding live Gemma retest completed the same route/list/schema trace and returned the correct `paths_csv` input pause in about ten minutes, with no simulator execution.
+`scripts/powerworld_tool_smoke.py` and `tests/mcp_state_machine_smoke.py` validate the standard catalog against the real Grid MCP server without loading generator weights. They require `regulatory.list_tests` to appear in the top four schemas, execute without approval, and be observed before the final answer. `evals/powerworld_routing_eval.py` measures recall@4, recall@8, abstention, wrong high-confidence proposals, semantic cold-start, and warm routing latency independently of model tool-call accuracy. `scripts/mcp_everything_smoke.py` validates the same generic host against the official, unrelated MCP Everything reference server.
 
 ## Environment note
 

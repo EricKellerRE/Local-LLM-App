@@ -1,0 +1,31 @@
+{
+  "manifest_version": 1,
+  "id": "mcp.reference.everything",
+  "tool_namespace": "everything",
+  "name": "MCP Everything Reference Server",
+  "version": "2026.8.31",
+  "description": "Official MCP reference server used to exercise generic client discovery and interoperability.",
+  "enabled": true,
+  "servers": [
+    {
+      "id": "everything",
+      "transport": "stdio",
+      "command": "cmd.exe",
+      "args": [
+        "/d",
+        "/s",
+        "/c",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-everything@2026.8.31"
+      ],
+      "timeout_seconds": 120
+    }
+  ],
+  "policy": {
+    "default_access": "ask",
+    "allow_tools": [],
+    "deny_tools": [],
+    "max_calls_per_turn": 4
+  }
+}

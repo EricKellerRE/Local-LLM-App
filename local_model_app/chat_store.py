@@ -147,6 +147,21 @@ class ChatStore:
             )
             self._connection.commit()
 
+    def append_message(self, chat_id: str, role: str, content: str) -> None:
+        self.get_chat(chat_id)
+        if role not in {"system", "user", "assistant"}:
+            raise ValueError(f"Unsupported chat role: {role}")
+        timestamp = _now()
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO messages(chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+                (chat_id, role, content, timestamp),
+            )
+            self._connection.execute(
+                "UPDATE chats SET updated_at = ? WHERE id = ?", (timestamp, chat_id)
+            )
+            self._connection.commit()
+
     def selected_plugins(self, chat_id: str) -> list[str]:
         self.get_chat(chat_id)
         with self._lock:

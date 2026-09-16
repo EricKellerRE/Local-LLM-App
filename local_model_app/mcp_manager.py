@@ -5,7 +5,13 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any
 
-from local_model_app.mcp_plugins import DiscoveredTool, McpPluginManifest, McpPluginRegistry
+from local_model_app.mcp_plugins import (
+    DiscoveredTool,
+    McpPluginManifest,
+    McpPluginRegistry,
+    PluginConfigurationError,
+    normalize_tool_result,
+)
 
 
 @dataclass
@@ -25,6 +31,15 @@ class McpPluginManager:
         self._errors: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def _add_discovered(active: ActivePlugin, discovered: list[DiscoveredTool]) -> None:
+        names = {item.exposed_name for item in active.tools}
+        for item in discovered:
+            if item.exposed_name in names:
+                raise PluginConfigurationError(f"Exposed MCP capability-name collision: {item.exposed_name}")
+            names.add(item.exposed_name)
+            active.tools.append(item)
+
     def status(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for plugin in self.registry.plugins:
@@ -42,7 +57,9 @@ class McpPluginManager:
                 "status": status,
                 "error": self._errors.get(plugin.manifest.id),
                 "server_count": len(plugin.manifest.servers),
-                "tool_count": len(active.tools) if active else 0,
+                "tool_count": len([item for item in active.tools if item.kind == "tool"]) if active else 0,
+                "resource_count": len([item for item in active.tools if item.kind.startswith("resource")]) if active else 0,
+                "prompt_count": len([item for item in active.tools if item.kind == "prompt"]) if active else 0,
                 "transports": sorted({server.transport for server in plugin.manifest.servers}),
                 "default_access": plugin.manifest.policy.default_access,
             })
@@ -75,7 +92,19 @@ class McpPluginManager:
                 for server in plugin.manifest.servers:
                     client = await stack.enter_async_context(self.registry.connect(server))
                     active.clients[server.id] = client
-                    active.tools.extend(await self.registry.discover_connected_tools(plugin, server, client))
+                    capabilities = getattr(client, "server_capabilities", None)
+                    if capabilities is None or getattr(capabilities, "tools", None) is not None:
+                        self._add_discovered(
+                            active, await self.registry.discover_connected_tools(plugin, server, client)
+                        )
+                    if capabilities is not None and getattr(capabilities, "resources", None) is not None:
+                        self._add_discovered(
+                            active, await self.registry.discover_connected_resources(plugin, server, client)
+                        )
+                    if capabilities is not None and getattr(capabilities, "prompts", None) is not None:
+                        self._add_discovered(
+                            active, await self.registry.discover_connected_prompts(plugin, server, client)
+                        )
                 active.ready_event.set()
                 await active.stop_event.wait()
         except Exception as exc:
@@ -105,6 +134,23 @@ class McpPluginManager:
             tool
             for plugin_id in plugin_ids
             for tool in (self._active.get(plugin_id).tools if self._active.get(plugin_id) else [])
+            if tool.kind == "tool"
+        ]
+
+    def resources_for_plugins(self, plugin_ids: list[str]) -> list[DiscoveredTool]:
+        return [
+            item
+            for plugin_id in plugin_ids
+            for item in (self._active.get(plugin_id).tools if self._active.get(plugin_id) else [])
+            if item.kind in {"resource", "resource_template"}
+        ]
+
+    def prompts_for_plugins(self, plugin_ids: list[str]) -> list[DiscoveredTool]:
+        return [
+            item
+            for plugin_id in plugin_ids
+            for item in (self._active.get(plugin_id).tools if self._active.get(plugin_id) else [])
+            if item.kind == "prompt"
         ]
 
     async def ensure_started(self, plugin_ids: list[str]) -> None:
@@ -137,12 +183,35 @@ class McpPluginManager:
             raise PermissionError(f"Tool requires user approval: {tool.native_name}")
         active = self._active[tool.plugin_id]
         client = active.clients[tool.server_id]
+        if tool.kind in {"resource", "resource_template"}:
+            uri = tool.target if tool.kind == "resource" else arguments["uri"]
+            result = await client.read_resource(uri)
+            return {
+                "content": [],
+                "structuredContent": {
+                    "uri": uri,
+                    "contents": [
+                        item.model_dump(mode="json", by_alias=True, exclude_none=True)
+                        for item in result.contents
+                    ],
+                },
+                "isError": False,
+            }
+        if tool.kind == "prompt":
+            result = await client.get_prompt(tool.target or "", arguments or None)
+            return {
+                "content": [],
+                "structuredContent": {
+                    "description": result.description,
+                    "messages": [
+                        item.model_dump(mode="json", by_alias=True, exclude_none=True)
+                        for item in result.messages
+                    ],
+                },
+                "isError": False,
+            }
         result = await client.call_tool(tool.native_name, arguments)
-        return {
-            "content": [item.model_dump(exclude_none=True) for item in result.content],
-            "structuredContent": result.structured_content,
-            "isError": bool(result.is_error),
-        }
+        return normalize_tool_result(tool, result)
 
     async def install(self, manifest_data: dict[str, Any]) -> dict[str, Any]:
         manifest = McpPluginManifest.model_validate(manifest_data)
