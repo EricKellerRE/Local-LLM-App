@@ -1,0 +1,26 @@
+{
+  "manifest_version": 1,
+  "id": "local.web-research",
+  "tool_namespace": "web",
+  "name": "Web Research",
+  "version": "1.0.0",
+  "description": "Built-in public web search and chunked webpage reading for durable research tasks.",
+  "enabled": true,
+  "servers": [
+    {
+      "id": "web-research",
+      "transport": "stdio",
+      "command": "${PYTHON_EXECUTABLE}",
+      "args": ["-m", "local_model_app.research_mcp"],
+      "cwd": "${PROJECT_ROOT}",
+      "env": {"PYTHONIOENCODING": "utf-8"},
+      "timeout_seconds": 60
+    }
+  ],
+  "policy": {
+    "default_access": "deny",
+    "allow_tools": ["search_web", "fetch_url"],
+    "deny_tools": [],
+    "max_calls_per_turn": 256
+  }
+}

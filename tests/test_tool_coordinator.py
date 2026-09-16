@@ -120,6 +120,7 @@ class ToolCoordinatorTests(unittest.TestCase):
             AssistantReply(content="", tool_calls=[{"id": "call_1", "type": "function", "function": {"name": tool.exposed_name, "arguments": '{"query":"cases"}'}}], reasoning_content="Use lookup."),
             AssistantReply(content="The lookup completed.", tool_calls=[]),
         ])
+        model.settings = SimpleNamespace(max_new_tokens=12_000)
         manager = FakeManager([tool], {tool.exposed_name: {"isError": False, "structuredContent": {"ok": True}}})
 
         with TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -130,6 +131,7 @@ class ToolCoordinatorTests(unittest.TestCase):
         self.assertEqual(answer, "The lookup completed.")
         self.assertEqual(manager.calls, [(tool.exposed_name, {"query": "cases"})])
         self.assertEqual(model.chat_calls[0]["max_new_tokens"], 192)
+        self.assertEqual(model.chat_calls[1]["max_new_tokens"], 12_000)
         tool_message = next(message for message in model.chat_calls[1]["messages"] if message["role"] == "tool")
         self.assertNotIn("duplicate", tool_message["content"])
 

@@ -34,6 +34,13 @@ class TaskStoreTests(unittest.TestCase):
             )
             item = store.claim_work_item(task["id"])
             self.assertEqual(item["id"], created[0]["id"])
+            checkpointed = store.checkpoint_work_item(
+                item["id"], {"pending_mcp_task": {"task_id": "task-123"}}
+            )
+            self.assertEqual(checkpointed["status"], "running")
+            self.assertEqual(
+                checkpointed["result"]["pending_mcp_task"]["task_id"], "task-123"
+            )
             store.complete_work_item(item["id"], {"summary": "done"})
             store.record_audit(task["id"], {"passed": True, "summary": "verified"})
             finished = store.release_task(task["id"], TaskStatus.COMPLETED, summary="verified")
@@ -43,6 +50,9 @@ class TaskStoreTests(unittest.TestCase):
             self.assertEqual(detail["work_items"][0]["result"]["summary"], "done")
             self.assertTrue(detail["latest_audit"]["passed"])
             self.assertIn("work_item_completed", [event["event"] for event in detail["events"]])
+            self.assertEqual([item["id"] for item in store.undelivered_terminal_tasks()], [task["id"]])
+            store.mark_delivered(task["id"])
+            self.assertEqual(store.undelivered_terminal_tasks(), [])
             store.close()
 
     def test_work_item_dependencies_are_enforced(self) -> None:

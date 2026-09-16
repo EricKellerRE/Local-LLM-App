@@ -58,7 +58,8 @@ class TaskStore:
                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
                 current_summary TEXT NOT NULL DEFAULT '',
                 waiting_reason TEXT,
-                last_error TEXT
+                last_error TEXT,
+                delivered_at TEXT
             );
             CREATE INDEX IF NOT EXISTS tasks_status_next_run ON tasks(status, next_run_at);
 
@@ -117,6 +118,11 @@ class TaskStore:
         self._connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS task_work_items_task_key ON task_work_items(task_id, item_key)"
         )
+        task_columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "delivered_at" not in task_columns:
+            self._connection.execute("ALTER TABLE tasks ADD COLUMN delivered_at TEXT")
         self._connection.commit()
 
     def _event(
@@ -183,6 +189,26 @@ class TaskStore:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT * FROM tasks ORDER BY updated_at DESC"
+            ).fetchall()
+        return [self._task_row(row) for row in rows]
+
+    def mark_delivered(self, task_id: str) -> dict[str, Any]:
+        with self._lock:
+            self.get_task(task_id)
+            self._connection.execute(
+                "UPDATE tasks SET delivered_at = ?, updated_at = ? WHERE id = ?",
+                (_timestamp(), _timestamp(), task_id),
+            )
+            self._event(task_id, "task_delivered")
+            self._connection.commit()
+        return self.get_task(task_id)
+
+    def undelivered_terminal_tasks(self) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in TERMINAL_TASK_STATUSES)
+        with self._lock:
+            rows = self._connection.execute(
+                f"SELECT * FROM tasks WHERE delivered_at IS NULL AND status IN ({placeholders}) ORDER BY updated_at",
+                tuple(TERMINAL_TASK_STATUSES),
             ).fetchall()
         return [self._task_row(row) for row in rows]
 
@@ -485,6 +511,27 @@ class TaskStore:
                 (json.dumps(result, ensure_ascii=False), now, now, work_item_id),
             )
             self._event(item["task_id"], "work_item_completed", {"summary": result.get("summary", "")}, work_item_id)
+            self._connection.commit()
+        return self.get_work_item(work_item_id)
+
+    def checkpoint_work_item(self, work_item_id: str, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+        """Persist in-flight executor state without changing the work-item status."""
+        with self._lock:
+            item = self.get_work_item(work_item_id)
+            self._connection.execute(
+                "UPDATE task_work_items SET result_json = ?, updated_at = ? WHERE id = ?",
+                (
+                    json.dumps(checkpoint, ensure_ascii=False) if checkpoint is not None else None,
+                    _timestamp(),
+                    work_item_id,
+                ),
+            )
+            self._event(
+                item["task_id"],
+                "work_item_checkpointed",
+                {"checkpoint": checkpoint or {}},
+                work_item_id,
+            )
             self._connection.commit()
         return self.get_work_item(work_item_id)
 

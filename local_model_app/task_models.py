@@ -38,7 +38,7 @@ class WorkItemStatus(StrEnum):
 
 class TaskExecutionPolicy(BaseModel):
     deadline: datetime | None = None
-    max_steps_per_episode: int = Field(default=8, ge=1, le=100)
+    max_steps_per_episode: int = Field(default=64, ge=1, le=100)
     maximum_attempts: int | None = Field(default=None, ge=1)
     retry_initial_seconds: int = Field(default=60, ge=1)
     retry_maximum_seconds: int = Field(default=21600, ge=1)

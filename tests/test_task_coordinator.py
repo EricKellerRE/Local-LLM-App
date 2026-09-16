@@ -9,6 +9,7 @@ class SequencedGenerator:
         self.replies = list(replies)
 
     async def __call__(self, messages):
+        self.messages = messages
         return self.replies.pop(0)
 
 
@@ -43,6 +44,32 @@ class TaskCoordinatorTests(unittest.TestCase):
         self.assertEqual(definition.title, "Literature review")
         self.assertIsNone(definition.execution.maximum_attempts)
         self.assertTrue(definition.execution.resume_after_restart)
+
+    def test_durable_tool_plan_uses_capabilities_and_finishes_with_synthesis(self) -> None:
+        generator = SequencedGenerator([
+            '{"work_items": ['
+            '{"key":"baseline","kind":"tool","title":"Measure baseline","instructions":"Inspect case",'
+            '"completion_check":"Metric recorded","priority":10,"depends_on":[]},'
+            '{"key":"report","kind":"synthesis","title":"Write report","instructions":"Compare results",'
+            '"completion_check":"Report complete","priority":0,"depends_on":["baseline"]}'
+            ']}'
+        ])
+
+        async def catalog(plugin_ids):
+            self.assertEqual(plugin_ids, ["grid-workshop.powerworld"])
+            return [{"name": "grid__case_overview", "description": "Inspect a case"}]
+
+        coordinator = ModelTaskCoordinator(generator, capability_catalog=catalog)
+        task = {"definition": {
+            "goal": "Improve the grid",
+            "success_criteria": ["Metric improves"],
+            "metadata": {"mode": "durable_tools", "plugin_ids": ["grid-workshop.powerworld"]},
+        }}
+
+        items = asyncio.run(coordinator.plan_task(task))
+
+        self.assertEqual([item.kind for item in items], ["tool", "synthesis"])
+        self.assertIn("grid__case_overview", generator.messages[1]["content"])
 
 
 if __name__ == "__main__":

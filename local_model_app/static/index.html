@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local Model</title>
-    <link rel="stylesheet" href="/static/styles.css?v=desktop-chat-5" />
+    <link rel="stylesheet" href="/static/styles.css?v=desktop-chat-7" />
   </head>
   <body>
     <div class="shell">
@@ -101,11 +101,23 @@
             <label>Device<select id="model-device"><option value="auto">Auto</option><option value="cpu">CPU</option><option value="cuda">CUDA</option></select></label>
             <label>Data type<select id="model-dtype"><option value="auto">Auto</option><option value="float16">float16</option><option value="bfloat16">bfloat16</option><option value="float32">float32</option></select></label>
             <label>CPU memory (GB)<input id="cpu-memory" type="number" min="1" placeholder="No limit" /></label>
-            <label>Max response tokens<input id="max-tokens" type="number" min="1" max="32768" /></label>
-            <label>Temperature<input id="temperature" type="number" min="0" max="2" step="0.05" /></label>
-            <label>Top P<input id="top-p" type="number" min="0.01" max="1" step="0.01" /></label>
           </div>
           <label class="checkbox-row"><input id="trust-remote-code" type="checkbox" /> Allow remote model code (only for repositories you trust)</label>
+        </section>
+
+        <section class="settings-section">
+          <h3>Context and generation</h3>
+          <p class="settings-explanation">The context window is shared by the conversation, tool results, reasoning, and the response.</p>
+          <div class="settings-grid context-settings">
+            <label>Context window<input id="context-window" type="number" min="256" max="4194304" placeholder="Use model limit" /><small>Total tokens available. Older turns are removed first when needed.</small></label>
+            <label>Response budget<input id="max-tokens" type="number" min="1" max="262144" /><small>Maximum generated tokens, including reasoning. The default is 8,192.</small></label>
+            <label>Reasoning budget<input id="reasoning-budget" type="number" min="0" max="262144" placeholder="Model default" /><small>Blank uses the model default; 0 disables thinking where supported.</small></label>
+            <label>Tool calls per checkpoint<input id="max-tool-calls" type="number" min="1" max="4096" /><small>Runaway guard for one checkpoint (default 256). It is not a whole-task limit.</small></label>
+            <label>Temperature<input id="temperature" type="number" min="0" max="2" step="0.05" /><small>Higher values make responses more varied.</small></label>
+            <label>Top P<input id="top-p" type="number" min="0.01" max="1" step="0.01" /><small>Limits sampling to the most likely token mass.</small></label>
+          </div>
+          <small id="context-window-note">The model's native context limit is detected after it loads.</small>
+          <small id="prompt-budget-note"></small>
         </section>
 
         <section class="settings-section">
@@ -119,6 +131,6 @@
       <div class="dialog-actions"><button id="save-settings" class="primary-button" type="button">Save settings</button></div>
     </dialog>
 
-    <script src="/static/app.js?v=desktop-chat-5" defer></script>
+    <script src="/static/app.js?v=desktop-chat-7" defer></script>
   </body>
 </html>

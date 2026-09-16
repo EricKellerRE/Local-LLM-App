@@ -36,13 +36,19 @@ There is no server window to manage and no second shutdown step.
 
 - **New chat** opens a blank conversation without creating clutter in the history.
 - **Add project** associates a folder with the app. Project chats are grouped beneath that folder in the sidebar and inherit the tools chosen for the project.
-- **Settings** controls the active model, generation options, app-data folder, and model-library folder.
+- **Settings** controls the active model, context window, response and reasoning budgets, sampling, app-data folder, and model-library folder. Blank context and reasoning values use the model defaults.
 - **Find models on Hugging Face** searches compatible Transformers text-generation models and downloads one into the selected model-library folder.
 - Longer requests use the same chat and the same tools; there is no separate task workspace to manage.
 - **Tools** enables optional capabilities for only the current chat.
 - **Archive** removes a chat from the main list without deleting its saved history.
 
 Chats, scratchpads, and activity records use `data/` by default. Models use `models/` by default. Both locations can be changed in **Settings**; changing the app-data location does not move existing data automatically.
+
+## Research and long work
+
+Ask for research, a literature review, an overnight report, or iterative project-tool work in an ordinary chat. The app turns that request into persisted evidence checkpoints, uses the selected tools, audits the requested outcome, and posts the final report back into the same chat. There is no eight-call or other fixed whole-task limit. The configurable tool-call value is only a runaway guard for one checkpoint; the task creates further checkpoints and audit follow-ups until it is complete or genuinely needs user input.
+
+Public-web research automatically uses the built-in search and chunked page reader. Long Grid Workshop operations use the MCP durable-task protocol, persist the Grid task ID before waiting, and resume polling that same operation after an app restart instead of launching a duplicate. Grid mutations and simulator runs still require explicit approval.
 
 ## Optional: open at sign-in
 
@@ -72,6 +78,10 @@ The usual settings are in `.env`:
 | `LOCAL_MODEL_DTYPE` | `auto`, `float16`, `bfloat16`, or `float32`. |
 | `LOCAL_MODEL_CPU_MEMORY_GB` | Optional CPU memory ceiling. |
 | `LOCAL_MODEL_OFFLOAD_DIR` | Optional model offload directory. |
+| `LOCAL_MODEL_CONTEXT_WINDOW` | Total token capacity for conversation history plus generation; blank uses the detected model limit. |
+| `LOCAL_MODEL_MAX_NEW_TOKENS` | Total generation budget, including reasoning tokens; defaults to 8,192 and also governs final answers after tool use. |
+| `LOCAL_MODEL_REASONING_BUDGET` | Blank uses the model default, `0` disables thinking, and a positive value is passed to compatible chat templates. |
+| `LOCAL_MAX_TOOL_CALLS_PER_STEP` | Runaway guard for one checkpoint; defaults to 256 (maximum 4,096) and does not cap the total calls in a durable task. A durable task starts another checkpoint as needed until its completion audit passes. |
 | `LOCAL_MODEL_EAGER_LOAD` | Load the model as soon as the app opens. |
 | `LOCAL_ROUTER_MODEL_ID` | Optional local sentence encoder for choosing tools. |
 
@@ -106,4 +116,4 @@ For architecture and roadmap details, see [PROJECT.md](PROJECT.md). For plugin m
 - `scripts/powerworld_tool_smoke.py` runs a live read-only PowerWorld catalog smoke test.
 - `scripts/mcp_everything_smoke.py` checks interoperability with the official MCP Everything reference server.
 
-The Grid Workshop plugin's HTTP backend is declared as an owned companion process. Enabling the plugin starts the backend and MCP bridge together; disabling it or closing Local Model stops both.
+The Grid Workshop plugin's HTTP backend is declared as an owned companion process. Enabling the plugin starts the backend and MCP bridge together; disabling it or closing Local Model stops both. A detached Grid MCP task worker can finish independently; Local Model reconnects to its persisted task record on the next launch.

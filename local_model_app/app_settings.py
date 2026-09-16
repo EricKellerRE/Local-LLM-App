@@ -14,7 +14,10 @@ MODEL_ENV_KEYS = {
     "dtype": "LOCAL_MODEL_DTYPE",
     "cpu_memory_gb": "LOCAL_MODEL_CPU_MEMORY_GB",
     "offload_dir": "LOCAL_MODEL_OFFLOAD_DIR",
+    "context_window": "LOCAL_MODEL_CONTEXT_WINDOW",
     "max_new_tokens": "LOCAL_MODEL_MAX_NEW_TOKENS",
+    "reasoning_budget": "LOCAL_MODEL_REASONING_BUDGET",
+    "max_tool_calls_per_step": "LOCAL_MAX_TOOL_CALLS_PER_STEP",
     "temperature": "LOCAL_MODEL_TEMPERATURE",
     "top_p": "LOCAL_MODEL_TOP_P",
     "trust_remote_code": "LOCAL_MODEL_TRUST_REMOTE_CODE",
@@ -66,7 +69,10 @@ class AppSettingsStore:
             "dtype": "auto",
             "cpu_memory_gb": None,
             "offload_dir": "",
-            "max_new_tokens": 512,
+            "context_window": None,
+            "max_new_tokens": 8192,
+            "reasoning_budget": None,
+            "max_tool_calls_per_step": 256,
             "temperature": 0.7,
             "top_p": 0.9,
             "trust_remote_code": False,
@@ -77,7 +83,10 @@ class AppSettingsStore:
             for default in [defaults[key]]
         }
         result["cpu_memory_gb"] = int(result["cpu_memory_gb"]) if str(result["cpu_memory_gb"] or "") else None
+        result["context_window"] = int(result["context_window"]) if str(result["context_window"] or "") else None
         result["max_new_tokens"] = int(result["max_new_tokens"])
+        result["reasoning_budget"] = int(result["reasoning_budget"]) if str(result["reasoning_budget"] or "") else None
+        result["max_tool_calls_per_step"] = int(result["max_tool_calls_per_step"])
         result["temperature"] = float(result["temperature"])
         result["top_p"] = float(result["top_p"])
         result["trust_remote_code"] = str(result["trust_remote_code"]).lower() in {"1", "true", "yes"}

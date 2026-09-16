@@ -65,12 +65,14 @@ Copy `.env.example` to `.env` and adjust:
 | `LOCAL_MODEL_ID` | Hugging Face causal-LM repository or local model directory. |
 | `LOCAL_MODEL_DEVICE` | `auto`, `cpu`, or `cuda`. |
 | `LOCAL_MODEL_DTYPE` | `auto`, `float16`, `bfloat16`, or `float32`. |
-| `LOCAL_MODEL_MAX_NEW_TOKENS` | Upper bound for a single model response. |
+| `LOCAL_MODEL_CONTEXT_WINDOW` | Optional total prompt and generation context; blank detects the model limit. |
+| `LOCAL_MODEL_MAX_NEW_TOKENS` | Upper bound for a model response, including final answers after tool use; defaults to 8,192. |
+| `LOCAL_MODEL_REASONING_BUDGET` | Optional thinking budget for compatible chat templates; `0` disables thinking. |
 | `LOCAL_MODEL_TEMPERATURE` | Sampling temperature. Use `0` for greedy decoding. |
 | `LOCAL_MODEL_TRUST_REMOTE_CODE` | Set only for models whose repository you trust. |
 | `LOCAL_PLANNER_MAX_NEW_TOKENS` | Token budget for the bounded execution plan. |
 | `LOCAL_TOOL_ACTION_MAX_NEW_TOKENS` | Token budget for a structured tool decision. |
-| `LOCAL_TOOL_FINAL_MAX_NEW_TOKENS` | Token budget for the final answer after observations. |
+| `LOCAL_MAX_TOOL_CALLS_PER_STEP` | Per-checkpoint runaway guard; defaults to 256, supports up to 4,096, and is not a whole-task limit. |
 | `LOCAL_TOOL_TEMPERATURE` | Sampling temperature for tool-enabled planning and action turns. |
 
 ## Plan
@@ -80,13 +82,13 @@ Copy `.env.example` to `.env` and adjust:
 3. Add streaming model output to the API and UI.
 4. Add chat rename. Gzip archive/restore and permanent delete are complete.
 5. Define and import a versioned schema for literature-backed study playbooks from the workflow-research workspace.
-6. In progress: the composer plugin menu installs manifests and persists toggles per chat; selected chats share persistent MCP connections. The host stores complete catalogs internally, uses a measured hybrid semantic router over compact metadata, reveals schemas in bounded batches, keeps resources/prompts outside model-selected tools, validates and bounds observations, attaches capability guidance selectively, and supports one-shot approval in the UI. The official MCP Everything server is registered as an unrelated interoperability fixture. Planning and tool activity are logged and archived. Next, add running-call status, cancellation, activity-log UI, and protocol conformance automation.
+6. In progress: the composer plugin menu installs manifests and persists toggles per chat; selected chats share persistent MCP connections. The host stores complete catalogs internally, uses a measured hybrid semantic router over compact metadata, reveals schemas in bounded batches, keeps resources/prompts outside model-selected tools, validates and bounds observations, attaches capability guidance selectively, and supports one-shot approval in the UI. MCP 2025-11-25 durable tool tasks are launched, checkpointed by task ID, polled, and resumed after restart. The official MCP Everything server is registered as an unrelated interoperability fixture. Planning and tool activity are logged and archived. Next, add running-call cancellation, activity-log UI, and broader protocol conformance automation.
 7. In progress: the desktop window now owns API startup and shutdown, the installer creates the environment, tool plugins can declare owned companion processes, and closing the window safely drains or ends active work. Remaining packaging work is model-location selection and a distributable installer.
-8. The separate long-running-task UI was removed. Longer work belongs in ordinary chats so it uses the same conversation, project context, and tools; durability remains an internal concern rather than a second user workflow.
+8. Done: the separate long-running-task UI was removed. Research and iterative project-tool requests made in ordinary chats are planned into durable evidence checkpoints plus final synthesis. Checkpoints repeat without a fixed whole-task call limit, survive restart, undergo a completion audit, and deliver the report back into the originating chat.
 
 ## PowerWorld integration
 
-`Grid-Workshop/powerworld-aux-agent` now advertises its ordinary MCP tool catalog. Local Model retains every schema internally, ranks compact metadata, and initially exposes only the top four schemas. Gemma chooses and replans around atomic backend calls. Existing combined workflows should be decomposed when they merely encode a fixed call sequence, while deterministic reducers, simulator transactions, copy-on-write operations, and detached jobs remain legitimate compound tools.
+`Grid-Workshop/powerworld-aux-agent` now advertises its ordinary MCP tool catalog. Local Model retains every schema internally, ranks compact metadata, and initially exposes only the top four schemas. Gemma chooses and replans around atomic backend calls. Tools marked as requiring MCP task execution are started through the durable task lifecycle; their task IDs are persisted before polling so the app can reconnect without duplicating a long study. Existing combined workflows should be decomposed when they merely encode a fixed call sequence, while deterministic reducers, simulator transactions, copy-on-write operations, and detached jobs remain legitimate compound tools.
 
 The existing PowerWorld agent loop can use this server through `http://127.0.0.1:8765/v1/chat/completions`; no LM Studio model server is involved. Conservative catalog, field-discovery, case-summary, artifact-summary, manifest, and job-status calls are explicitly allowed. Mutations and simulator execution remain approval-gated and subject to the PowerWorld adapter's path, copy-on-write, and detached-job conventions.
 

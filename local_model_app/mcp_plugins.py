@@ -67,7 +67,7 @@ class PluginPolicy(BaseModel):
     default_access: Literal["deny", "ask", "allow"] = "ask"
     allow_tools: list[str] = Field(default_factory=list)
     deny_tools: list[str] = Field(default_factory=list)
-    max_calls_per_turn: int = Field(default=8, ge=1, le=100)
+    max_calls_per_turn: int = Field(default=256, ge=1, le=4096)
 
 
 class GuidanceDocument(BaseModel):
@@ -122,6 +122,7 @@ class DiscoveredTool:
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None
     annotations: dict[str, Any]
+    execution: dict[str, Any] | None = None
     kind: Literal["tool", "resource", "resource_template", "prompt"] = "tool"
     target: str | None = None
 
@@ -427,6 +428,10 @@ class McpPluginRegistry:
                         annotations=(
                             tool.annotations.model_dump(by_alias=True, exclude_none=True)
                             if tool.annotations else {}
+                        ),
+                        execution=(
+                            tool.execution.model_dump(by_alias=True, exclude_none=True)
+                            if getattr(tool, "execution", None) else None
                         ),
                     )
                 )

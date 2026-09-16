@@ -25,7 +25,7 @@ class FakeApprovalManager:
 
 class FakeApprovalModel:
     def __init__(self) -> None:
-        self.settings = SimpleNamespace(tool_final_max_new_tokens=128, tool_temperature=0.0)
+        self.settings = SimpleNamespace(max_new_tokens=4096, tool_temperature=0.0)
         self.calls = []
 
     def chat(self, messages, **kwargs):
@@ -70,6 +70,7 @@ class ApprovalTests(unittest.TestCase):
 
             self.assertIn("TPL-001", answer)
             self.assertEqual(runtime.mcp.calls, [("grid__regulatory_list_tests", {}, True)])
+            self.assertEqual(runtime.model.calls[0][1]["max_new_tokens"], 4096)
             self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["status"], "complete")
             self.assertEqual(store.messages(chat["id"])[-1]["content"], answer)
             store.close()
