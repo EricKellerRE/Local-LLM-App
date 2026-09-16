@@ -2,12 +2,12 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ServerScript = Join-Path $ProjectRoot 'server.ps1'
+$AppScript = Join-Path $ProjectRoot 'run.ps1'
 $PowerShell = (Get-Process -Id $PID).Path
 $TaskName = 'Local Model Coordinator'
 $Action = New-ScheduledTaskAction `
     -Execute $PowerShell `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ServerScript`""
+    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$AppScript`""
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -21,7 +21,7 @@ Register-ScheduledTask `
     -Action $Action `
     -Trigger $Trigger `
     -Settings $Settings `
-    -Description 'Runs the local model server and resumes durable tasks after sign-in.' `
+    -Description 'Opens Local Model after sign-in.' `
     -Force | Out-Null
 
-Write-Host "Installed '$TaskName'. It will start at sign-in and restart after failures."
+Write-Host "Installed '$TaskName'. The app will open after sign-in."

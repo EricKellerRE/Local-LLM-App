@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local Model</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=desktop-chat-5" />
   </head>
   <body>
     <div class="shell">
@@ -14,37 +14,29 @@
           <div><strong>Local Model</strong><small>Private, on this computer</small></div>
         </div>
         <button id="new-chat" class="new-chat" type="button">＋ New chat</button>
-        <button id="new-task" class="new-chat" type="button">＋ Long-running task</button>
-        <div class="sidebar-label">Tasks</div>
-        <nav id="task-list" class="task-list" aria-label="Long-running tasks"></nav>
+        <button id="new-project" class="sidebar-action" type="button">＋ Add project</button>
+
+        <div class="sidebar-label">Projects</div>
+        <nav id="project-list" class="project-list" aria-label="Project chats"></nav>
+
         <div class="sidebar-label">Chats</div>
-        <nav id="chat-list" class="chat-list" aria-label="Saved chats"></nav>
-        <button id="archive-view" class="archive-view" type="button">Archived chats</button>
-        <div class="server-state"><span id="status-dot"></span><span id="status-text">Checking model…</span></div>
+        <nav id="chat-list" class="chat-list" aria-label="Chats without a project"></nav>
+
+        <div class="sidebar-footer">
+          <button id="archive-view" class="archive-view" type="button">Archived chats</button>
+          <button id="open-settings" class="archive-view" type="button">⚙ Settings</button>
+          <div class="server-state"><span id="status-dot"></span><span id="status-text">Checking model…</span></div>
+        </div>
       </aside>
 
       <main class="main">
         <header class="topbar">
           <button id="sidebar-toggle" class="icon-button" type="button" aria-label="Toggle conversations">☰</button>
           <div class="title-block"><h1 id="chat-title">New chat</h1><p id="model-name"></p></div>
-          <button id="start-task" class="text-button" type="button" hidden>Start</button>
-          <button id="pause-task" class="text-button" type="button" hidden>Pause</button>
-          <button id="resume-task" class="text-button" type="button" hidden>Resume</button>
-          <button id="cancel-task" class="text-button danger" type="button" hidden>Cancel</button>
-          <button id="archive-chat" class="text-button" type="button" hidden>Archive</button>
-          <button id="delete-chat" class="text-button danger" type="button" hidden>Delete</button>
+          <button id="chat-project" class="text-button" type="button">No project</button>
         </header>
 
-        <section id="messages" class="messages" aria-live="polite">
-          <div id="welcome" class="welcome">
-            <div class="orb">L</div>
-            <h2>What would you like to work on?</h2>
-            <p>Your chats and scratchpad stay on this computer.</p>
-          </div>
-        </section>
-
-        <section id="task-detail" class="task-detail" aria-live="polite" hidden></section>
-
+        <section id="messages" class="messages" aria-live="polite"></section>
         <section id="approval-panel" class="approval-panel" hidden></section>
 
         <form id="composer" class="composer">
@@ -53,34 +45,80 @@
               <button id="plugin-menu-button" class="plus-button" type="button" aria-label="Tools and plugins" aria-expanded="false">＋</button>
               <section id="plugin-menu" class="plugin-menu" hidden>
                 <div class="plugin-menu-heading">
-                  <div><strong>Tools</strong><small>Start an MCP server for this session</small></div>
+                  <div><strong>Tools</strong><small>Choose what this chat can use</small></div>
                   <button id="add-plugin" class="add-plugin" type="button">Add plugin</button>
                   <input id="plugin-file" type="file" accept="application/json,.json" hidden />
                 </div>
                 <div id="plugin-list" class="plugin-list"></div>
               </section>
             </div>
-            <textarea id="message-input" rows="1" placeholder="Message your local model" aria-label="Message"></textarea>
+            <textarea id="message-input" rows="1" tabindex="0" placeholder="Message your local model" aria-label="Message" autofocus></textarea>
             <button id="send" type="submit" aria-label="Send message">↑</button>
           </div>
-          <p id="composer-note">Responses may take a few minutes on CPU.</p>
+          <p id="composer-note">Press Enter to send · Shift+Enter for a new line</p>
         </form>
       </main>
     </div>
-    <dialog id="task-dialog" class="task-dialog">
-      <div class="task-dialog-heading">
-        <div><h2>Create a long-running task</h2><p>Describe the outcome. The local model will assemble a reviewable task contract.</p></div>
-        <button id="close-task-dialog" class="text-button" type="button">Close</button>
-      </div>
-      <label for="task-request">What should continue until completion?</label>
-      <textarea id="task-request" rows="6" placeholder="For example: Compile a 100-source literature review…"></textarea>
-      <div id="task-proposal" class="task-proposal" hidden></div>
-      <p id="task-dialog-status" class="dialog-status"></p>
-      <div class="dialog-actions">
-        <button id="propose-task" class="primary-button" type="button">Assemble task</button>
-        <button id="create-task" class="primary-button" type="button" hidden>Confirm and start</button>
-      </div>
+
+    <dialog id="project-dialog" class="modal-dialog">
+      <div class="dialog-heading"><div><h2>Add a project</h2><p>Choose the folder and any tools that should start for its chats.</p></div><button id="close-project-dialog" class="text-button" type="button">Close</button></div>
+      <label>Project folder</label>
+      <div class="path-row"><input id="project-path" type="text" readonly placeholder="Choose a folder" /><button id="browse-project" class="text-button" type="button">Browse…</button></div>
+      <label for="project-name">Name</label>
+      <input id="project-name" type="text" placeholder="Project name" />
+      <label>Tools for project chats</label>
+      <div id="project-plugins" class="check-list"></div>
+      <p id="project-status" class="dialog-status"></p>
+      <div class="dialog-actions"><button id="create-project" class="primary-button" type="button">Add project</button></div>
     </dialog>
-    <script src="/static/app.js" defer></script>
+
+    <dialog id="project-choice-dialog" class="modal-dialog compact-dialog">
+      <div class="dialog-heading"><div><h2>Chat project</h2><p>New messages will be associated with this folder.</p></div><button id="close-project-choice" class="text-button" type="button">Close</button></div>
+      <div id="project-choices" class="choice-list"></div>
+    </dialog>
+
+    <dialog id="settings-dialog" class="modal-dialog settings-dialog">
+      <div class="dialog-heading"><div><h2>Settings</h2><p>Model and storage changes take effect after restarting Local Model.</p></div><button id="close-settings" class="text-button" type="button">Close</button></div>
+      <div class="settings-scroll">
+        <section class="settings-section">
+          <h3>Storage</h3>
+          <label>App data</label>
+          <div class="path-row"><input id="data-directory" type="text" readonly /><button class="text-button browse-directory" data-target="data-directory" type="button">Browse…</button></div>
+          <small>Chats, projects, and logs. Existing data is not moved automatically.</small>
+          <label>Models</label>
+          <div class="path-row"><input id="models-directory" type="text" readonly /><button class="text-button browse-directory" data-target="models-directory" type="button">Browse…</button></div>
+        </section>
+
+        <section class="settings-section">
+          <h3>Active model</h3>
+          <label for="model-id">Model ID or local folder</label>
+          <input id="model-id" type="text" list="installed-models" placeholder="organization/model or C:\\models\\model" />
+          <datalist id="installed-models"></datalist>
+          <label>Offload folder (optional)</label>
+          <div class="path-row"><input id="offload-directory" type="text" placeholder="Used when a model exceeds available memory" /><button class="text-button browse-directory" data-target="offload-directory" type="button">Browse…</button></div>
+          <div class="settings-grid">
+            <label>Kind<select id="model-kind"><option value="auto">Auto</option><option value="text">Text</option><option value="multimodal">Multimodal</option></select></label>
+            <label>Device<select id="model-device"><option value="auto">Auto</option><option value="cpu">CPU</option><option value="cuda">CUDA</option></select></label>
+            <label>Data type<select id="model-dtype"><option value="auto">Auto</option><option value="float16">float16</option><option value="bfloat16">bfloat16</option><option value="float32">float32</option></select></label>
+            <label>CPU memory (GB)<input id="cpu-memory" type="number" min="1" placeholder="No limit" /></label>
+            <label>Max response tokens<input id="max-tokens" type="number" min="1" max="32768" /></label>
+            <label>Temperature<input id="temperature" type="number" min="0" max="2" step="0.05" /></label>
+            <label>Top P<input id="top-p" type="number" min="0.01" max="1" step="0.01" /></label>
+          </div>
+          <label class="checkbox-row"><input id="trust-remote-code" type="checkbox" /> Allow remote model code (only for repositories you trust)</label>
+        </section>
+
+        <section class="settings-section">
+          <h3>Find models on Hugging Face</h3>
+          <div class="path-row"><input id="hf-search" type="search" placeholder="Search compatible Transformers chat models" /><button id="search-models" class="text-button" type="button">Search</button></div>
+          <p id="hf-status" class="dialog-status"></p>
+          <div id="hf-results" class="model-results"></div>
+        </section>
+      </div>
+      <p id="settings-status" class="dialog-status"></p>
+      <div class="dialog-actions"><button id="save-settings" class="primary-button" type="button">Save settings</button></div>
+    </dialog>
+
+    <script src="/static/app.js?v=desktop-chat-5" defer></script>
   </body>
 </html>

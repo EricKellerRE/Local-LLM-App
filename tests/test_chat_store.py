@@ -44,6 +44,41 @@ class ChatStoreTests(unittest.TestCase):
             self.assertEqual(store.plugin_selection_count("example.plugin"), 0)
             store.close()
 
+    def test_empty_chat_shells_are_discarded_without_touching_real_chats(self) -> None:
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            store = ChatStore(Path(directory) / "chats.sqlite3")
+            empty = store.create_chat()
+            real = store.create_chat()
+            store.append_exchange(real["id"], "hello", "hi")
+
+            self.assertEqual(store.discard_empty_chats(), 1)
+            with self.assertRaises(KeyError):
+                store.get_chat(empty["id"])
+            self.assertEqual(store.get_chat(real["id"])["title"], "hello")
+            store.close()
+
+    def test_project_chats_are_grouped_and_inherit_project_plugins(self) -> None:
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            project_folder = root / "sample-project"
+            project_folder.mkdir()
+            store = ChatStore(root / "chats.sqlite3")
+            project = store.create_project(
+                str(project_folder), name="Sample", plugin_ids=["example.plugin"]
+            )
+            associated = store.create_chat(project_id=str(project["id"]))
+            unassociated = store.create_chat()
+
+            self.assertEqual(associated["project_id"], project["id"])
+            self.assertIsNone(unassociated["project_id"])
+            self.assertEqual(store.selected_plugins(associated["id"]), ["example.plugin"])
+            self.assertEqual(store.list_projects()[0]["name"], "Sample")
+
+            moved = store.move_chat_to_project(unassociated["id"], str(project["id"]))
+            self.assertEqual(moved["project_id"], project["id"])
+            self.assertEqual(store.selected_plugins(unassociated["id"]), ["example.plugin"])
+            store.close()
+
     def test_archive_is_lossless_and_reversible(self) -> None:
         with TemporaryDirectory(dir=Path.cwd()) as directory:
             store = ChatStore(Path(directory) / "chats.sqlite3")

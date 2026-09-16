@@ -81,8 +81,8 @@ Copy `.env.example` to `.env` and adjust:
 4. Add chat rename. Gzip archive/restore and permanent delete are complete.
 5. Define and import a versioned schema for literature-backed study playbooks from the workflow-research workspace.
 6. In progress: the composer plugin menu installs manifests and persists toggles per chat; selected chats share persistent MCP connections. The host stores complete catalogs internally, uses a measured hybrid semantic router over compact metadata, reveals schemas in bounded batches, keeps resources/prompts outside model-selected tools, validates and bounds observations, attaches capability guidance selectively, and supports one-shot approval in the UI. The official MCP Everything server is registered as an unrelated interoperability fixture. Planning and tool activity are logged and archived. Next, add running-call status, cancellation, activity-log UI, and protocol conformance automation.
-7. Package the server, UI, environment bootstrap, PowerWorld adapter, and model-location selection into a downloadable desktop app.
-8. Done: add the tool-agnostic long-running task engine, proposal/confirmation UI, durable work queue, bounded background worker, retry/backoff, lease recovery, task controls, and completion-audit records. Task-specific MCP executors and deterministic domain auditors remain future additions.
+7. In progress: the desktop window now owns API startup and shutdown, the installer creates the environment, tool plugins can declare owned companion processes, and closing the window safely drains or ends active work. Remaining packaging work is model-location selection and a distributable installer.
+8. The separate long-running-task UI was removed. Longer work belongs in ordinary chats so it uses the same conversation, project context, and tools; durability remains an internal concern rather than a second user workflow.
 
 ## PowerWorld integration
 

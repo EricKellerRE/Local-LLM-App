@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import hashlib
+import subprocess
+import sys
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +25,16 @@ class PluginConfigurationError(ValueError):
     pass
 
 
+class CompanionProcessConfig(BaseModel):
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]*$")
+    command: str
+    args: list[str] = Field(default_factory=list)
+    cwd: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    ready_url: str | None = None
+    timeout_seconds: float = Field(default=30, gt=0)
+
+
 class McpServerConfig(BaseModel):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]*$")
     transport: Literal["stdio", "streamable_http"]
@@ -29,6 +44,7 @@ class McpServerConfig(BaseModel):
     url: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
+    companions: list[CompanionProcessConfig] = Field(default_factory=list)
     timeout_seconds: float = Field(default=300, gt=0)
 
     @model_validator(mode="after")
@@ -41,6 +57,9 @@ class McpServerConfig(BaseModel):
             raise ValueError("stdio servers cannot define url")
         if self.transport == "streamable_http" and (self.command or self.args or self.cwd or self.env):
             raise ValueError("streamable_http servers cannot define stdio process fields")
+        companion_ids = [companion.id for companion in self.companions]
+        if len(companion_ids) != len(set(companion_ids)):
+            raise ValueError("companion ids must be unique within a server")
         return self
 
 
@@ -211,11 +230,21 @@ class McpPluginRegistry:
         self.config_dir = config_dir
         self.project_root = project_root.resolve()
         self._extra_variables = dict(variables or {})
-        self.variables = {**os.environ, "PROJECT_ROOT": str(self.project_root), **self._extra_variables}
+        self.variables = {
+            **os.environ,
+            "PROJECT_ROOT": str(self.project_root),
+            "PYTHON_EXECUTABLE": sys.executable,
+            **self._extra_variables,
+        }
         self.plugins = self._load_plugins()
 
     def reload(self) -> None:
-        self.variables = {**os.environ, "PROJECT_ROOT": str(self.project_root), **self._extra_variables}
+        self.variables = {
+            **os.environ,
+            "PROJECT_ROOT": str(self.project_root),
+            "PYTHON_EXECUTABLE": sys.executable,
+            **self._extra_variables,
+        }
         self.plugins = self._load_plugins()
 
     def get_plugin(self, plugin_id: str) -> LoadedPlugin:
@@ -253,35 +282,108 @@ class McpPluginRegistry:
         data["args"] = [_expand_string(item, self.variables) for item in data["args"]]
         data["env"] = {name: _expand_string(value, self.variables) for name, value in data["env"].items()}
         data["headers"] = {name: _expand_string(value, self.variables) for name, value in data["headers"].items()}
+        for companion in data["companions"]:
+            for key in ("command", "cwd", "ready_url"):
+                if companion.get(key):
+                    companion[key] = _expand_string(companion[key], self.variables)
+            companion["args"] = [_expand_string(item, self.variables) for item in companion["args"]]
+            companion["env"] = {
+                name: _expand_string(value, self.variables)
+                for name, value in companion["env"].items()
+            }
         return McpServerConfig.model_validate(data)
+
+    @staticmethod
+    def _url_is_ready(url: str) -> bool:
+        try:
+            with urllib.request.urlopen(url, timeout=0.5):
+                return True
+        except (OSError, urllib.error.URLError):
+            return False
+
+    async def _start_companions(
+        self, companions: list[CompanionProcessConfig]
+    ) -> list[asyncio.subprocess.Process]:
+        processes: list[asyncio.subprocess.Process] = []
+        try:
+            for companion in companions:
+                if companion.ready_url and await asyncio.to_thread(self._url_is_ready, companion.ready_url):
+                    raise RuntimeError(
+                        f"Cannot start companion '{companion.id}': its address is already in use."
+                    )
+                process = await asyncio.create_subprocess_exec(
+                    companion.command,
+                    *companion.args,
+                    cwd=companion.cwd,
+                    env={**os.environ, **companion.env},
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                processes.append(process)
+                if not companion.ready_url:
+                    continue
+                deadline = asyncio.get_running_loop().time() + companion.timeout_seconds
+                while asyncio.get_running_loop().time() < deadline:
+                    if process.returncode is not None:
+                        raise RuntimeError(
+                            f"Companion '{companion.id}' stopped during startup (exit {process.returncode})."
+                        )
+                    if await asyncio.to_thread(self._url_is_ready, companion.ready_url):
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    raise RuntimeError(f"Companion '{companion.id}' did not become ready in time.")
+            return processes
+        except Exception:
+            await self._stop_companions(processes)
+            raise
+
+    @staticmethod
+    async def _stop_companions(processes: list[asyncio.subprocess.Process]) -> None:
+        for process in reversed(processes):
+            if process.returncode is None:
+                process.terminate()
+        for process in reversed(processes):
+            if process.returncode is not None:
+                continue
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
 
     @asynccontextmanager
     async def connect(self, server: McpServerConfig) -> AsyncIterator[Any]:
         from mcp import Client, StdioServerParameters
 
         selected = self._expanded_server(server)
-        if selected.transport == "stdio":
-            parameters = StdioServerParameters(
-                command=selected.command or "",
-                args=selected.args,
-                cwd=selected.cwd,
-                env=selected.env or None,
-            )
-            async with Client(parameters, read_timeout_seconds=selected.timeout_seconds) as client:
-                yield client
-            return
-
-        if selected.headers:
-            import httpx2
-            from mcp.client.streamable_http import streamable_http_client
-
-            async with httpx2.AsyncClient(headers=selected.headers) as http_client:
-                transport = streamable_http_client(selected.url or "", http_client=http_client)
-                async with Client(transport, read_timeout_seconds=selected.timeout_seconds) as client:
+        companions = await self._start_companions(selected.companions)
+        try:
+            if selected.transport == "stdio":
+                parameters = StdioServerParameters(
+                    command=selected.command or "",
+                    args=selected.args,
+                    cwd=selected.cwd,
+                    env=selected.env or None,
+                )
+                async with Client(parameters, read_timeout_seconds=selected.timeout_seconds) as client:
                     yield client
-        else:
-            async with Client(selected.url or "", read_timeout_seconds=selected.timeout_seconds) as client:
-                yield client
+                return
+
+            if selected.headers:
+                import httpx2
+                from mcp.client.streamable_http import streamable_http_client
+
+                async with httpx2.AsyncClient(headers=selected.headers) as http_client:
+                    transport = streamable_http_client(selected.url or "", http_client=http_client)
+                    async with Client(transport, read_timeout_seconds=selected.timeout_seconds) as client:
+                        yield client
+            else:
+                async with Client(selected.url or "", read_timeout_seconds=selected.timeout_seconds) as client:
+                    yield client
+        finally:
+            await self._stop_companions(companions)
 
     async def discover_tools(self) -> list[DiscoveredTool]:
         discovered: list[DiscoveredTool] = []
