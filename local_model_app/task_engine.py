@@ -204,7 +204,7 @@ class UniversalTaskEngine:
             await self._release_task(
                 task_id,
                 TaskStatus.RUNNABLE,
-                summary="Episode call budget reached; work was checkpointed for the next episode.",
+                summary="Episode checkpoint interval reached; work continues in the next episode.",
                 next_run_at=datetime.now(timezone.utc),
             )
         except Exception as exc:

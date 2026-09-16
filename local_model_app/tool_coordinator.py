@@ -361,6 +361,34 @@ class ToolCoordinator:
         return getattr(getattr(self.model, "settings", None), name, default)
 
     @staticmethod
+    def _checkpoint_summary(
+        messages: list[dict[str, Any]],
+        data: dict[str, Any],
+        previous: str,
+    ) -> str:
+        """Build a deterministic bounded continuation record without ending the tool loop."""
+        recent: list[dict[str, Any]] = []
+        for message in messages[-8:]:
+            row: dict[str, Any] = {"role": message.get("role")}
+            if message.get("name"):
+                row["name"] = message["name"]
+            content = message.get("content")
+            if content:
+                row["content"] = str(content)[:3500]
+            if message.get("tool_calls"):
+                row["tool_calls"] = json.dumps(
+                    message["tool_calls"], ensure_ascii=False, separators=(",", ":")
+                )[:3500]
+            recent.append(row)
+        bounded_data, _ = _bounded_structured(data, 12_000)
+        record = {
+            "prior_checkpoint": previous[-12_000:] if previous else "",
+            "latest_structured_state": bounded_data,
+            "recent_messages": recent,
+        }
+        return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
     def _data_requires_action(data: dict[str, Any]) -> bool:
         return bool(data.get("next_step") or data.get("next_tool") or data.get("tools") or data.get("tool"))
 
@@ -376,6 +404,12 @@ class ToolCoordinator:
             raise RuntimeError("The selected MCP plugins exposed no callable capabilities.")
 
         saved_state = self._load_state()
+        resumed_checkpoint = (
+            saved_state
+            if saved_state.get("status") == "tool_checkpoint"
+            and saved_state.get("user_message") == user_message
+            else {}
+        )
         resume_tool_name = saved_state.get("backend_tool") if saved_state.get("status") == "waiting_for_input" else None
         resume_required = saved_state.get("required_inputs") if isinstance(saved_state.get("required_inputs"), list) else []
         can_resume = bool(
@@ -455,11 +489,25 @@ class ToolCoordinator:
             "or when a required input, permission, or external condition prevents progress.\n\n"
             f"Planning note:\n{plan}"
         )
+        base_system_prompt = system_prompt
+        checkpoint_summary = str(resumed_checkpoint.get("summary") or "")
+        checkpoint_index = int(resumed_checkpoint.get("checkpoint_index") or 0)
+        if checkpoint_summary:
+            system_prompt += (
+                "\n\nPersisted continuation record from earlier tool checkpoints. Treat it as bounded "
+                "observations from this same request and continue from it; do not repeat completed calls:\n"
+                f"{checkpoint_summary}"
+            )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             *history[-6:],
             {"role": "user", "content": user_message},
         ]
+        if checkpoint_summary:
+            messages.append({
+                "role": "user",
+                "content": "Continue the same work from the persisted checkpoint. Call the next necessary tool.",
+            })
         conversation_text = "\n".join(
             str(message.get("content", ""))
             for message in [*history, {"role": "user", "content": user_message}]
@@ -470,7 +518,11 @@ class ToolCoordinator:
             *(self.manager.registry.get_plugin(plugin_id).manifest.policy.max_calls_per_turn for plugin_id in plugin_ids),
         )
         call_count = 0
-        data: dict[str, Any] = {}
+        data = (
+            dict(resumed_checkpoint.get("data") or {})
+            if isinstance(resumed_checkpoint.get("data"), dict)
+            else {}
+        )
         pending: tuple[DiscoveredTool, dict[str, Any], str | None, bool] | None = None
 
         schema_tool = next((tool for tool in tools if tool.native_name.endswith("get_tool_schema")), None)
@@ -482,7 +534,42 @@ class ToolCoordinator:
             pending = (route_tool, {"request_text": user_message}, None, True)
 
         premature_retries = 0
-        while call_count < max_calls:
+        while True:
+            if call_count >= max_calls:
+                checkpoint_index += 1
+                checkpoint_summary = self._checkpoint_summary(messages, data, checkpoint_summary)
+                self._save_state({
+                    "status": "tool_checkpoint",
+                    "user_message": user_message,
+                    "checkpoint_index": checkpoint_index,
+                    "summary": checkpoint_summary,
+                    "data": data,
+                })
+                self.scratchpad.add("tool_checkpoint", checkpoint_summary[:4000])
+                self._log(
+                    "tool_checkpoint",
+                    checkpoint_index=checkpoint_index,
+                    completed_calls=max_calls,
+                    continuing=True,
+                )
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            f"{base_system_prompt}\n\nTool checkpoint {checkpoint_index}. The call count caused context "
+                            "compaction, not task termination. Continue from this exact bounded record and do not "
+                            f"repeat completed calls:\n{checkpoint_summary}"
+                        ),
+                    },
+                    {"role": "user", "content": user_message},
+                    {
+                        "role": "user",
+                        "content": "Continue the same work. Call the next necessary tool.",
+                    },
+                ]
+                call_count = 0
+                premature_retries = 0
+
             if pending:
                 selected_tool, arguments, existing_call_id, append_assistant_call = pending
                 pending = None
@@ -573,8 +660,6 @@ class ToolCoordinator:
 
             premature_retries = 0
             for call in reply.tool_calls:
-                if call_count >= max_calls:
-                    break
                 function = call["function"]
                 raw_arguments = function.get("arguments", {})
                 arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
@@ -590,5 +675,3 @@ class ToolCoordinator:
                     continue
                 pending = (selected_tool, arguments, call["id"], False)
                 break
-
-        raise RuntimeError(f"Tool loop exceeded its {max_calls}-call budget without a final answer.")

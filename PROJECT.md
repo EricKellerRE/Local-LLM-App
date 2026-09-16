@@ -72,7 +72,7 @@ Copy `.env.example` to `.env` and adjust:
 | `LOCAL_MODEL_TRUST_REMOTE_CODE` | Set only for models whose repository you trust. |
 | `LOCAL_PLANNER_MAX_NEW_TOKENS` | Token budget for the bounded execution plan. |
 | `LOCAL_TOOL_ACTION_MAX_NEW_TOKENS` | Token budget for a structured tool decision. |
-| `LOCAL_MAX_TOOL_CALLS_PER_STEP` | Per-checkpoint runaway guard; defaults to 256, supports up to 4,096, and is not a whole-task limit. |
+| `LOCAL_MAX_TOOL_CALLS_PER_STEP` | Context-checkpoint interval; defaults to 256 and compacts then continues instead of terminating execution. |
 | `LOCAL_TOOL_TEMPERATURE` | Sampling temperature for tool-enabled planning and action turns. |
 
 ## Plan

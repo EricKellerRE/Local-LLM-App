@@ -46,7 +46,7 @@ Chats, scratchpads, and activity records use `data/` by default. Models use `mod
 
 ## Research and long work
 
-Ask for research, a literature review, an overnight report, or iterative project-tool work in an ordinary chat. The app turns that request into persisted evidence checkpoints, uses the selected tools, audits the requested outcome, and posts the final report back into the same chat. There is no eight-call or other fixed whole-task limit. The configurable tool-call value is only a runaway guard for one checkpoint; the task creates further checkpoints and audit follow-ups until it is complete or genuinely needs user input.
+Ask for research, a literature review, an overnight report, or iterative project-tool work in an ordinary chat. The app turns that request into persisted evidence checkpoints, uses the selected tools, audits the requested outcome, and posts the final report back into the same chat. There is no eight-call or other fixed whole-task limit. The configurable tool-call value is a context-checkpoint interval: reaching it compacts the working context and execution continues automatically. The task stops only when it completes, genuinely needs user input or approval, is cancelled, or encounters an actual unrecoverable failure.
 
 Public-web research automatically uses the built-in search and chunked page reader. Long Grid Workshop operations use the MCP durable-task protocol, persist the Grid task ID before waiting, and resume polling that same operation after an app restart instead of launching a duplicate. Grid mutations and simulator runs still require explicit approval.
 
@@ -81,7 +81,7 @@ The usual settings are in `.env`:
 | `LOCAL_MODEL_CONTEXT_WINDOW` | Total token capacity for conversation history plus generation; blank uses the detected model limit. |
 | `LOCAL_MODEL_MAX_NEW_TOKENS` | Total generation budget, including reasoning tokens; defaults to 8,192 and also governs final answers after tool use. |
 | `LOCAL_MODEL_REASONING_BUDGET` | Blank uses the model default, `0` disables thinking, and a positive value is passed to compatible chat templates. |
-| `LOCAL_MAX_TOOL_CALLS_PER_STEP` | Runaway guard for one checkpoint; defaults to 256 (maximum 4,096) and does not cap the total calls in a durable task. A durable task starts another checkpoint as needed until its completion audit passes. |
+| `LOCAL_MAX_TOOL_CALLS_PER_STEP` | Context-checkpoint interval; defaults to 256 (maximum 4,096). Reaching it compacts working context and continues rather than stopping the task. |
 | `LOCAL_MODEL_EAGER_LOAD` | Load the model as soon as the app opens. |
 | `LOCAL_ROUTER_MODEL_ID` | Optional local sentence encoder for choosing tools. |
 

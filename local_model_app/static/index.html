@@ -112,7 +112,7 @@
             <label>Context window<input id="context-window" type="number" min="256" max="4194304" placeholder="Use model limit" /><small>Total tokens available. Older turns are removed first when needed.</small></label>
             <label>Response budget<input id="max-tokens" type="number" min="1" max="262144" /><small>Maximum generated tokens, including reasoning. The default is 8,192.</small></label>
             <label>Reasoning budget<input id="reasoning-budget" type="number" min="0" max="262144" placeholder="Model default" /><small>Blank uses the model default; 0 disables thinking where supported.</small></label>
-            <label>Tool calls per checkpoint<input id="max-tool-calls" type="number" min="1" max="4096" /><small>Runaway guard for one checkpoint (default 256). It is not a whole-task limit.</small></label>
+            <label>Tool checkpoint interval<input id="max-tool-calls" type="number" min="1" max="4096" /><small>After this many calls, working context is compacted and execution continues. Default: 256.</small></label>
             <label>Temperature<input id="temperature" type="number" min="0" max="2" step="0.05" /><small>Higher values make responses more varied.</small></label>
             <label>Top P<input id="top-p" type="number" min="0.01" max="1" step="0.01" /><small>Limits sampling to the most likely token mass.</small></label>
           </div>
