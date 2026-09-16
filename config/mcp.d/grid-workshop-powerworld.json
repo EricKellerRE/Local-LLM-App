@@ -41,7 +41,7 @@
           "timeout_seconds": 30
         }
       ],
-      "timeout_seconds": 300
+      "timeout_seconds": 1800
     }
   ],
   "guidance": [
@@ -70,6 +70,6 @@
       "results.inspect_artifact"
     ],
     "deny_tools": [],
-    "max_calls_per_turn": 8
+    "max_calls_per_turn": 256
   }
 }

@@ -1,6 +1,8 @@
 const state = {
   chatId: null, chats: [], projects: [], pendingProjectId: null, busy: false,
   showArchived: false, currentArchived: false, plugins: [], pluginBusy: null,
+  detectedContextWindow: null,
+  messageSignature: "",
   pendingPluginOverrides: new Map(),
 };
 const el = (id) => document.getElementById(id);
@@ -63,7 +65,7 @@ async function loadChats() {
 }
 
 function showBlankChat(projectId = null) {
-  state.chatId = null; state.pendingProjectId = projectId || null; state.currentArchived = false;
+  state.chatId = null; state.pendingProjectId = projectId || null; state.currentArchived = false; state.messageSignature = "";
   state.pendingPluginOverrides.clear();
   el("chat-title").textContent = "New chat";
   el("messages").hidden = false; el("composer").hidden = false; el("messages").innerHTML = "";
@@ -99,9 +101,19 @@ async function openChat(chatId, { force = false } = {}) {
   state.chatId = chat.id; state.pendingProjectId = chat.project_id || null; state.currentArchived = Boolean(chat.archived_at);
   state.pendingPluginOverrides.clear();
   el("chat-title").textContent = chat.title;
+  state.messageSignature = JSON.stringify(chat.messages.map((message) => [message.role, message.created_at, message.content]));
   el("messages").hidden = false; el("composer").hidden = false;
   setProjectLabel(state.pendingProjectId); renderMessages(chat.messages); await Promise.all([loadApproval(), loadPlugins()]); renderSidebar(); updateComposerState();
   document.querySelector(".shell").classList.remove("sidebar-open");
+}
+async function refreshOpenChat() {
+  if (!state.chatId || state.busy || document.hidden) return;
+  try {
+    const chat = await api(`/api/chats/${state.chatId}`);
+    const signature = JSON.stringify(chat.messages.map((message) => [message.role, message.created_at, message.content]));
+    if (signature === state.messageSignature) return;
+    state.messageSignature = signature; renderMessages(chat.messages); await loadChats(); await loadApproval();
+  } catch (error) { console.warn("Could not refresh durable-task progress", error); }
 }
 function renderMessages(messages) {
   el("messages").innerHTML = messages.map((message) => `<article class="message ${message.role}"><div class="bubble">${escapeHtml(message.content)}</div></article>`).join("");
@@ -236,18 +248,31 @@ async function downloadModel(repoId, button) {
     button.textContent = "Downloaded"; el("model-id").value = job.destination; el("hf-status").textContent = `${repoId} is ready. Save settings to make it the active model.`;
   } catch (error) { button.disabled = false; button.textContent = "Retry"; el("hf-status").textContent = error.message; }
 }
+function updatePromptBudgetNote() {
+  const requested = el("context-window").value === "" ? null : Number(el("context-window").value);
+  const response = Number(el("max-tokens").value);
+  const effective = requested && state.detectedContextWindow ? Math.min(requested, state.detectedContextWindow) : requested || state.detectedContextWindow;
+  if (!effective || !response) { el("prompt-budget-note").textContent = "Usable prompt capacity will be shown once a context and response budget are known."; return; }
+  const prompt = effective - response;
+  el("prompt-budget-note").textContent = prompt > 0 ? `Usable prompt capacity: ${prompt.toLocaleString()} tokens (${effective.toLocaleString()} context − ${response.toLocaleString()} reserved for generation).` : "Response budget must be smaller than the effective context window.";
+}
 async function openSettings() {
   el("settings-status").textContent = "Loading…"; el("settings-dialog").showModal();
   try {
     const settings = await api("/api/settings");
-    const values = { "data-directory": settings.data_directory, "models-directory": settings.models_directory, "model-id": settings.model_id, "offload-directory": settings.offload_dir, "model-kind": settings.model_kind, "model-device": settings.device, "model-dtype": settings.dtype, "cpu-memory": settings.cpu_memory_gb ?? "", "max-tokens": settings.max_new_tokens, temperature: settings.temperature, "top-p": settings.top_p };
+    const values = { "data-directory": settings.data_directory, "models-directory": settings.models_directory, "model-id": settings.model_id, "offload-directory": settings.offload_dir, "model-kind": settings.model_kind, "model-device": settings.device, "model-dtype": settings.dtype, "cpu-memory": settings.cpu_memory_gb ?? "", "context-window": settings.context_window ?? "", "max-tokens": settings.max_new_tokens, "reasoning-budget": settings.reasoning_budget ?? "", "max-tool-calls": settings.max_tool_calls_per_step, temperature: settings.temperature, "top-p": settings.top_p };
     Object.entries(values).forEach(([id, value]) => { el(id).value = value; }); el("trust-remote-code").checked = settings.trust_remote_code;
+    const nativeContext = settings.detected_context_window;
+    const effectiveContext = settings.effective_context_window;
+    state.detectedContextWindow = nativeContext;
+    el("context-window-note").textContent = nativeContext ? `Detected model limit: ${nativeContext.toLocaleString()} tokens${effectiveContext && effectiveContext !== nativeContext ? ` · effective limit: ${effectiveContext.toLocaleString()}` : ""}.` : "The model's native context limit is detected after it loads.";
+    updatePromptBudgetNote();
     el("installed-models").innerHTML = settings.installed_models.map((model) => `<option value="${escapeHtml(model.path)}">${escapeHtml(model.name)}</option>`).join(""); el("settings-status").textContent = "";
   } catch (error) { el("settings-status").textContent = error.message; }
 }
 async function saveSettings() {
   const numeric = (id) => el(id).value === "" ? null : Number(el(id).value);
-  const body = { data_directory: el("data-directory").value, models_directory: el("models-directory").value, model_id: el("model-id").value.trim(), offload_dir: el("offload-directory").value.trim(), model_kind: el("model-kind").value, device: el("model-device").value, dtype: el("model-dtype").value, cpu_memory_gb: numeric("cpu-memory"), max_new_tokens: numeric("max-tokens"), temperature: numeric("temperature"), top_p: numeric("top-p"), trust_remote_code: el("trust-remote-code").checked };
+  const body = { data_directory: el("data-directory").value, models_directory: el("models-directory").value, model_id: el("model-id").value.trim(), offload_dir: el("offload-directory").value.trim(), model_kind: el("model-kind").value, device: el("model-device").value, dtype: el("model-dtype").value, cpu_memory_gb: numeric("cpu-memory"), context_window: numeric("context-window"), max_new_tokens: numeric("max-tokens"), reasoning_budget: numeric("reasoning-budget"), max_tool_calls_per_step: numeric("max-tool-calls"), temperature: numeric("temperature"), top_p: numeric("top-p"), trust_remote_code: el("trust-remote-code").checked };
   el("save-settings").disabled = true;
   try { const result = await api("/api/settings", { method: "PUT", body: JSON.stringify(body) }); el("settings-status").textContent = result.restart_required ? "Saved. Restart Local Model to apply these changes." : "Settings are up to date."; }
   catch (error) { el("settings-status").textContent = error.message; } finally { el("save-settings").disabled = false; }
@@ -274,6 +299,7 @@ async function updateHealth() {
 el("new-chat").addEventListener("click", () => startBlankChat()); el("new-project").addEventListener("click", openProjectDialog); el("chat-project").addEventListener("click", openProjectChoice);
 el("close-project-dialog").addEventListener("click", () => el("project-dialog").close()); el("browse-project").addEventListener("click", () => chooseDirectory("project-path")); el("create-project").addEventListener("click", createProject); el("close-project-choice").addEventListener("click", () => el("project-choice-dialog").close());
 el("open-settings").addEventListener("click", openSettings); el("close-settings").addEventListener("click", () => el("settings-dialog").close()); el("save-settings").addEventListener("click", saveSettings); el("search-models").addEventListener("click", searchModels); el("hf-search").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); searchModels(); } });
+el("context-window").addEventListener("input", updatePromptBudgetNote); el("max-tokens").addEventListener("input", updatePromptBudgetNote);
 document.querySelectorAll(".browse-directory").forEach((button) => button.addEventListener("click", () => chooseDirectory(button.dataset.target)));
 el("plugin-menu-button").addEventListener("click", async () => { const menu = el("plugin-menu"); menu.hidden = !menu.hidden; el("plugin-menu-button").classList.toggle("active", !menu.hidden); if (!menu.hidden) await loadPlugins(); });
 el("add-plugin").addEventListener("click", () => el("plugin-file").click()); el("plugin-file").addEventListener("change", (event) => installPluginFile(event.target.files[0]));
@@ -292,3 +318,4 @@ document.addEventListener("keydown", (event) => {
 
 Promise.all([loadChats(), loadProjects(), updateHealth(), loadPlugins()]).then(() => showBlankChat()).catch((error) => { el("status-dot").className = "error"; el("status-text").textContent = error.message; });
 setInterval(updateHealth, 15000);
+setInterval(refreshOpenChat, 5000);

@@ -24,12 +24,14 @@ class Settings:
     cpu_memory_gb: int | None
     offload_dir: str
     dtype: str
+    context_window: int | None
     max_new_tokens: int
+    reasoning_budget: int | None
     temperature: float
     top_p: float
     planner_max_new_tokens: int
     tool_action_max_new_tokens: int
-    tool_final_max_new_tokens: int
+    max_tool_calls_per_step: int
     tool_temperature: float
     router_model_id: str
     router_device: str
@@ -46,12 +48,14 @@ class Settings:
             cpu_memory_gb=(int(os.environ["LOCAL_MODEL_CPU_MEMORY_GB"]) if os.getenv("LOCAL_MODEL_CPU_MEMORY_GB") else None),
             offload_dir=os.getenv("LOCAL_MODEL_OFFLOAD_DIR", "").strip(),
             dtype=os.getenv("LOCAL_MODEL_DTYPE", "auto").strip().lower(),
-            max_new_tokens=int(os.getenv("LOCAL_MODEL_MAX_NEW_TOKENS", "512")),
+            context_window=(int(os.environ["LOCAL_MODEL_CONTEXT_WINDOW"]) if os.getenv("LOCAL_MODEL_CONTEXT_WINDOW") else None),
+            max_new_tokens=int(os.getenv("LOCAL_MODEL_MAX_NEW_TOKENS", "8192")),
+            reasoning_budget=(int(os.environ["LOCAL_MODEL_REASONING_BUDGET"]) if os.getenv("LOCAL_MODEL_REASONING_BUDGET") else None),
             temperature=float(os.getenv("LOCAL_MODEL_TEMPERATURE", "0.7")),
             top_p=float(os.getenv("LOCAL_MODEL_TOP_P", "0.9")),
             planner_max_new_tokens=int(os.getenv("LOCAL_PLANNER_MAX_NEW_TOKENS", "192")),
-            tool_action_max_new_tokens=int(os.getenv("LOCAL_TOOL_ACTION_MAX_NEW_TOKENS", "96")),
-            tool_final_max_new_tokens=int(os.getenv("LOCAL_TOOL_FINAL_MAX_NEW_TOKENS", "256")),
+            tool_action_max_new_tokens=int(os.getenv("LOCAL_TOOL_ACTION_MAX_NEW_TOKENS", "1024")),
+            max_tool_calls_per_step=int(os.getenv("LOCAL_MAX_TOOL_CALLS_PER_STEP", "256")),
             tool_temperature=float(os.getenv("LOCAL_TOOL_TEMPERATURE", "0")),
             router_model_id=os.getenv(
                 "LOCAL_ROUTER_MODEL_ID",

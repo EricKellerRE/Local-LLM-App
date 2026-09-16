@@ -13,12 +13,13 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from local_model_app.app_settings import AppSettingsStore
 from local_model_app.chat_store import ChatStore
 from local_model_app.config import Settings, _load_dotenv
 from local_model_app.coordinator import Coordinator
+from local_model_app.durable_tools import DurableSynthesisExecutor, DurableToolExecutor
 from local_model_app.model import TransformersModel
 from local_model_app.huggingface_service import HuggingFaceService
 from local_model_app.mcp_manager import McpPluginManager
@@ -26,7 +27,7 @@ from local_model_app.mcp_plugins import McpPluginRegistry, PluginConfigurationEr
 from local_model_app.scratchpad import Scratchpad
 from local_model_app.task_coordinator import ModelTaskCoordinator
 from local_model_app.task_engine import UniversalTaskEngine
-from local_model_app.task_models import TaskDefinition
+from local_model_app.task_models import TaskDefinition, TaskStatus, WorkItemOutcome
 from local_model_app.task_store import TaskStore
 from local_model_app.tool_coordinator import FINAL_TOKENS, ToolCoordinator, _compact_result
 from local_model_app.tool_router import LocalEmbeddingEncoder, ToolRouter
@@ -105,12 +106,23 @@ class SettingsUpdateRequest(BaseModel):
     dtype: str = "auto"
     cpu_memory_gb: int | None = Field(default=None, ge=1)
     offload_dir: str = ""
-    max_new_tokens: int = Field(default=512, ge=1, le=32768)
+    context_window: int | None = Field(default=None, ge=256, le=4_194_304)
+    max_new_tokens: int = Field(default=8192, ge=1, le=262_144)
+    reasoning_budget: int | None = Field(default=None, ge=0, le=262_144)
+    max_tool_calls_per_step: int = Field(default=256, ge=1, le=4096)
     temperature: float = Field(default=0.7, ge=0, le=2)
     top_p: float = Field(default=0.9, gt=0, le=1)
     trust_remote_code: bool = False
     data_directory: str
     models_directory: str
+
+    @model_validator(mode="after")
+    def validate_token_budgets(self) -> "SettingsUpdateRequest":
+        if self.context_window is not None and self.max_new_tokens >= self.context_window:
+            raise ValueError("Response budget must be smaller than the context window.")
+        if self.reasoning_budget is not None and self.reasoning_budget > self.max_new_tokens:
+            raise ValueError("Reasoning budget cannot exceed the response budget.")
+        return self
 
 
 class ModelDownloadRequest(BaseModel):
@@ -139,10 +151,25 @@ class Runtime:
         self._active_operations: dict[str, str] = {}
         self._load_lock = asyncio.Lock()
         self._inference_lock = asyncio.Lock()
-        self.task_coordinator = ModelTaskCoordinator(self.task_generate)
+        self.task_coordinator = ModelTaskCoordinator(
+            self.task_generate,
+            capability_catalog=self.task_capability_catalog,
+        )
         self.task_engine = UniversalTaskEngine(
             self.tasks,
             self.task_coordinator,
+            executors={
+                "model": self.task_coordinator,
+                "tool": DurableToolExecutor(
+                    self.model,
+                    self.mcp,
+                    self.tool_router,
+                    self.paths.data_directory,
+                    self.tasks,
+                ),
+                "synthesis": DurableSynthesisExecutor(self.task_generate),
+            },
+            on_status=self.deliver_task_status,
             poll_seconds=float(os.getenv("LOCAL_TASK_POLL_SECONDS", "5")),
             lease_seconds=int(os.getenv("LOCAL_TASK_LEASE_SECONDS", "1800")),
         )
@@ -205,6 +232,117 @@ class Runtime:
             await self.ensure_loaded()
             return await asyncio.to_thread(self.model.generate, messages)
 
+    async def task_capability_catalog(self, plugin_ids: list[str]) -> list[dict[str, Any]]:
+        await self.mcp.ensure_started(plugin_ids)
+        return [{
+            "name": tool.exposed_name,
+            "description": tool.description,
+            "required": tool.input_schema.get("required", []),
+        } for tool in self.mcp.tools_for_plugins(plugin_ids)]
+
+    @staticmethod
+    def _durable_request(content: str, has_project_tools: bool) -> bool:
+        normalized = " ".join(content.lower().split())
+        durable_markers = (
+            "overnight", "while i am away", "while i'm away", "keep working", "long-running",
+            "long running", "comprehensive report", "detailed report", "literature review",
+            "deep research", "research this", "research the", "investigate the", "investigate this",
+        )
+        iterative_markers = (
+            "optimize", "optimise", "improve the grid", "improve this grid", "iterate until",
+            "until the metric", "until it meets", "run scenarios", "sensitivity analysis",
+        )
+        return any(marker in normalized for marker in durable_markers) or (
+            has_project_tools and any(marker in normalized for marker in iterative_markers)
+        )
+
+    @staticmethod
+    def _needs_web_research(content: str) -> bool:
+        normalized = content.lower()
+        return any(term in normalized for term in (
+            "research", "literature", "sources", "citations", "web", "internet", "papers", "state of the art",
+        ))
+
+    async def _start_durable_chat_task(
+        self,
+        chat: dict[str, Any],
+        content: str,
+        plugin_ids: list[str],
+    ) -> str:
+        title = " ".join(content.strip().split())[:120] or "Durable task"
+        definition = TaskDefinition.model_validate({
+            "title": title,
+            "goal": content,
+            "success_criteria": [
+                "The requested work is executed with persisted evidence rather than only described.",
+                "Every requested metric, conclusion, technique, comparison, or deliverable is addressed.",
+                "The final report identifies evidence, assumptions, limitations, unresolved gaps, and next steps.",
+                "Claims are traceable to source URLs or tool-produced artifact, case, session, and metric records.",
+            ],
+            "deliverables": ["A complete standalone report posted back into the originating chat."],
+            "constraints": [
+                "Never invent tool results, measurements, sources, or completion evidence.",
+                "Checkpoint each bounded work item and resume after application restart.",
+                "Pause for explicit approval or missing user input when required by tool policy.",
+            ],
+            "execution": {
+                "deadline": None,
+                "max_steps_per_episode": 64,
+                "maximum_attempts": None,
+                "retry_initial_seconds": 30,
+                "retry_maximum_seconds": 3600,
+                "resume_after_restart": True,
+            },
+            "metadata": {
+                "mode": "durable_tools",
+                "chat_id": chat["id"],
+                "project_id": chat.get("project_id"),
+                "plugin_ids": plugin_ids,
+            },
+        })
+        task = self.tasks.create_task(content, definition)
+        self.tasks.start_task(task["id"])
+        self.task_engine.wake()
+        answer = (
+            "I started this as a durable task in this chat. It will plan checkpointed tool work, keep evidence "
+            "outside the model context, audit the requested outcome, and post the completed report here. Leave "
+            "Local Model running for uninterrupted work; if it closes, the task resumes on the next launch."
+        )
+        self.store.append_exchange(chat["id"], content, answer)
+        return answer
+
+    async def deliver_task_status(self, task: dict[str, Any]) -> None:
+        metadata = task.get("definition", {}).get("metadata") or {}
+        chat_id = metadata.get("chat_id")
+        if not chat_id or task.get("delivered_at"):
+            return
+        status = task.get("status")
+        if status not in {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}:
+            return
+        if status == TaskStatus.COMPLETED.value:
+            report = ""
+            for item in reversed(self.tasks.work_items(task["id"])):
+                outcome = item.get("result") or {}
+                if item.get("kind") == "synthesis" and isinstance(outcome, dict):
+                    report = str(outcome.get("result") or "").strip()
+                    if report:
+                        break
+            message = report or task.get("current_summary") or "The durable task completed."
+        else:
+            message = (
+                f"The durable task ended with status {status}: "
+                f"{task.get('last_error') or task.get('current_summary') or 'No additional detail was recorded.'}"
+            )
+        try:
+            self.store.append_message(str(chat_id), "assistant", message)
+        except KeyError:
+            pass
+        self.tasks.mark_delivered(task["id"])
+
+    async def deliver_pending_task_results(self) -> None:
+        for task in self.tasks.undelivered_terminal_tasks():
+            await self.deliver_task_status(task)
+
     @tracked_activity("a response or tool action is in progress")
     async def respond(self, chat_id: str, content: str) -> str:
         history = [{"role": item["role"], "content": item["content"]} for item in self.store.messages(chat_id)]
@@ -218,6 +356,16 @@ class Runtime:
             self.store.set_plugin_selected(chat_id, plugin_id, selected=True)
         if requested_plugins:
             selected_plugins = self.store.selected_plugins(chat_id)
+        if self._needs_web_research(content):
+            try:
+                self.mcp.registry.get_plugin("local.web-research")
+            except KeyError:
+                pass
+            else:
+                self.store.set_plugin_selected(chat_id, "local.web-research", selected=True)
+                selected_plugins = self.store.selected_plugins(chat_id)
+        if self._durable_request(content, bool(selected_plugins)):
+            return await self._start_durable_chat_task(chat, content, selected_plugins)
         async with self._inference_lock:
             await self.ensure_loaded()
             if selected_plugins:
@@ -227,6 +375,7 @@ class Runtime:
                     Scratchpad(self.data_directory / "scratchpads" / f"{chat_id}.jsonl"),
                     self.data_directory / "tool_activity" / f"{chat_id}.jsonl",
                     router=self.tool_router,
+                    max_calls=self.model.settings.max_tool_calls_per_step,
                 )
                 answer = await coordinator.respond(content, history, selected_plugins)
             else:
@@ -382,7 +531,23 @@ class Runtime:
             self._log_activity(activity_path, "approved_tool_execution_started", tool=tool_name, arguments=arguments)
             try:
                 await self.mcp.ensure_started([plugin_id])
-                result = await self.mcp.call_tool(tool_name, arguments, approved=True)
+                durable_work_item_id = state.get("durable_work_item_id")
+
+                async def checkpoint_approved_task(handle: dict[str, Any]) -> None:
+                    if durable_work_item_id:
+                        self.tasks.checkpoint_work_item(
+                            str(durable_work_item_id), {"pending_mcp_task": handle}
+                        )
+
+                if durable_work_item_id:
+                    result = await self.mcp.call_tool(
+                        tool_name,
+                        arguments,
+                        approved=True,
+                        task_checkpoint=checkpoint_approved_task,
+                    )
+                else:
+                    result = await self.mcp.call_tool(tool_name, arguments, approved=True)
                 self._log_activity(activity_path, "approved_tool_execution_finished", tool=tool_name, result=result)
                 compact = _compact_result(result)
                 call_id = f"approval_{uuid.uuid4().hex}"
@@ -420,7 +585,7 @@ class Runtime:
                         },
                     ],
                     tools=[],
-                    max_new_tokens=int(getattr(settings, "tool_final_max_new_tokens", FINAL_TOKENS)),
+                    max_new_tokens=int(getattr(settings, "max_new_tokens", FINAL_TOKENS)),
                     temperature=float(getattr(settings, "tool_temperature", 0.0)),
                 )
                 answer = reply.content.strip() or "The approved tool call completed."
@@ -433,6 +598,19 @@ class Runtime:
                     "answer": answer,
                 })
                 self.store.append_message(chat_id, "assistant", answer)
+                durable_task_id = state.get("durable_task_id")
+                if terminal == "complete" and durable_task_id and durable_work_item_id:
+                    self.tasks.complete_work_item(
+                        str(durable_work_item_id),
+                        WorkItemOutcome(
+                            outcome="completed",
+                            summary=f"Approved tool call completed: {tool_name}",
+                            result=answer,
+                            completion_evidence=[json.dumps(compact, ensure_ascii=False)[:2000]],
+                        ).model_dump(mode="json"),
+                    )
+                    self.tasks.resume_task(str(durable_task_id))
+                    self.task_engine.wake()
                 return answer
             except Exception as exc:
                 self._write_state(state_path, {
@@ -466,6 +644,10 @@ class Runtime:
             })
             self._log_activity(activity_path, "tool_approval_denied", tool=state.get("exposed_tool"))
             self.store.append_message(chat_id, "assistant", message)
+            durable_task_id = state.get("durable_task_id")
+            if durable_task_id:
+                self.tasks.cancel_task(str(durable_task_id))
+                await self.deliver_task_status(self.tasks.get_task(str(durable_task_id)))
             return message
 
 
@@ -476,6 +658,7 @@ async def lifespan(app: FastAPI):
     if os.getenv("LOCAL_MODEL_EAGER_LOAD", "true").lower() in {"1", "true", "yes"}:
         asyncio.create_task(runtime.ensure_loaded())
     await runtime.task_engine.start()
+    await runtime.deliver_pending_task_results()
     try:
         yield
     finally:
@@ -545,6 +728,8 @@ async def get_settings(request: Request):
     return {
         **service.app_settings.public_settings(),
         "installed_models": service.app_settings.installed_models(),
+        "detected_context_window": service.model.native_context_window,
+        "effective_context_window": service.model.effective_context_window,
     }
 
 

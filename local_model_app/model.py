@@ -32,6 +32,30 @@ class TransformersModel:
     def loaded(self) -> bool:
         return self.model is not None
 
+    @property
+    def native_context_window(self) -> int | None:
+        """Return the first credible context limit reported by the loaded model."""
+        config = getattr(self.model, "config", None)
+        for source, names in (
+            (config, ("max_position_embeddings", "max_sequence_length", "seq_length", "n_positions")),
+            (getattr(config, "text_config", None), ("max_position_embeddings", "max_sequence_length", "seq_length", "n_positions")),
+            (self.tokenizer, ("model_max_length",)),
+            (getattr(self.processor, "tokenizer", None), ("model_max_length",)),
+        ):
+            for name in names:
+                value = getattr(source, name, None)
+                if isinstance(value, int) and 256 <= value <= 4_194_304:
+                    return value
+        return None
+
+    @property
+    def effective_context_window(self) -> int | None:
+        requested = self.settings.context_window
+        native = self.native_context_window
+        if requested is None:
+            return native
+        return min(requested, native) if native is not None else requested
+
     def _load(self) -> None:
         if self.loaded:
             return
@@ -104,6 +128,115 @@ class TransformersModel:
             converted.append(message)
         return converted
 
+    def _template_reasoning_options(self, max_new_tokens: int) -> dict[str, Any]:
+        """Supply the common thinking controls; templates that do not use them ignore them."""
+        budget = self.settings.reasoning_budget
+        if budget is None:
+            return {}
+        options: dict[str, Any] = {"enable_thinking": budget > 0}
+        if budget > 0:
+            effective_budget = min(budget, max_new_tokens)
+            options.update({
+                "thinking_budget": effective_budget,
+                "reasoning_budget": effective_budget,
+            })
+        return options
+
+    def _format_inputs(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        max_new_tokens: int,
+    ) -> Any:
+        tokenizer = self.tokenizer
+        template_options = {
+            "tools": tools or None,
+            "add_generation_prompt": True,
+            "tokenize": True,
+            "return_dict": True,
+            "return_tensors": "pt",
+            **self._template_reasoning_options(max_new_tokens),
+        }
+        if self.is_multimodal:
+            assert self.processor is not None
+            return self.processor.apply_chat_template(
+                self._processor_messages(messages),
+                **template_options,
+            )
+        if getattr(tokenizer, "chat_template", None):
+            return tokenizer.apply_chat_template(
+                self._processor_messages(messages),
+                **template_options,
+            )
+        assert tokenizer is not None
+        text = "\n\n".join(f"{message['role'].upper()}: {message['content']}" for message in messages) + "\nASSISTANT:"
+        return tokenizer(text, return_tensors="pt")
+
+    @staticmethod
+    def _without_oldest_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+        """Drop one complete old turn while retaining leading system messages and the latest turn."""
+        first_conversation_message = 0
+        while (
+            first_conversation_message < len(messages)
+            and messages[first_conversation_message].get("role") == "system"
+        ):
+            first_conversation_message += 1
+        next_user = next(
+            (
+                index
+                for index in range(first_conversation_message + 1, len(messages))
+                if messages[index].get("role") == "user"
+            ),
+            None,
+        )
+        if next_user is None:
+            return None
+        return messages[:first_conversation_message] + messages[next_user:]
+
+    @staticmethod
+    def _truncate_token_inputs(inputs: Any, max_input_tokens: int) -> Any:
+        """Left-truncate sequence tensors when a single remaining turn is still too large."""
+        original_length = int(inputs["input_ids"].shape[-1])
+        if original_length <= max_input_tokens:
+            return inputs
+        for key in ("input_ids", "attention_mask", "token_type_ids", "position_ids", "cache_position"):
+            value = inputs.get(key)
+            if value is None or not hasattr(value, "shape") or not value.shape:
+                continue
+            if int(value.shape[-1]) != original_length:
+                continue
+            value = value[..., -max_input_tokens:]
+            if key == "position_ids":
+                value = value - value[..., :1]
+            inputs[key] = value
+        return inputs
+
+    def _context_fitted_inputs(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        max_new_tokens: int,
+    ) -> Any:
+        context_window = self.effective_context_window
+        if context_window is None:
+            return self._format_inputs(messages, tools, max_new_tokens)
+        max_input_tokens = context_window - max_new_tokens
+        if max_input_tokens < 1:
+            raise RuntimeError(
+                f"The response budget ({max_new_tokens}) must be smaller than the effective "
+                f"context window ({context_window})."
+            )
+
+        retained = copy.deepcopy(messages)
+        inputs = self._format_inputs(retained, tools, max_new_tokens)
+        while int(inputs["input_ids"].shape[-1]) > max_input_tokens:
+            shortened = self._without_oldest_turn(retained)
+            if shortened is None:
+                return self._truncate_token_inputs(inputs, max_input_tokens)
+            retained = shortened
+            inputs = self._format_inputs(retained, tools, max_new_tokens)
+        return inputs
+
     def chat(
         self,
         messages: list[dict[str, Any]],
@@ -117,29 +250,8 @@ class TransformersModel:
 
         assert self.model is not None
         tokenizer = self.tokenizer
-        if self.is_multimodal:
-            assert self.processor is not None
-            multimodal_messages = self._processor_messages(messages)
-            inputs = self.processor.apply_chat_template(
-                multimodal_messages,
-                tools=tools or None,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
-        elif getattr(tokenizer, "chat_template", None):
-            template_messages = self._processor_messages(messages)
-            inputs = tokenizer.apply_chat_template(
-                template_messages,
-                tools=tools or None,
-                add_generation_prompt=True,
-                return_tensors="pt",
-                return_dict=True,
-            )
-        else:
-            text = "\n\n".join(f"{message['role'].upper()}: {message['content']}" for message in messages) + "\nASSISTANT:"
-            inputs = tokenizer(text, return_tensors="pt")
+        selected_max_new_tokens = max_new_tokens if max_new_tokens is not None else self.settings.max_new_tokens
+        inputs = self._context_fitted_inputs(messages, tools, selected_max_new_tokens)
         device = torch.device("cuda:0") if torch.cuda.is_available() and self.settings.device != "cpu" else torch.device("cpu")
         inputs = {key: value.to(device) for key, value in inputs.items()}
         if self.is_multimodal:
@@ -150,7 +262,7 @@ class TransformersModel:
             pad_token_id = tokenizer.eos_token_id
         selected_temperature = self.settings.temperature if temperature is None else temperature
         generate_kwargs: dict[str, Any] = {
-            "max_new_tokens": max_new_tokens or self.settings.max_new_tokens,
+            "max_new_tokens": selected_max_new_tokens,
             "pad_token_id": pad_token_id,
         }
         if selected_temperature > 0:

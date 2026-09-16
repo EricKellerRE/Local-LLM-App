@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable
 
 from local_model_app.task_coordinator import TaskCoordinatorProtocol, WorkItemExecutorProtocol
 from local_model_app.task_models import CompletionAudit, TaskStatus
@@ -18,12 +19,14 @@ class UniversalTaskEngine:
         coordinator: TaskCoordinatorProtocol,
         *,
         executors: dict[str, WorkItemExecutorProtocol] | None = None,
+        on_status: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         poll_seconds: float = 5.0,
         lease_seconds: int = 1800,
     ) -> None:
         self.store = store
         self.coordinator = coordinator
         self.executors: dict[str, WorkItemExecutorProtocol] = dict(executors or {"model": coordinator})
+        self.on_status = on_status
         self.poll_seconds = poll_seconds
         self.lease_seconds = lease_seconds
         self.worker_id = f"local-{uuid.uuid4()}"
@@ -58,6 +61,22 @@ class UniversalTaskEngine:
     def wake(self) -> None:
         self._wake_event.set()
 
+    async def _release_task(self, task_id: str, status: TaskStatus, **kwargs: Any) -> dict[str, Any]:
+        task = self.store.release_task(task_id, status, **kwargs)
+        if self.on_status and status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.WAITING_FOR_INPUT,
+            TaskStatus.WAITING_FOR_TOOLS,
+        }:
+            try:
+                await self.on_status(task)
+            except Exception:
+                # Delivery is retried from durable state when the application starts again.
+                pass
+        return task
+
     async def _run(self) -> None:
         while not self._stop_event.is_set():
             worked = await self.run_pending_once()
@@ -91,7 +110,7 @@ class UniversalTaskEngine:
         policy = task["definition"]["execution"]
         deadline = policy.get("deadline")
         if deadline and datetime.fromisoformat(deadline) <= datetime.now(timezone.utc):
-            self.store.release_task(
+            await self._release_task(
                 task_id,
                 TaskStatus.FAILED,
                 summary="The configured task deadline passed before completion.",
@@ -124,7 +143,7 @@ class UniversalTaskEngine:
                 if executor is None:
                     reason = f"No executor is registered for work-item kind '{item['kind']}'."
                     self.store.block_work_item(item["id"], reason)
-                    self.store.release_task(
+                    await self._release_task(
                         task_id,
                         TaskStatus.WAITING_FOR_TOOLS,
                         summary=reason,
@@ -147,7 +166,7 @@ class UniversalTaskEngine:
                 if outcome.outcome == "retry":
                     retry_at = self._retry_at(task, item["attempts"], outcome.wait_seconds)
                     self.store.retry_work_item(item["id"], outcome.summary, retry_at)
-                    self.store.release_task(
+                    await self._release_task(
                         task_id,
                         TaskStatus.WAITING,
                         summary=outcome.summary,
@@ -157,7 +176,7 @@ class UniversalTaskEngine:
                     return
                 if outcome.outcome == "waiting_for_input":
                     self.store.block_work_item(item["id"], outcome.summary)
-                    self.store.release_task(
+                    await self._release_task(
                         task_id,
                         TaskStatus.WAITING_FOR_INPUT,
                         summary=outcome.summary,
@@ -166,7 +185,7 @@ class UniversalTaskEngine:
                     return
                 if outcome.outcome == "waiting_for_tools":
                     self.store.block_work_item(item["id"], outcome.summary)
-                    self.store.release_task(
+                    await self._release_task(
                         task_id,
                         TaskStatus.WAITING_FOR_TOOLS,
                         summary=outcome.summary,
@@ -174,7 +193,7 @@ class UniversalTaskEngine:
                     )
                     return
                 self.store.fail_work_item(item["id"], outcome.summary)
-                self.store.release_task(
+                await self._release_task(
                     task_id,
                     TaskStatus.FAILED,
                     summary=outcome.summary,
@@ -182,14 +201,14 @@ class UniversalTaskEngine:
                 )
                 return
 
-            self.store.release_task(
+            await self._release_task(
                 task_id,
                 TaskStatus.RUNNABLE,
-                summary="Episode call budget reached; work was checkpointed for the next episode.",
+                summary="Episode checkpoint interval reached; work continues in the next episode.",
                 next_run_at=datetime.now(timezone.utc),
             )
         except Exception as exc:
-            self.store.release_task(
+            await self._release_task(
                 task_id,
                 TaskStatus.FAILED,
                 summary="The task engine could not continue this episode.",
@@ -202,13 +221,13 @@ class UniversalTaskEngine:
         reason = f"{type(exc).__name__}: {exc}"
         if maximum_attempts is not None and item["attempts"] >= int(maximum_attempts):
             self.store.fail_work_item(item["id"], reason)
-            self.store.release_task(
+            await self._release_task(
                 task["id"], TaskStatus.FAILED, summary="Retry limit reached.", error=reason
             )
             return
         retry_at = self._retry_at(task, item["attempts"])
         self.store.retry_work_item(item["id"], reason, retry_at)
-        self.store.release_task(
+        await self._release_task(
             task["id"],
             TaskStatus.WAITING,
             summary="A transient task error was checkpointed and scheduled for retry.",
@@ -224,7 +243,7 @@ class UniversalTaskEngine:
         blocked = [item for item in items if item["status"] == "blocked"]
         pending_later = [item for item in items if item["status"] == "pending"]
         if failed:
-            self.store.release_task(
+            await self._release_task(
                 task_id,
                 TaskStatus.FAILED,
                 summary="One or more work items failed.",
@@ -232,7 +251,7 @@ class UniversalTaskEngine:
             )
             return
         if blocked:
-            self.store.release_task(
+            await self._release_task(
                 task_id,
                 TaskStatus.WAITING_FOR_INPUT,
                 summary="Work is blocked and requires attention.",
@@ -242,7 +261,7 @@ class UniversalTaskEngine:
         if pending_later:
             run_times = [item["run_after"] for item in pending_later if item.get("run_after")]
             if run_times:
-                self.store.release_task(
+                await self._release_task(
                     task_id,
                     TaskStatus.WAITING,
                     summary="Waiting until the next work item is eligible to run.",
@@ -250,7 +269,7 @@ class UniversalTaskEngine:
                     next_run_at=datetime.fromisoformat(min(run_times)),
                 )
             else:
-                self.store.release_task(
+                await self._release_task(
                     task_id,
                     TaskStatus.WAITING_FOR_INPUT,
                     summary="No pending work item has satisfiable dependencies.",
@@ -261,18 +280,18 @@ class UniversalTaskEngine:
         audit: CompletionAudit = await self.coordinator.audit_completion(task, items)
         self.store.record_audit(task_id, audit.model_dump(mode="json"))
         if audit.passed:
-            self.store.release_task(task_id, TaskStatus.COMPLETED, summary=audit.summary)
+            await self._release_task(task_id, TaskStatus.COMPLETED, summary=audit.summary)
             return
         if audit.follow_up_items:
             self.store.add_work_items(task_id, audit.follow_up_items)
-            self.store.release_task(
+            await self._release_task(
                 task_id,
                 TaskStatus.RUNNABLE,
                 summary=audit.summary,
                 next_run_at=datetime.now(timezone.utc),
             )
             return
-        self.store.release_task(
+        await self._release_task(
             task_id,
             TaskStatus.WAITING_FOR_INPUT,
             summary=audit.summary,

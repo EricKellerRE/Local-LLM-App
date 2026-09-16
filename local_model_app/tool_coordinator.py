@@ -7,7 +7,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from local_model_app.mcp_manager import McpPluginManager
 from local_model_app.model import AssistantReply, TransformersModel
@@ -18,7 +18,7 @@ from local_model_app.tool_router import ToolRouter
 
 PLAN_TOKENS = 192
 ACTION_TOKENS = 192
-FINAL_TOKENS = 256
+FINAL_TOKENS = 8192
 MAX_OBSERVATION_BYTES = 32_000
 MAX_TEXT_OBSERVATION_CHARS = 12_000
 
@@ -47,13 +47,13 @@ def _strip_binary_payloads(value: Any) -> Any:
     return cleaned
 
 
-def _bounded_structured(value: Any) -> tuple[Any, dict[str, Any] | None]:
+def _bounded_structured(value: Any, max_bytes: int = MAX_OBSERVATION_BYTES) -> tuple[Any, dict[str, Any] | None]:
     cleaned = _strip_binary_payloads(value)
     serialized = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     size = len(serialized.encode("utf-8"))
-    if size <= MAX_OBSERVATION_BYTES:
+    if size <= max_bytes:
         return cleaned, None
-    preview = serialized.encode("utf-8")[:MAX_OBSERVATION_BYTES].decode("utf-8", errors="ignore")
+    preview = serialized.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
     return {
         "preview": preview,
         "truncated": True,
@@ -65,7 +65,12 @@ def _bounded_structured(value: Any) -> tuple[Any, dict[str, Any] | None]:
     }
 
 
-def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
+def _compact_result(
+    result: dict[str, Any],
+    *,
+    max_structured_bytes: int = MAX_OBSERVATION_BYTES,
+    max_text_characters: int = MAX_TEXT_OBSERVATION_CHARS,
+) -> dict[str, Any]:
     """Avoid sending duplicate MCP text and structured payloads back to the model."""
     compact: dict[str, Any] = {"isError": bool(result.get("isError"))}
     if result.get("error"):
@@ -73,7 +78,7 @@ def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
         return compact
     structured = result.get("structuredContent")
     if structured is not None:
-        compact["data"], truncation = _bounded_structured(structured)
+        compact["data"], truncation = _bounded_structured(structured, max_structured_bytes)
         if truncation:
             compact["truncation"] = truncation
         return compact
@@ -83,11 +88,11 @@ def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
         if isinstance(item, dict) and item.get("type") == "text" and item.get("text")
     ]
     combined = "\n".join(text_parts)
-    compact["content"] = combined[:MAX_TEXT_OBSERVATION_CHARS]
-    if len(combined) > MAX_TEXT_OBSERVATION_CHARS:
+    compact["content"] = combined[:max_text_characters]
+    if len(combined) > max_text_characters:
         compact["truncation"] = {
             "originalCharacters": len(combined),
-            "includedCharacters": MAX_TEXT_OBSERVATION_CHARS,
+            "includedCharacters": max_text_characters,
             "estimatedOriginalTokens": (len(combined) + 3) // 4,
             "strategy": "text_prefix",
         }
@@ -107,12 +112,28 @@ class ToolCoordinator:
         scratchpad: Scratchpad,
         activity_path: Path,
         router: ToolRouter | None = None,
+        max_calls: int = 256,
+        task_checkpoint: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> None:
         self.model = model
         self.manager = manager
         self.scratchpad = scratchpad
         self.activity_path = activity_path
         self.router = router or ToolRouter()
+        # This is a circuit breaker for one checkpoint, not a task-wide quota.
+        # Durable work can run as many checkpoints/episodes as completion needs.
+        self.max_calls = max(1, min(int(max_calls), 4096))
+        self.task_checkpoint = task_checkpoint
+
+    def _observation_limits(self) -> tuple[int, int]:
+        context_window = getattr(self.model, "effective_context_window", None)
+        if not isinstance(context_window, int):
+            context_window = getattr(getattr(self.model, "settings", None), "context_window", None)
+        if not isinstance(context_window, int):
+            return MAX_OBSERVATION_BYTES, MAX_TEXT_OBSERVATION_CHARS
+        observation_tokens = max(8_000, min(context_window // 4, 65_536))
+        characters = observation_tokens * 4
+        return characters, characters
 
     def _log(self, event: str, **data: Any) -> None:
         self.activity_path.parent.mkdir(parents=True, exist_ok=True)
@@ -302,13 +323,25 @@ class ToolCoordinator:
             messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
         self._log("tool_call", tool=tool.exposed_name, arguments=arguments, call_id=call_id)
         try:
-            full_result = await self.manager.call_tool(tool.exposed_name, arguments)
+            if self.task_checkpoint is None:
+                full_result = await self.manager.call_tool(tool.exposed_name, arguments)
+            else:
+                full_result = await self.manager.call_tool(
+                    tool.exposed_name,
+                    arguments,
+                    task_checkpoint=self.task_checkpoint,
+                )
         except PermissionError as exc:
             full_result = {"isError": True, "error": "approval_required", "message": str(exc)}
         except Exception as exc:
             full_result = {"isError": True, "error": type(exc).__name__, "message": str(exc)}
         self._log("tool_result", tool=tool.exposed_name, result=full_result, call_id=call_id)
-        compact = _compact_result(full_result)
+        max_bytes, max_characters = self._observation_limits()
+        compact = _compact_result(
+            full_result,
+            max_structured_bytes=max_bytes,
+            max_text_characters=max_characters,
+        )
         messages.append({
             "role": "tool",
             "tool_call_id": call_id,
@@ -328,6 +361,34 @@ class ToolCoordinator:
         return getattr(getattr(self.model, "settings", None), name, default)
 
     @staticmethod
+    def _checkpoint_summary(
+        messages: list[dict[str, Any]],
+        data: dict[str, Any],
+        previous: str,
+    ) -> str:
+        """Build a deterministic bounded continuation record without ending the tool loop."""
+        recent: list[dict[str, Any]] = []
+        for message in messages[-8:]:
+            row: dict[str, Any] = {"role": message.get("role")}
+            if message.get("name"):
+                row["name"] = message["name"]
+            content = message.get("content")
+            if content:
+                row["content"] = str(content)[:3500]
+            if message.get("tool_calls"):
+                row["tool_calls"] = json.dumps(
+                    message["tool_calls"], ensure_ascii=False, separators=(",", ":")
+                )[:3500]
+            recent.append(row)
+        bounded_data, _ = _bounded_structured(data, 12_000)
+        record = {
+            "prior_checkpoint": previous[-12_000:] if previous else "",
+            "latest_structured_state": bounded_data,
+            "recent_messages": recent,
+        }
+        return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
     def _data_requires_action(data: dict[str, Any]) -> bool:
         return bool(data.get("next_step") or data.get("next_tool") or data.get("tools") or data.get("tool"))
 
@@ -343,6 +404,12 @@ class ToolCoordinator:
             raise RuntimeError("The selected MCP plugins exposed no callable capabilities.")
 
         saved_state = self._load_state()
+        resumed_checkpoint = (
+            saved_state
+            if saved_state.get("status") == "tool_checkpoint"
+            and saved_state.get("user_message") == user_message
+            else {}
+        )
         resume_tool_name = saved_state.get("backend_tool") if saved_state.get("status") == "waiting_for_input" else None
         resume_required = saved_state.get("required_inputs") if isinstance(saved_state.get("required_inputs"), list) else []
         can_resume = bool(
@@ -422,22 +489,40 @@ class ToolCoordinator:
             "or when a required input, permission, or external condition prevents progress.\n\n"
             f"Planning note:\n{plan}"
         )
+        base_system_prompt = system_prompt
+        checkpoint_summary = str(resumed_checkpoint.get("summary") or "")
+        checkpoint_index = int(resumed_checkpoint.get("checkpoint_index") or 0)
+        if checkpoint_summary:
+            system_prompt += (
+                "\n\nPersisted continuation record from earlier tool checkpoints. Treat it as bounded "
+                "observations from this same request and continue from it; do not repeat completed calls:\n"
+                f"{checkpoint_summary}"
+            )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             *history[-6:],
             {"role": "user", "content": user_message},
         ]
+        if checkpoint_summary:
+            messages.append({
+                "role": "user",
+                "content": "Continue the same work from the persisted checkpoint. Call the next necessary tool.",
+            })
         conversation_text = "\n".join(
             str(message.get("content", ""))
             for message in [*history, {"role": "user", "content": user_message}]
             if message.get("role") == "user"
         )
         max_calls = min(
-            8,
+            self.max_calls,
             *(self.manager.registry.get_plugin(plugin_id).manifest.policy.max_calls_per_turn for plugin_id in plugin_ids),
         )
         call_count = 0
-        data: dict[str, Any] = {}
+        data = (
+            dict(resumed_checkpoint.get("data") or {})
+            if isinstance(resumed_checkpoint.get("data"), dict)
+            else {}
+        )
         pending: tuple[DiscoveredTool, dict[str, Any], str | None, bool] | None = None
 
         schema_tool = next((tool for tool in tools if tool.native_name.endswith("get_tool_schema")), None)
@@ -449,7 +534,42 @@ class ToolCoordinator:
             pending = (route_tool, {"request_text": user_message}, None, True)
 
         premature_retries = 0
-        while call_count < max_calls:
+        while True:
+            if call_count >= max_calls:
+                checkpoint_index += 1
+                checkpoint_summary = self._checkpoint_summary(messages, data, checkpoint_summary)
+                self._save_state({
+                    "status": "tool_checkpoint",
+                    "user_message": user_message,
+                    "checkpoint_index": checkpoint_index,
+                    "summary": checkpoint_summary,
+                    "data": data,
+                })
+                self.scratchpad.add("tool_checkpoint", checkpoint_summary[:4000])
+                self._log(
+                    "tool_checkpoint",
+                    checkpoint_index=checkpoint_index,
+                    completed_calls=max_calls,
+                    continuing=True,
+                )
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            f"{base_system_prompt}\n\nTool checkpoint {checkpoint_index}. The call count caused context "
+                            "compaction, not task termination. Continue from this exact bounded record and do not "
+                            f"repeat completed calls:\n{checkpoint_summary}"
+                        ),
+                    },
+                    {"role": "user", "content": user_message},
+                    {
+                        "role": "user",
+                        "content": "Continue the same work. Call the next necessary tool.",
+                    },
+                ]
+                call_count = 0
+                premature_retries = 0
+
             if pending:
                 selected_tool, arguments, existing_call_id, append_assistant_call = pending
                 pending = None
@@ -496,14 +616,16 @@ class ToolCoordinator:
                     continue
 
             specs = self._narrowed_specs(tools, data, routed.visible)
+            requires_action = self._data_requires_action(data) or not data
             reply: AssistantReply = await asyncio.to_thread(
                 self.model.chat,
                 messages,
                 tools=specs,
-                max_new_tokens=int(self._setting(
-                    "tool_action_max_new_tokens" if self._data_requires_action(data) or not data else "tool_final_max_new_tokens",
-                    ACTION_TOKENS if self._data_requires_action(data) or not data else FINAL_TOKENS,
-                )),
+                max_new_tokens=int(
+                    self._setting("tool_action_max_new_tokens", ACTION_TOKENS)
+                    if requires_action
+                    else self._setting("max_new_tokens", FINAL_TOKENS)
+                ),
                 temperature=float(self._setting("tool_temperature", 0.0)),
             )
             assistant_message: dict[str, Any] = {"role": "assistant", "content": reply.content}
@@ -538,8 +660,6 @@ class ToolCoordinator:
 
             premature_retries = 0
             for call in reply.tool_calls:
-                if call_count >= max_calls:
-                    break
                 function = call["function"]
                 raw_arguments = function.get("arguments", {})
                 arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
@@ -555,5 +675,3 @@ class ToolCoordinator:
                     continue
                 pending = (selected_tool, arguments, call["id"], False)
                 break
-
-        raise RuntimeError(f"Tool loop exceeded its {max_calls}-call budget without a final answer.")

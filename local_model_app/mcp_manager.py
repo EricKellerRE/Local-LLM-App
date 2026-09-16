@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from local_model_app.mcp_plugins import (
     DiscoveredTool,
@@ -158,12 +158,60 @@ class McpPluginManager:
             if plugin_id not in self._active:
                 await self.start(plugin_id)
 
+    @staticmethod
+    def _requires_durable_task(tool: DiscoveredTool) -> bool:
+        execution = tool.execution or {}
+        return execution.get("taskSupport") == "required"
+
+    async def _wait_for_tool_task(
+        self,
+        client: Any,
+        tool: DiscoveredTool,
+        task_id: str,
+    ) -> dict[str, Any]:
+        from mcp import types
+
+        while True:
+            status = await client.session.send_request(
+                types.GetTaskRequest(params=types.GetTaskRequestParams(taskId=task_id)),
+                types.GetTaskResult,
+            )
+            if status.status == "completed":
+                result = await client.session.send_request(
+                    types.GetTaskPayloadRequest(
+                        params=types.GetTaskPayloadRequestParams(taskId=task_id)
+                    ),
+                    types.CallToolResult,
+                )
+                return normalize_tool_result(tool, result)
+            if status.status in {"failed", "cancelled"}:
+                detail = status.status_message or f"MCP task {task_id} {status.status}."
+                raise RuntimeError(detail)
+            poll_seconds = max(0.25, min(float(status.poll_interval or 2000) / 1000.0, 30.0))
+            await asyncio.sleep(poll_seconds)
+
+    async def resume_tool_task(self, handle: dict[str, Any]) -> dict[str, Any]:
+        """Resume polling a previously checkpointed MCP task without launching it again."""
+        plugin_id = str(handle["plugin_id"])
+        server_id = str(handle["server_id"])
+        exposed_name = str(handle["exposed_name"])
+        task_id = str(handle["task_id"])
+        await self.ensure_started([plugin_id])
+        active = self._active[plugin_id]
+        tool = next(
+            item
+            for item in active.tools
+            if item.server_id == server_id and item.exposed_name == exposed_name
+        )
+        return await self._wait_for_tool_task(active.clients[server_id], tool, task_id)
+
     async def call_tool(
         self,
         exposed_name: str,
         arguments: dict[str, Any],
         *,
         approved: bool = False,
+        task_checkpoint: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         from jsonschema import validate
 
@@ -210,6 +258,29 @@ class McpPluginManager:
                 },
                 "isError": False,
             }
+        if self._requires_durable_task(tool):
+            from mcp import types
+
+            created = await client.session.send_request(
+                types.CallToolRequest(params=types.CallToolRequestParams(
+                    name=tool.native_name,
+                    arguments=arguments,
+                    task=types.TaskMetadata(ttl=7 * 24 * 60 * 60 * 1000),
+                )),
+                types.CreateTaskResult,
+            )
+            handle = {
+                "plugin_id": tool.plugin_id,
+                "server_id": tool.server_id,
+                "exposed_name": tool.exposed_name,
+                "native_name": tool.native_name,
+                "task_id": created.task.task_id,
+                "created_at": created.task.created_at,
+            }
+            if task_checkpoint is not None:
+                await task_checkpoint(handle)
+            return await self._wait_for_tool_task(client, tool, created.task.task_id)
+
         result = await client.call_tool(tool.native_name, arguments)
         return normalize_tool_result(tool, result)
 

@@ -13,6 +13,7 @@ from local_model_app.task_models import (
 
 
 AsyncGenerator = Callable[[list[dict[str, Any]]], Awaitable[str]]
+CapabilityCatalog = Callable[[list[str]], Awaitable[list[dict[str, Any]]]]
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -57,8 +58,13 @@ class WorkItemExecutorProtocol(Protocol):
 class ModelTaskCoordinator:
     """Uses the local model for planning while leaving lifecycle control to the host."""
 
-    def __init__(self, generate: AsyncGenerator) -> None:
+    def __init__(
+        self,
+        generate: AsyncGenerator,
+        capability_catalog: CapabilityCatalog | None = None,
+    ) -> None:
         self.generate = generate
+        self.capability_catalog = capability_catalog
 
     async def propose(self, request: str) -> TaskDefinition:
         prompt = (
@@ -77,6 +83,36 @@ class ModelTaskCoordinator:
 
     async def plan_task(self, task: dict[str, Any]) -> list[ProposedWorkItem]:
         definition = task["definition"]
+        metadata = definition.get("metadata") or {}
+        if metadata.get("mode") == "durable_tools":
+            plugin_ids = [str(value) for value in metadata.get("plugin_ids") or []]
+            capabilities = (
+                await self.capability_catalog(plugin_ids)
+                if self.capability_catalog is not None and plugin_ids
+                else []
+            )
+            prompt = (
+                "Plan a durable, resumable tool-driven task. Return only JSON with a work_items array. "
+                "Create 3-12 bounded evidence-producing items of kind 'tool', each covering a distinct research "
+                "question, engineering stage, metric, scenario, or validation concern. Use dependencies where a "
+                "later operation requires a case/session/artifact handle from earlier work. Then create exactly one "
+                "kind 'synthesis' item that depends on every evidence item and produces the complete user-facing "
+                "deliverable. For iterative optimization, include baseline measurement, candidate changes, repeated "
+                "metric evaluation, regression/safety checks, and final comparison. For research, include diverse "
+                "search angles, primary-source reading, disagreement/gap analysis, and citation capture. Do not put "
+                "all work into one item. Each item has key, kind, title, instructions, completion_check, priority, "
+                "and depends_on. Keys must start with a lowercase letter and contain only letters, digits, dot, "
+                "underscore, or hyphen."
+            )
+            response = await self.generate([
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps({
+                    "definition": definition,
+                    "available_capabilities": capabilities,
+                }, ensure_ascii=False)},
+            ])
+            data = _parse_json_object(response)
+            return [ProposedWorkItem.model_validate(item) for item in data.get("work_items", [])]
         prompt = (
             "Create the first bounded work items for this durable task. You are planning, not claiming execution. "
             "The host currently supports model reasoning and drafting but has no task-specific external tools. "
@@ -148,11 +184,19 @@ class ModelTaskCoordinator:
             }
             for item in work_items[-40:]
         ]
+        durable_tools = (task["definition"].get("metadata") or {}).get("mode") == "durable_tools"
         prompt = (
             "Audit a durable task against every success criterion using only recorded evidence. Be conservative. "
             "A plan or assertion is not evidence that external work occurred. Return only JSON with: passed, summary, "
             "criteria (each containing criterion, satisfied, evidence), and follow_up_items. passed may be true only "
             "when every criterion is satisfied. Create bounded follow-up items for remediable gaps."
+            + (
+                " For this tool-driven task, follow-up evidence or optimization items must use kind 'tool'. If any "
+                "follow-up is created, also create a new kind 'synthesis' item depending on every new follow-up key. "
+                "Do not pass an optimization without baseline/final metric evidence, and do not pass research without "
+                "source URLs, conclusions, techniques, and explicit gaps or limitations."
+                if durable_tools else ""
+            )
         )
         response = await self.generate(
             [

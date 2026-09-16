@@ -120,6 +120,7 @@ class ToolCoordinatorTests(unittest.TestCase):
             AssistantReply(content="", tool_calls=[{"id": "call_1", "type": "function", "function": {"name": tool.exposed_name, "arguments": '{"query":"cases"}'}}], reasoning_content="Use lookup."),
             AssistantReply(content="The lookup completed.", tool_calls=[]),
         ])
+        model.settings = SimpleNamespace(max_new_tokens=12_000)
         manager = FakeManager([tool], {tool.exposed_name: {"isError": False, "structuredContent": {"ok": True}}})
 
         with TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -130,8 +131,55 @@ class ToolCoordinatorTests(unittest.TestCase):
         self.assertEqual(answer, "The lookup completed.")
         self.assertEqual(manager.calls, [(tool.exposed_name, {"query": "cases"})])
         self.assertEqual(model.chat_calls[0]["max_new_tokens"], 192)
+        self.assertEqual(model.chat_calls[1]["max_new_tokens"], 12_000)
         tool_message = next(message for message in model.chat_calls[1]["messages"] if message["role"] == "tool")
         self.assertNotIn("duplicate", tool_message["content"])
+
+    def test_tool_checkpoint_interval_compacts_and_continues(self) -> None:
+        tool = make_tool("lookup", required=["query"])
+        model = FakeModel([
+            AssistantReply(content="", tool_calls=[{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": tool.exposed_name, "arguments": '{"query":"first"}'},
+            }]),
+            AssistantReply(content="", tool_calls=[{
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": tool.exposed_name, "arguments": '{"query":"second"}'},
+            }]),
+            AssistantReply(content="Both lookups completed.", tool_calls=[]),
+        ])
+        model.settings = SimpleNamespace(max_new_tokens=12_000)
+        manager = FakeManager([tool], {tool.exposed_name: {
+            "isError": False, "structuredContent": {"ok": True},
+        }})
+
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            activity = root / "activity.jsonl"
+            coordinator = ToolCoordinator(
+                model,
+                manager,
+                Scratchpad(root / "scratchpad.jsonl"),
+                activity,
+                max_calls=1,
+            )
+            answer = asyncio.run(coordinator.respond("Perform both lookups", [], ["grid.plugin"]))
+            events = [
+                json.loads(line)["event"]
+                for line in activity.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(answer, "Both lookups completed.")
+        self.assertEqual(
+            manager.calls,
+            [
+                (tool.exposed_name, {"query": "first"}),
+                (tool.exposed_name, {"query": "second"}),
+            ],
+        )
+        self.assertGreaterEqual(events.count("tool_checkpoint"), 1)
 
     def test_generic_router_exposes_only_top_schema_batch(self) -> None:
         weather = make_tool("weather_forecast", required=["city"])

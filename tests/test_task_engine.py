@@ -83,6 +83,25 @@ class TaskEngineTests(unittest.TestCase):
             self.assertIn("literature search", detail["waiting_reason"])
             store.close()
 
+    def test_terminal_status_callback_receives_completed_task(self) -> None:
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            store = TaskStore(Path(directory) / "tasks.sqlite3")
+            task = store.create_task(
+                "Do this",
+                TaskDefinition(title="Task", goal="Do this", success_criteria=["Done"]),
+            )
+            store.start_task(task["id"])
+            delivered = []
+
+            async def on_status(completed):
+                delivered.append(completed)
+
+            engine = UniversalTaskEngine(store, FakeCoordinator(), on_status=on_status)
+            asyncio.run(engine.run_pending_once())
+
+            self.assertEqual(delivered[0]["status"], "completed")
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
