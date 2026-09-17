@@ -114,6 +114,7 @@ class ToolCoordinator:
         router: ToolRouter | None = None,
         max_calls: int = 256,
         task_checkpoint: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        telemetry_context: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.manager = manager
@@ -124,6 +125,7 @@ class ToolCoordinator:
         # Durable work can run as many checkpoints/episodes as completion needs.
         self.max_calls = max(1, min(int(max_calls), 4096))
         self.task_checkpoint = task_checkpoint
+        self.telemetry_context = dict(telemetry_context or {})
 
     def _observation_limits(self) -> tuple[int, int]:
         context_window = getattr(self.model, "effective_context_window", None)
@@ -451,6 +453,8 @@ class ToolCoordinator:
                 [{"role": "system", "content": plan_prompt}, *history[-6:], {"role": "user", "content": user_message}],
                 max_new_tokens=int(self._setting("planner_max_new_tokens", PLAN_TOKENS)),
                 temperature=float(self._setting("tool_temperature", 0.0)),
+                generation_class="work_item_planning",
+                telemetry_context=self.telemetry_context,
             )
         self.scratchpad.add("plan", plan)
         self._log("plan", content=plan, plugins=plugin_ids)
@@ -624,9 +628,14 @@ class ToolCoordinator:
                 max_new_tokens=int(
                     self._setting("tool_action_max_new_tokens", ACTION_TOKENS)
                     if requires_action
-                    else self._setting("max_new_tokens", FINAL_TOKENS)
+                    else self._setting(
+                        "post_tool_decision_max_new_tokens",
+                        self._setting("max_new_tokens", FINAL_TOKENS),
+                    )
                 ),
                 temperature=float(self._setting("tool_temperature", 0.0)),
+                generation_class="tool_action" if requires_action else "post_tool_decision",
+                telemetry_context=self.telemetry_context,
             )
             assistant_message: dict[str, Any] = {"role": "assistant", "content": reply.content}
             if reply.reasoning_content:

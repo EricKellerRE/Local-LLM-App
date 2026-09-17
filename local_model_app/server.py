@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import wraps
@@ -19,8 +21,9 @@ from local_model_app.app_settings import AppSettingsStore
 from local_model_app.chat_store import ChatStore
 from local_model_app.config import Settings, _load_dotenv
 from local_model_app.coordinator import Coordinator
-from local_model_app.durable_tools import DurableSynthesisExecutor, DurableToolExecutor
+from local_model_app.durable_tools import DurableSectionExecutor, DurableSynthesisExecutor, DurableToolExecutor
 from local_model_app.model import TransformersModel
+from local_model_app.research_pipeline import ResearchDiscoveryExecutor, ResearchNotesExecutor
 from local_model_app.huggingface_service import HuggingFaceService
 from local_model_app.mcp_manager import McpPluginManager
 from local_model_app.mcp_plugins import McpPluginRegistry, PluginConfigurationError
@@ -109,6 +112,19 @@ class SettingsUpdateRequest(BaseModel):
     context_window: int | None = Field(default=None, ge=256, le=4_194_304)
     max_new_tokens: int = Field(default=8192, ge=1, le=262_144)
     reasoning_budget: int | None = Field(default=None, ge=0, le=262_144)
+    task_planner_max_new_tokens: int = Field(default=1024, ge=1, le=262_144)
+    work_item_planner_max_new_tokens: int = Field(default=192, ge=1, le=262_144)
+    tool_action_max_new_tokens: int = Field(default=1024, ge=1, le=262_144)
+    post_tool_decision_max_new_tokens: int = Field(default=8192, ge=1, le=262_144)
+    section_max_new_tokens: int = Field(default=3072, ge=1, le=262_144)
+    synthesis_max_new_tokens: int = Field(default=8192, ge=1, le=262_144)
+    research_classifier_max_new_tokens: int = Field(default=512, ge=1, le=262_144)
+    research_notes_max_new_tokens: int = Field(default=1536, ge=1, le=262_144)
+    research_seed_sources: int = Field(default=12, ge=1, le=100)
+    research_depth_passes: int = Field(default=3, ge=0, le=10)
+    research_max_sources: int = Field(default=80, ge=1, le=1000)
+    research_references_per_source: int = Field(default=12, ge=1, le=100)
+    research_notes_batch_size: int = Field(default=6, ge=1, le=50)
     max_tool_calls_per_step: int = Field(default=256, ge=1, le=4096)
     temperature: float = Field(default=0.7, ge=0, le=2)
     top_p: float = Field(default=0.9, gt=0, le=1)
@@ -118,8 +134,24 @@ class SettingsUpdateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_token_budgets(self) -> "SettingsUpdateRequest":
+        if self.research_max_sources < self.research_seed_sources:
+            raise ValueError("Research total source cap must be at least the seed-source count.")
         if self.context_window is not None and self.max_new_tokens >= self.context_window:
             raise ValueError("Response budget must be smaller than the context window.")
+        if self.context_window is not None:
+            named_budgets = {
+                "Task planner": self.task_planner_max_new_tokens,
+                "Work-item planner": self.work_item_planner_max_new_tokens,
+                "Tool action": self.tool_action_max_new_tokens,
+                "Post-tool decision": self.post_tool_decision_max_new_tokens,
+                "Report section": self.section_max_new_tokens,
+                "Synthesis": self.synthesis_max_new_tokens,
+                "Research relevance": self.research_classifier_max_new_tokens,
+                "Research notes": self.research_notes_max_new_tokens,
+            }
+            invalid = [name for name, value in named_budgets.items() if value >= self.context_window]
+            if invalid:
+                raise ValueError(f"{', '.join(invalid)} budget must be smaller than the context window.")
         if self.reasoning_budget is not None and self.reasoning_budget > self.max_new_tokens:
             raise ValueError("Reasoning budget cannot exceed the response budget.")
         return self
@@ -134,7 +166,10 @@ class Runtime:
         self.app_settings = AppSettingsStore(ROOT)
         self.paths = self.app_settings.paths()
         settings = Settings.from_environment(ROOT)
-        self.model = TransformersModel(settings)
+        self.model = TransformersModel(
+            settings,
+            telemetry_path=self.paths.data_directory / "generation_telemetry.jsonl",
+        )
         encoder = (
             LocalEmbeddingEncoder(settings.router_model_id, device=settings.router_device)
             if settings.router_model_id
@@ -168,7 +203,14 @@ class Runtime:
                     self.tasks,
                     self._inference_lock,
                 ),
-                "synthesis": DurableSynthesisExecutor(self.task_synthesize),
+                "research_discovery": ResearchDiscoveryExecutor(
+                    self.mcp,
+                    self.paths.data_directory,
+                    self.classify_references,
+                ),
+                "research_notes": ResearchNotesExecutor(self.task_analyze_sources, self.paths.data_directory),
+                "section": DurableSectionExecutor(self.task_write_section),
+                "synthesis": DurableSynthesisExecutor(self.task_synthesize, self.paths.data_directory),
             },
             on_status=self.deliver_task_status,
             poll_seconds=float(os.getenv("LOCAL_TASK_POLL_SECONDS", "5")),
@@ -225,6 +267,7 @@ class Runtime:
                 tools=body.tools,
                 max_new_tokens=body.max_tokens,
                 temperature=body.temperature,
+                generation_class="api_tool_turn" if body.tools else "ordinary_response",
             )
 
     @tracked_activity("background work is in progress")
@@ -234,13 +277,14 @@ class Runtime:
             settings = self.model.settings
             planner_budget = min(
                 settings.max_new_tokens,
-                max(1024, settings.tool_action_max_new_tokens),
+                int(getattr(settings, "task_planner_max_new_tokens", max(1024, settings.tool_action_max_new_tokens))),
             )
             return await asyncio.to_thread(
                 self.model.generate,
                 messages,
                 max_new_tokens=planner_budget,
                 temperature=settings.tool_temperature,
+                generation_class="task_planning",
             )
 
     @tracked_activity("a final report is being written")
@@ -250,8 +294,68 @@ class Runtime:
             return await asyncio.to_thread(
                 self.model.generate,
                 messages,
-                max_new_tokens=self.model.settings.max_new_tokens,
+                max_new_tokens=int(getattr(
+                    self.model.settings,
+                    "synthesis_max_new_tokens",
+                    self.model.settings.max_new_tokens,
+                )),
                 temperature=self.model.settings.temperature,
+                generation_class="final_synthesis",
+            )
+
+    @tracked_activity("a report section is being written")
+    async def task_write_section(self, messages: list[dict[str, Any]]) -> str:
+        async with self._inference_lock:
+            await self.ensure_loaded()
+            return await asyncio.to_thread(
+                self.model.generate,
+                messages,
+                max_new_tokens=int(getattr(self.model.settings, "section_max_new_tokens", 3072)),
+                temperature=self.model.settings.temperature,
+                generation_class="report_section",
+            )
+
+    @tracked_activity("research sources are being filtered")
+    async def classify_references(self, goal: str, candidates: list[dict[str, str]]) -> set[str]:
+        async with self._inference_lock:
+            await self.ensure_loaded()
+            response = await asyncio.to_thread(
+                self.model.generate,
+                [
+                    {"role": "system", "content": (
+                        "Select citation candidates that are substantively relevant to the research goal. Favor "
+                        "primary studies and authoritative reviews; reject navigation, author profiles, unrelated "
+                        "citations, and duplicate editions. Return only JSON: {\"relevant_ids\": [string]}."
+                    )},
+                    {"role": "user", "content": json.dumps({
+                        "goal": goal,
+                        "candidates": candidates,
+                    }, ensure_ascii=False)},
+                ],
+                max_new_tokens=int(getattr(self.model.settings, "research_classifier_max_new_tokens", 512)),
+                temperature=0,
+                generation_class="research_relevance",
+            )
+        try:
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
+            payload = json.loads(cleaned[cleaned.find("{"):cleaned.rfind("}") + 1])
+            allowed = {candidate["id"] for candidate in candidates}
+            return {str(value) for value in payload.get("relevant_ids", []) if str(value) in allowed}
+        except (ValueError, TypeError, json.JSONDecodeError):
+            raise ValueError("The relevance classifier did not return valid candidate IDs.")
+
+    @tracked_activity("research sources are being summarized")
+    async def task_analyze_sources(self, messages: list[dict[str, Any]]) -> str:
+        async with self._inference_lock:
+            await self.ensure_loaded()
+            return await asyncio.to_thread(
+                self.model.generate,
+                messages,
+                max_new_tokens=int(getattr(self.model.settings, "research_notes_max_new_tokens", 1536)),
+                temperature=self.model.settings.tool_temperature,
+                generation_class="research_notes",
             )
 
     async def task_capability_catalog(self, plugin_ids: list[str]) -> list[dict[str, Any]]:
@@ -292,16 +396,29 @@ class Runtime:
         plugin_ids: list[str],
     ) -> str:
         title = " ".join(content.strip().split())[:120] or "Durable task"
+        is_research = "local.web-research" in plugin_ids
+        settings = self.model.settings
+        success_criteria = [
+            "The requested work is executed with persisted evidence rather than only described.",
+            "Every requested metric, conclusion, technique, comparison, or deliverable is addressed.",
+            "The final report identifies evidence, assumptions, limitations, unresolved gaps, and next steps.",
+            "Claims are traceable to source URLs or tool-produced artifact, case, session, and metric records.",
+        ]
+        deliverables = ["A complete standalone report posted back into the originating chat."]
+        if is_research:
+            success_criteria.extend([
+                "The research report contains at least 6,000 substantive words organized into independently drafted sections.",
+                "A downloadable Word document is produced and preserved in app data.",
+            ])
+            deliverables = [
+                "A downloadable Word research document stored in app data.",
+                "A concise completion message and document link posted into the originating chat.",
+            ]
         definition = TaskDefinition.model_validate({
             "title": title,
             "goal": content,
-            "success_criteria": [
-                "The requested work is executed with persisted evidence rather than only described.",
-                "Every requested metric, conclusion, technique, comparison, or deliverable is addressed.",
-                "The final report identifies evidence, assumptions, limitations, unresolved gaps, and next steps.",
-                "Claims are traceable to source URLs or tool-produced artifact, case, session, and metric records.",
-            ],
-            "deliverables": ["A complete standalone report posted back into the originating chat."],
+            "success_criteria": success_criteria,
+            "deliverables": deliverables,
             "constraints": [
                 "Never invent tool results, measurements, sources, or completion evidence.",
                 "Checkpoint each bounded work item and resume after application restart.",
@@ -320,6 +437,15 @@ class Runtime:
                 "chat_id": chat["id"],
                 "project_id": chat.get("project_id"),
                 "plugin_ids": plugin_ids,
+                "report_min_words": 6000 if is_research else None,
+                "report_min_sources": 12 if is_research else None,
+                "report_target_words": 8000 if is_research else None,
+                "report_format": "docx" if is_research else None,
+                "research_seed_sources": settings.research_seed_sources if is_research else None,
+                "research_depth_passes": settings.research_depth_passes if is_research else None,
+                "research_max_sources": settings.research_max_sources if is_research else None,
+                "research_references_per_source": settings.research_references_per_source if is_research else None,
+                "research_notes_batch_size": settings.research_notes_batch_size if is_research else None,
             },
         })
         task = self.tasks.create_task(content, definition)
@@ -343,13 +469,24 @@ class Runtime:
             return
         if status == TaskStatus.COMPLETED.value:
             report = ""
+            artifacts: list[dict[str, Any]] = []
             for item in reversed(self.tasks.work_items(task["id"])):
                 outcome = item.get("result") or {}
                 if item.get("kind") == "synthesis" and isinstance(outcome, dict):
                     report = str(outcome.get("result") or "").strip()
-                    if report:
+                    artifacts = list(outcome.get("artifacts") or [])
+                    if report or artifacts:
                         break
             message = report or task.get("current_summary") or "The durable task completed."
+            if artifacts:
+                links = []
+                for artifact in artifacts:
+                    filename = Path(str(artifact.get("relative_path") or "")).name
+                    if filename:
+                        label = str(artifact.get("name") or filename)
+                        links.append(f"[{label}](/api/tasks/{task['id']}/artifacts/{filename})")
+                if links:
+                    message = f"{message}\n\n" + "\n".join(links)
         else:
             message = (
                 f"The durable task ended with status {status}: "
@@ -770,6 +907,30 @@ async def update_settings(body: SettingsUpdateRequest, request: Request):
     }
 
 
+@app.get("/api/developer/generations")
+async def generation_telemetry(request: Request, limit: int = 50):
+    service = runtime(request)
+    selected_limit = max(1, min(int(limit), 500))
+    path = service.data_directory / "generation_telemetry.jsonl"
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            lines = list(deque(stream, maxlen=selected_limit))
+    except OSError:
+        lines = []
+    records = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return {
+        "path": str(path),
+        "records": records,
+    }
+
+
 @app.get("/api/models/search")
 async def search_models(request: Request, q: str = ""):
     try:
@@ -1080,6 +1241,20 @@ async def get_task(task_id: str, request: Request):
         return runtime(request).tasks.get_task(task_id, include_details=True)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Task not found") from exc
+
+
+@app.get("/api/tasks/{task_id}/artifacts/{artifact_name}")
+async def get_task_artifact(task_id: str, artifact_name: str, request: Request):
+    service = runtime(request)
+    try:
+        service.tasks.get_task(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Task not found") from exc
+    artifact_root = (service.data_directory / "artifacts" / task_id).resolve()
+    artifact_path = (artifact_root / artifact_name).resolve()
+    if artifact_path.parent != artifact_root or not artifact_path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return FileResponse(artifact_path, filename=artifact_path.name)
 
 
 @app.post("/api/tasks/{task_id}/start")

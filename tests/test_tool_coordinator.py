@@ -135,6 +135,42 @@ class ToolCoordinatorTests(unittest.TestCase):
         tool_message = next(message for message in model.chat_calls[1]["messages"] if message["role"] == "tool")
         self.assertNotIn("duplicate", tool_message["content"])
 
+    def test_post_tool_decision_has_an_independent_budget_and_turn_class(self) -> None:
+        tool = make_tool("lookup", required=["query"])
+        model = FakeModel([
+            AssistantReply(content="", tool_calls=[{
+                "id": "call_1", "type": "function",
+                "function": {"name": tool.exposed_name, "arguments": '{"query":"memory"}'},
+            }]),
+            AssistantReply(content="Evidence recorded.", tool_calls=[]),
+        ])
+        model.settings = SimpleNamespace(
+            max_new_tokens=8192,
+            tool_action_max_new_tokens=384,
+            post_tool_decision_max_new_tokens=1536,
+        )
+        manager = FakeManager([tool], {tool.exposed_name: {
+            "isError": False, "structuredContent": {"results": ["source"]},
+        }})
+
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            coordinator = ToolCoordinator(
+                model,
+                manager,
+                Scratchpad(root / "scratchpad.jsonl"),
+                root / "activity.jsonl",
+                telemetry_context={"task_id": "task-1", "work_item_id": "item-1"},
+            )
+            answer = asyncio.run(coordinator.respond("Research memory", [], ["grid.plugin"]))
+
+        self.assertEqual(answer, "Evidence recorded.")
+        self.assertEqual(model.chat_calls[0]["max_new_tokens"], 384)
+        self.assertEqual(model.chat_calls[0]["generation_class"], "tool_action")
+        self.assertEqual(model.chat_calls[1]["max_new_tokens"], 1536)
+        self.assertEqual(model.chat_calls[1]["generation_class"], "post_tool_decision")
+        self.assertEqual(model.chat_calls[1]["telemetry_context"]["work_item_id"], "item-1")
+
     def test_tool_checkpoint_interval_compacts_and_continues(self) -> None:
         tool = make_tool("lookup", required=["query"])
         model = FakeModel([

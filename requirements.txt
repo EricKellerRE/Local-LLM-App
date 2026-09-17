@@ -6,6 +6,7 @@ accelerate>=1.0
 safetensors>=0.4
 sentencepiece>=0.2
 pillow>=10
+python-docx>=1.1,<2
 fastapi>=0.115
 uvicorn>=0.34
 mcp>=1.24,<3

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import copy
 import json
+import threading
+import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,18 +18,49 @@ class AssistantReply:
     content: str
     tool_calls: list[dict[str, Any]]
     reasoning_content: str | None = None
+    prompt_tokens: int | None = None
+    generated_tokens: int | None = None
+    stop_reason: str | None = None
+    elapsed_seconds: float | None = None
 
 
 class TransformersModel:
     """Lazy Hugging Face Transformers loader and text generator."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, telemetry_path: Path | None = None) -> None:
         self.settings = settings
+        self.telemetry_path = telemetry_path
+        self._telemetry_lock = threading.Lock()
         self.tokenizer: Any | None = None
         self.processor: Any | None = None
         self.model: Any | None = None
         self.is_multimodal = False
         self.uses_device_map = False
+
+    def _write_telemetry(self, record: dict[str, Any]) -> None:
+        if self.telemetry_path is None:
+            return
+        try:
+            self.telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            with self._telemetry_lock, self.telemetry_path.open("a", encoding="utf-8") as stream:
+                stream.write(line)
+        except OSError:
+            # Diagnostics must never turn a successful model response into an error.
+            return
+
+    @staticmethod
+    def _text_token_count(decoder: Any, text: str | None) -> int | None:
+        if not text:
+            return 0
+        tokenizer = getattr(decoder, "tokenizer", decoder)
+        encode = getattr(tokenizer, "encode", None)
+        if not callable(encode):
+            return None
+        try:
+            return len(encode(text, add_special_tokens=False))
+        except (TypeError, ValueError):
+            return None
 
     @property
     def loaded(self) -> bool:
@@ -244,6 +278,8 @@ class TransformersModel:
         tools: list[dict[str, Any]] | None = None,
         max_new_tokens: int | None = None,
         temperature: float | None = None,
+        generation_class: str = "ordinary_response",
+        telemetry_context: dict[str, Any] | None = None,
     ) -> AssistantReply:
         self._load()
         import torch
@@ -252,6 +288,7 @@ class TransformersModel:
         tokenizer = self.tokenizer
         selected_max_new_tokens = max_new_tokens if max_new_tokens is not None else self.settings.max_new_tokens
         inputs = self._context_fitted_inputs(messages, tools, selected_max_new_tokens)
+        prompt_tokens = int(inputs["input_ids"].shape[-1])
         device = torch.device("cuda:0") if torch.cuda.is_available() and self.settings.device != "cpu" else torch.device("cpu")
         inputs = {key: value.to(device) for key, value in inputs.items()}
         if self.is_multimodal:
@@ -269,9 +306,12 @@ class TransformersModel:
             generate_kwargs.update({"do_sample": True, "temperature": selected_temperature, "top_p": self.settings.top_p})
         else:
             generate_kwargs["do_sample"] = False
+        started = time.monotonic()
         with torch.inference_mode():
             output = self.model.generate(**inputs, **generate_kwargs)
+        elapsed_seconds = time.monotonic() - started
         new_tokens = output[0][inputs["input_ids"].shape[-1] :]
+        generated_tokens = int(new_tokens.shape[-1])
         decoder = self.processor if self.is_multimodal else tokenizer
         assert decoder is not None
         cleaned_content = decoder.decode(new_tokens, skip_special_tokens=True).strip()
@@ -313,7 +353,43 @@ class TransformersModel:
                     "type": "function",
                     "function": {"name": name, "arguments": arguments},
                 })
-        return AssistantReply(content=content.strip(), tool_calls=tool_calls, reasoning_content=reasoning)
+        eos_value = getattr(getattr(decoder, "tokenizer", decoder), "eos_token_id", None)
+        eos_ids = set(eos_value if isinstance(eos_value, (list, tuple, set)) else [eos_value])
+        last_token = int(new_tokens[-1]) if generated_tokens else None
+        stop_reason = (
+            "tool_call" if tool_calls else
+            "length" if generated_tokens >= selected_max_new_tokens else
+            "eos" if generated_tokens and last_token in eos_ids else
+            "completed"
+        )
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "generation_id": uuid.uuid4().hex,
+            "generation_class": generation_class,
+            "model_id": self.settings.model_id,
+            "device": self.settings.device,
+            "dtype": self.settings.dtype,
+            "prompt_tokens": prompt_tokens,
+            "max_new_tokens": selected_max_new_tokens,
+            "generated_tokens": generated_tokens,
+            "content_tokens": self._text_token_count(decoder, content),
+            "reasoning_tokens": self._text_token_count(decoder, reasoning),
+            "elapsed_seconds": round(elapsed_seconds, 6),
+            "tokens_per_second": round(generated_tokens / elapsed_seconds, 6) if elapsed_seconds else None,
+            "stop_reason": stop_reason,
+            "tool_call_count": len(tool_calls),
+            **(telemetry_context or {}),
+        }
+        self._write_telemetry(record)
+        return AssistantReply(
+            content=content.strip(),
+            tool_calls=tool_calls,
+            reasoning_content=reasoning,
+            prompt_tokens=prompt_tokens,
+            generated_tokens=generated_tokens,
+            stop_reason=stop_reason,
+            elapsed_seconds=elapsed_seconds,
+        )
 
     def generate(
         self,
@@ -321,5 +397,13 @@ class TransformersModel:
         *,
         max_new_tokens: int | None = None,
         temperature: float | None = None,
+        generation_class: str = "ordinary_response",
+        telemetry_context: dict[str, Any] | None = None,
     ) -> str:
-        return self.chat(messages, max_new_tokens=max_new_tokens, temperature=temperature).content
+        return self.chat(
+            messages,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            generation_class=generation_class,
+            telemetry_context=telemetry_context,
+        ).content

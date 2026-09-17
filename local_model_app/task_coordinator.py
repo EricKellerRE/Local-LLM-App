@@ -6,6 +6,7 @@ from typing import Any, Awaitable, Callable, Protocol
 
 from local_model_app.task_models import (
     CompletionAudit,
+    CriterionAudit,
     ProposedWorkItem,
     TaskDefinition,
     WorkItemOutcome,
@@ -68,99 +69,149 @@ class ModelTaskCoordinator:
 
     @staticmethod
     def _research_work_items() -> list[ProposedWorkItem]:
-        evidence_items = [
+        discovery_items = [
             ProposedWorkItem(
-                key="source-map",
-                kind="tool",
-                title="Map authoritative and primary sources",
+                key="source-discovery",
+                kind="research_discovery",
+                title="Build and expand the source graph",
                 instructions=(
-                    "Search broadly for authoritative reviews and landmark or recent primary studies directly "
-                    "relevant to the goal. Open the strongest sources, record exact URLs, publication details, "
-                    "study systems, and which questions each source can support. Prefer primary literature and "
-                    "authoritative institutional or scholarly sources over summaries."
+                    "Collect the configured seed-source count, read those sources, extract their references, resolve "
+                    "novel relevant references, and repeat breadth-first until the configured depth-pass limit, the "
+                    "source cap, or a pass with no novel relevant references. Persist the source ledger and graph."
                 ),
-                completion_check="A diverse source map with exact URLs and relevance notes is recorded.",
+                completion_check=(
+                    "The configured seed count was read and every citation-expansion pass has persisted counts, "
+                    "exact URLs, parent links, and an objective stop reason."
+                ),
                 priority=20,
             ),
             ProposedWorkItem(
-                key="core-findings",
-                kind="tool",
-                title="Research the core findings and mechanisms",
+                key="source-notes",
+                kind="research_notes",
+                title="Extract reusable evidence from the source corpus",
                 instructions=(
-                    "Research the central claims, mechanisms, or explanations in the goal using primary and "
-                    "authoritative sources. Capture causal versus correlational evidence, relevant timescales and "
-                    "populations or study systems, competing interpretations, and exact URLs; distinguish established "
-                    "findings from inference."
+                    "Read every fetched source once in hardware-bounded batches. Preserve source-specific findings, "
+                    "mechanisms, methods, study systems, evidential strength, limitations, disagreements, and exact URLs "
+                    "as reusable notes for all report sections."
                 ),
-                completion_check="The core findings are supported by traceable source evidence.",
+                completion_check="Every readable source has persisted, source-specific evidence notes with its exact URL.",
                 priority=15,
-                depends_on=["source-map"],
+                depends_on=["source-discovery"],
+            ),
+        ]
+        evidence_dependency = ["source-notes"]
+        section_items = [
+            ProposedWorkItem(
+                key="section-executive",
+                kind="section",
+                title="Executive summary and scope",
+                instructions=(
+                    "Write the opening section of the report. State the central conclusions, define the scope and "
+                    "memory categories covered, explain the evidence-selection method, and preview the cross-scale "
+                    "account. Use connected prose and cite exact source URLs beside material claims. Write 600-900 words."
+                ),
+                completion_check="At least 600 substantive words with conclusions, scope, method, and source URLs.",
+                priority=8,
+                depends_on=evidence_dependency,
             ),
             ProposedWorkItem(
-                key="requested-dimensions",
-                kind="tool",
-                title="Research every requested dimension and comparison",
+                key="section-molecular-cellular",
+                kind="section",
+                title="Molecular and cellular mechanisms",
                 instructions=(
-                    "Extract every distinct dimension, level, stage, population, comparison, or sub-question named "
-                    "in the goal. Research each one and its relationships to the others, preserving exact URLs and "
-                    "the evidence supporting every material distinction."
+                    "Write a detailed report section tracing induction, signaling, transcription, translation, "
+                    "synaptic tagging and capture, structural plasticity, and candidate persistence mechanisms. "
+                    "Distinguish necessity, sufficiency, correlation, timescale, species, and memory system. Explain "
+                    "important disagreements rather than listing molecules. Cite exact source URLs. Write 1,200-1,800 words."
                 ),
-                completion_check="Every explicitly requested dimension and comparison has supporting evidence.",
-                priority=14,
-                depends_on=["source-map"],
+                completion_check="At least 1,200 substantive words with mechanistic explanation and exact source URLs.",
+                priority=7,
+                depends_on=evidence_dependency,
             ),
             ProposedWorkItem(
-                key="boundary-conditions",
-                kind="tool",
-                title="Establish scope, chronology, and boundary conditions",
+                key="section-circuit-systems",
+                kind="section",
+                title="Circuit and systems mechanisms",
                 instructions=(
-                    "Research the scope, chronology, definitions, prerequisites, and boundary conditions relevant to "
-                    "the goal. Clearly distinguish stages or categories requested by the user and record where results "
-                    "do or do not generalize, with exact source URLs."
+                    "Write a detailed report section on engram allocation and reactivation, hippocampal and cortical "
+                    "interactions, replay, sleep and oscillations, systems consolidation theories, remote memory, and "
+                    "precision or generalization. Connect circuit findings to molecular mechanisms and distinguish "
+                    "causal from observational evidence. Cite exact source URLs. Write 1,000-1,600 words."
                 ),
-                completion_check="Scope, chronology, definitions, and boundary conditions are evidenced and distinct.",
-                priority=13,
-                depends_on=["source-map"],
+                completion_check="At least 1,000 substantive words covering circuit and systems mechanisms with URLs.",
+                priority=7,
+                depends_on=evidence_dependency,
             ),
             ProposedWorkItem(
-                key="methods-evidence",
-                kind="tool",
-                title="Compare techniques and strength of evidence",
+                key="section-memory-phases",
+                kind="section",
+                title="Formation consolidation reconsolidation and maintenance",
                 instructions=(
-                    "Research the major experimental, analytical, or investigative techniques used to establish the "
-                    "findings in the goal. Compare what each technique can and cannot establish, important confounds "
-                    "and generalization limits, and representative primary evidence with exact URLs."
+                    "Write a detailed chronological section that distinguishes acquisition, early and late "
+                    "consolidation, systems consolidation, retrieval, destabilization and reconsolidation, persistence, "
+                    "maintenance, updating, extinction, and forgetting. State boundary conditions and timescales and "
+                    "explain where terminology or evidence remains contested. Cite exact URLs. Write 1,000-1,600 words."
                 ),
-                completion_check="Techniques are compared by causal reach, limitations, and representative evidence.",
-                priority=12,
-                depends_on=["source-map"],
+                completion_check="At least 1,000 substantive words clearly distinguishing every requested phase with URLs.",
+                priority=7,
+                depends_on=evidence_dependency,
             ),
             ProposedWorkItem(
-                key="disagreements-gaps",
-                kind="tool",
-                title="Identify disagreements, limitations, and open gaps",
+                key="section-methods",
+                kind="section",
+                title="Techniques and strength of evidence",
                 instructions=(
-                    "Search specifically for unresolved controversies, failed replications or boundary conditions, "
-                    "methodological limitations, missing cross-scale explanations, and current research gaps. Record "
-                    "which conclusions are source evidence versus synthesis and preserve exact URLs."
+                    "Write a comparative section covering behavioral paradigms, lesions and pharmacology, "
+                    "electrophysiology, imaging, optogenetics and chemogenetics, activity tagging, molecular profiling, "
+                    "and human translation. Explain what each technique can establish, its resolution, confounds, and "
+                    "generalization limits. Include a compact comparison table where useful and exact URLs. Write 900-1,400 words."
                 ),
-                completion_check="Material disagreements, limitations, and open questions are documented with sources.",
-                priority=11,
-                depends_on=["source-map"],
+                completion_check="At least 900 substantive words comparing methods, causal reach, limitations, and URLs.",
+                priority=6,
+                depends_on=evidence_dependency,
+            ),
+            ProposedWorkItem(
+                key="section-disagreements-gaps",
+                kind="section",
+                title="Disagreements limitations and open research gaps",
+                instructions=(
+                    "Write a critical section on competing theories, replication and translation problems, measurement "
+                    "limits, unresolved cross-scale links, and high-value open questions. Identify what evidence would "
+                    "discriminate between alternatives. Separate sourced findings from synthesis and cite exact URLs. "
+                    "Write 900-1,400 words."
+                ),
+                completion_check="At least 900 substantive words naming concrete disagreements, limitations, gaps, and URLs.",
+                priority=6,
+                depends_on=evidence_dependency,
+            ),
+            ProposedWorkItem(
+                key="section-conclusions",
+                kind="section",
+                title="Integrated conclusions and research agenda",
+                instructions=(
+                    "Write the concluding section. Integrate molecular, cellular, circuit, and systems explanations; "
+                    "state the strongest supported conclusions and their limits; identify useful experimental designs "
+                    "for closing the major gaps; and avoid merely repeating the executive summary. Cite exact URLs for "
+                    "claims that depend on particular studies. Write 700-1,100 words."
+                ),
+                completion_check="At least 700 substantive words with integrated conclusions, limitations, next steps, and URLs.",
+                priority=5,
+                depends_on=evidence_dependency,
             ),
         ]
         return [
-            *evidence_items,
+            *discovery_items,
+            *section_items,
             ProposedWorkItem(
                 key="synthesis",
                 kind="synthesis",
-                title="Write the complete research report",
+                title="Assemble and export the complete research document",
                 instructions=(
-                    "Synthesize all recorded evidence into the requested standalone report, with conclusions, "
-                    "techniques, disagreements, limitations, gaps, and exact inline source URLs."
+                    "Assemble every completed report section without compressing it, preserve exact inline source "
+                    "URLs, append a deduplicated source URL index, and export a readable Word document."
                 ),
-                completion_check="A complete, traceable report addresses every success criterion.",
-                depends_on=[item.key for item in evidence_items if item.key],
+                completion_check="A traceable report of at least 6,000 words exists as a downloadable DOCX artifact.",
+                depends_on=[item.key for item in section_items if item.key],
             ),
         ]
 
@@ -276,15 +327,80 @@ class ModelTaskCoordinator:
         task: dict[str, Any],
         work_items: list[dict[str, Any]],
     ) -> CompletionAudit:
-        evidence = [
-            {
+        metadata = task["definition"].get("metadata") or {}
+        if metadata.get("plugin_ids") == ["local.web-research"]:
+            by_kind: dict[str, list[dict[str, Any]]] = {}
+            for work_item in work_items:
+                by_kind.setdefault(str(work_item.get("kind")), []).append(work_item)
+            discovery = by_kind.get("research_discovery", [])
+            notes = by_kind.get("research_notes", [])
+            sections = by_kind.get("section", [])
+            synthesis = by_kind.get("synthesis", [])
+            synthesis_outcome = synthesis[-1].get("result") or {} if synthesis else {}
+            evidence = synthesis_outcome.get("completion_evidence", []) if isinstance(synthesis_outcome, dict) else []
+
+            def metric(name: str) -> int:
+                prefix = f"{name}="
+                for value in evidence:
+                    if str(value).startswith(prefix):
+                        try:
+                            return int(str(value)[len(prefix):])
+                        except ValueError:
+                            return 0
+                return 0
+
+            artifacts = synthesis_outcome.get("artifacts", []) if isinstance(synthesis_outcome, dict) else []
+            required_words = int(metadata.get("report_min_words") or 6000)
+            required_sources = int(metadata.get("report_min_sources") or 12)
+            checks = {
+                "citation graph": bool(discovery and discovery[-1].get("status") == "completed"),
+                "source notes": bool(notes and notes[-1].get("status") == "completed"),
+                "report sections": len(sections) == 7 and all(item.get("status") == "completed" for item in sections),
+                "word count": metric("word_count") >= required_words,
+                "source count": metric("source_url_count") >= required_sources,
+                "Word document": any(
+                    str(artifact.get("media_type")) ==
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    for artifact in artifacts
+                ),
+            }
+            passed = all(checks.values())
+            detail = ", ".join(f"{name}={'passed' if value else 'failed'}" for name, value in checks.items())
+            return CompletionAudit(
+                passed=passed,
+                summary=("Research task passed host-enforced completion checks. " if passed else
+                         "Research task did not pass host-enforced completion checks. ") + detail,
+                criteria=[
+                    CriterionAudit(
+                        criterion=criterion,
+                        satisfied=passed,
+                        evidence=(
+                            f"Host-enforced research checks: {detail}; words={metric('word_count')}; "
+                            f"sources={metric('source_url_count')}."
+                        ),
+                    )
+                    for criterion in task["definition"]["success_criteria"]
+                ],
+            )
+
+        evidence = []
+        for item in work_items[-40:]:
+            outcome = item.get("result") or {}
+            result = outcome.get("result") if isinstance(outcome, dict) else outcome
+            result_text = str(result or "")
+            evidence.append({
+                "key": item.get("key"),
+                "kind": item.get("kind"),
                 "title": item["title"],
                 "status": item["status"],
-                "result": item.get("result"),
-            }
-            for item in work_items[-40:]
-        ]
-        durable_tools = (task["definition"].get("metadata") or {}).get("mode") == "durable_tools"
+                "summary": outcome.get("summary") if isinstance(outcome, dict) else "",
+                "word_count": len(re.findall(r"\b[\w'-]+\b", result_text)),
+                "source_url_count": len(set(re.findall(r"https?://[^\s<>)\]}]+", result_text))),
+                "completion_evidence": outcome.get("completion_evidence", []) if isinstance(outcome, dict) else [],
+                "artifacts": outcome.get("artifacts", []) if isinstance(outcome, dict) else [],
+                "result_preview": result_text[:1200],
+            })
+        durable_tools = metadata.get("mode") == "durable_tools"
         prompt = (
             "Audit a durable task against every success criterion using only recorded evidence. Be conservative. "
             "A plan or assertion is not evidence that external work occurred. Return only JSON with: passed, summary, "
@@ -295,6 +411,8 @@ class ModelTaskCoordinator:
                 "follow-up is created, also create a new kind 'synthesis' item depending on every new follow-up key. "
                 "Do not pass an optimization without baseline/final metric evidence, and do not pass research without "
                 "source URLs, conclusions, techniques, and explicit gaps or limitations."
+                " For document-backed research, do not pass unless the recorded synthesis has a DOCX artifact and "
+                "its completion evidence meets the configured minimum word count."
                 if durable_tools else ""
             )
         )

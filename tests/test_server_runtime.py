@@ -18,6 +18,7 @@ class RuntimePluginRequestTests(unittest.TestCase):
                 tool_action_max_new_tokens=1024,
                 tool_temperature=0.0,
                 temperature=0.7,
+                section_max_new_tokens=3072,
             )
 
             def generate(self, messages, **kwargs):
@@ -31,10 +32,24 @@ class RuntimePluginRequestTests(unittest.TestCase):
         runtime.ensure_loaded = AsyncMock()
 
         asyncio.run(runtime.task_generate([{"role": "user", "content": "plan"}]))
+        asyncio.run(runtime.task_write_section([{"role": "user", "content": "section"}]))
         asyncio.run(runtime.task_synthesize([{"role": "user", "content": "report"}]))
 
-        self.assertEqual(calls[0], {"max_new_tokens": 1024, "temperature": 0.0})
-        self.assertEqual(calls[1], {"max_new_tokens": 8192, "temperature": 0.7})
+        self.assertEqual(calls[0], {
+            "max_new_tokens": 1024,
+            "temperature": 0.0,
+            "generation_class": "task_planning",
+        })
+        self.assertEqual(calls[1], {
+            "max_new_tokens": 3072,
+            "temperature": 0.7,
+            "generation_class": "report_section",
+        })
+        self.assertEqual(calls[2], {
+            "max_new_tokens": 8192,
+            "temperature": 0.7,
+            "generation_class": "final_synthesis",
+        })
 
     def test_specific_mcp_name_is_detected_in_chat_request(self) -> None:
         runtime = Runtime.__new__(Runtime)
@@ -62,6 +77,8 @@ class RuntimePluginRequestTests(unittest.TestCase):
             SettingsUpdateRequest(**common, context_window=512, max_new_tokens=512)
         with self.assertRaisesRegex(ValidationError, "cannot exceed the response budget"):
             SettingsUpdateRequest(**common, max_new_tokens=512, reasoning_budget=513)
+        with self.assertRaisesRegex(ValidationError, "source cap"):
+            SettingsUpdateRequest(**common, research_seed_sources=20, research_max_sources=10)
 
     def test_research_and_project_optimization_are_durable_requests(self) -> None:
         self.assertTrue(Runtime._durable_request("Research the literature and write a report", False))
