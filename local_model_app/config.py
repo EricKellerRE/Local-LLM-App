@@ -67,14 +67,14 @@ class Settings:
             top_p=float(os.getenv("LOCAL_MODEL_TOP_P", "0.9")),
             task_planner_max_new_tokens=int(os.getenv("LOCAL_TASK_PLANNER_MAX_NEW_TOKENS", "1024")),
             planner_max_new_tokens=int(os.getenv("LOCAL_PLANNER_MAX_NEW_TOKENS", "192")),
-            tool_action_max_new_tokens=int(os.getenv("LOCAL_TOOL_ACTION_MAX_NEW_TOKENS", "1024")),
+            tool_action_max_new_tokens=int(os.getenv("LOCAL_TOOL_ACTION_MAX_NEW_TOKENS", "192")),
             post_tool_decision_max_new_tokens=int(
-                os.getenv("LOCAL_POST_TOOL_DECISION_MAX_NEW_TOKENS", str(response_budget))
+                os.getenv("LOCAL_POST_TOOL_DECISION_MAX_NEW_TOKENS", "256")
             ),
-            section_max_new_tokens=int(os.getenv("LOCAL_SECTION_MAX_NEW_TOKENS", "3072")),
+            section_max_new_tokens=int(os.getenv("LOCAL_SECTION_MAX_NEW_TOKENS", "768")),
             synthesis_max_new_tokens=int(os.getenv("LOCAL_SYNTHESIS_MAX_NEW_TOKENS", str(response_budget))),
-            research_classifier_max_new_tokens=int(os.getenv("LOCAL_RESEARCH_CLASSIFIER_MAX_NEW_TOKENS", "512")),
-            research_notes_max_new_tokens=int(os.getenv("LOCAL_RESEARCH_NOTES_MAX_NEW_TOKENS", "1536")),
+            research_classifier_max_new_tokens=int(os.getenv("LOCAL_RESEARCH_CLASSIFIER_MAX_NEW_TOKENS", "256")),
+            research_notes_max_new_tokens=int(os.getenv("LOCAL_RESEARCH_NOTES_MAX_NEW_TOKENS", "768")),
             research_seed_sources=int(os.getenv("LOCAL_RESEARCH_SEED_SOURCES", "12")),
             research_depth_passes=int(os.getenv("LOCAL_RESEARCH_DEPTH_PASSES", "3")),
             research_max_sources=int(os.getenv("LOCAL_RESEARCH_MAX_SOURCES", "80")),

@@ -171,6 +171,50 @@ class ToolCoordinatorTests(unittest.TestCase):
         self.assertEqual(model.chat_calls[1]["generation_class"], "post_tool_decision")
         self.assertEqual(model.chat_calls[1]["telemetry_context"]["work_item_id"], "item-1")
 
+    def test_chunked_fetch_continues_deterministically_without_model_url_rewrite(self) -> None:
+        url = (
+            "https://example.org/paper?comparison=early-versus-late&"
+            "source=exact-long-url"
+        )
+        fetch = make_tool("fetch_url", required=["url"])
+        model = FakeModel([
+            AssistantReply(content="", tool_calls=[{
+                "id": "call_1", "type": "function",
+                "function": {"name": fetch.exposed_name, "arguments": {"url": url}},
+            }]),
+            AssistantReply(content="Source fully read.", tool_calls=[]),
+        ])
+        manager = FakeManager([fetch], {fetch.exposed_name: {
+            "isError": False,
+            "structuredContent": {"url": url, "content": "chunk", "next_start": 30000, "complete": False},
+        }})
+        # The deterministic continuation sees a terminal result on the second call.
+        calls = 0
+
+        async def call_tool(exposed_name, arguments, **kwargs):
+            nonlocal calls
+            calls += 1
+            manager.calls.append((exposed_name, arguments))
+            if calls == 1:
+                return {"isError": False, "structuredContent": {
+                    "url": url, "content": "first", "next_start": 30000, "complete": False,
+                }}
+            return {"isError": False, "structuredContent": {
+                "url": url, "content": "second", "next_start": None, "complete": True,
+            }}
+
+        manager.call_tool = call_tool
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            coordinator = ToolCoordinator(
+                model, manager, Scratchpad(root / "scratchpad.jsonl"), root / "activity.jsonl",
+            )
+            answer = asyncio.run(coordinator.respond("Read the complete source", [], ["grid.plugin"]))
+
+        self.assertEqual(answer, "Source fully read.")
+        self.assertEqual(manager.calls[1], (fetch.exposed_name, {"url": url, "start_index": 30000}))
+        self.assertEqual(len(model.chat_calls), 2)
+
     def test_tool_checkpoint_interval_compacts_and_continues(self) -> None:
         tool = make_tool("lookup", required=["query"])
         model = FakeModel([

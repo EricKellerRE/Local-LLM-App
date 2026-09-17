@@ -87,12 +87,12 @@ class AppSettingsStore:
             "reasoning_budget": None,
             "task_planner_max_new_tokens": 1024,
             "work_item_planner_max_new_tokens": 192,
-            "tool_action_max_new_tokens": 1024,
-            "post_tool_decision_max_new_tokens": 8192,
-            "section_max_new_tokens": 3072,
+            "tool_action_max_new_tokens": 192,
+            "post_tool_decision_max_new_tokens": 256,
+            "section_max_new_tokens": 768,
             "synthesis_max_new_tokens": 8192,
-            "research_classifier_max_new_tokens": 512,
-            "research_notes_max_new_tokens": 1536,
+            "research_classifier_max_new_tokens": 256,
+            "research_notes_max_new_tokens": 768,
             "research_seed_sources": 12,
             "research_depth_passes": 3,
             "research_max_sources": 80,
@@ -112,7 +112,7 @@ class AppSettingsStore:
         result["context_window"] = int(result["context_window"]) if str(result["context_window"] or "") else None
         result["max_new_tokens"] = int(result["max_new_tokens"])
         result["reasoning_budget"] = int(result["reasoning_budget"]) if str(result["reasoning_budget"] or "") else None
-        for key in ("post_tool_decision_max_new_tokens", "synthesis_max_new_tokens"):
+        for key in ("synthesis_max_new_tokens",):
             env_key = MODEL_ENV_KEYS[key]
             if not str(values.get(env_key) or "").strip():
                 result[key] = result["max_new_tokens"]

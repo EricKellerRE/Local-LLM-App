@@ -23,7 +23,7 @@ from local_model_app.config import Settings, _load_dotenv
 from local_model_app.coordinator import Coordinator
 from local_model_app.durable_tools import DurableSectionExecutor, DurableSynthesisExecutor, DurableToolExecutor
 from local_model_app.model import TransformersModel
-from local_model_app.research_pipeline import ResearchDiscoveryExecutor, ResearchNotesExecutor
+from local_model_app.research_pipeline import CandidateSelection, ResearchDiscoveryExecutor, ResearchNotesExecutor
 from local_model_app.huggingface_service import HuggingFaceService
 from local_model_app.mcp_manager import McpPluginManager
 from local_model_app.mcp_plugins import McpPluginRegistry, PluginConfigurationError
@@ -114,12 +114,12 @@ class SettingsUpdateRequest(BaseModel):
     reasoning_budget: int | None = Field(default=None, ge=0, le=262_144)
     task_planner_max_new_tokens: int = Field(default=1024, ge=1, le=262_144)
     work_item_planner_max_new_tokens: int = Field(default=192, ge=1, le=262_144)
-    tool_action_max_new_tokens: int = Field(default=1024, ge=1, le=262_144)
-    post_tool_decision_max_new_tokens: int = Field(default=8192, ge=1, le=262_144)
-    section_max_new_tokens: int = Field(default=3072, ge=1, le=262_144)
+    tool_action_max_new_tokens: int = Field(default=192, ge=1, le=262_144)
+    post_tool_decision_max_new_tokens: int = Field(default=256, ge=1, le=262_144)
+    section_max_new_tokens: int = Field(default=768, ge=1, le=262_144)
     synthesis_max_new_tokens: int = Field(default=8192, ge=1, le=262_144)
-    research_classifier_max_new_tokens: int = Field(default=512, ge=1, le=262_144)
-    research_notes_max_new_tokens: int = Field(default=1536, ge=1, le=262_144)
+    research_classifier_max_new_tokens: int = Field(default=256, ge=1, le=262_144)
+    research_notes_max_new_tokens: int = Field(default=768, ge=1, le=262_144)
     research_seed_sources: int = Field(default=12, ge=1, le=100)
     research_depth_passes: int = Field(default=3, ge=0, le=10)
     research_max_sources: int = Field(default=80, ge=1, le=1000)
@@ -209,7 +209,7 @@ class Runtime:
                     self.classify_references,
                 ),
                 "research_notes": ResearchNotesExecutor(self.task_analyze_sources, self.paths.data_directory),
-                "section": DurableSectionExecutor(self.task_write_section),
+                "section": DurableSectionExecutor(self.task_write_section, self.paths.data_directory),
                 "synthesis": DurableSynthesisExecutor(self.task_synthesize, self.paths.data_directory),
             },
             on_status=self.deliver_task_status,
@@ -310,13 +310,13 @@ class Runtime:
             return await asyncio.to_thread(
                 self.model.generate,
                 messages,
-                max_new_tokens=int(getattr(self.model.settings, "section_max_new_tokens", 3072)),
+                max_new_tokens=int(getattr(self.model.settings, "section_max_new_tokens", 768)),
                 temperature=self.model.settings.temperature,
                 generation_class="report_section",
             )
 
     @tracked_activity("research sources are being filtered")
-    async def classify_references(self, goal: str, candidates: list[dict[str, str]]) -> set[str]:
+    async def classify_references(self, goal: str, candidates: list[dict[str, Any]]) -> CandidateSelection:
         async with self._inference_lock:
             await self.ensure_loaded()
             response = await asyncio.to_thread(
@@ -325,14 +325,17 @@ class Runtime:
                     {"role": "system", "content": (
                         "Select citation candidates that are substantively relevant to the research goal. Favor "
                         "primary studies and authoritative reviews; reject navigation, author profiles, unrelated "
-                        "citations, and duplicate editions. Return only JSON: {\"relevant_ids\": [string]}."
+                        "citations, and duplicate editions. Use needs_abstract_numbers only when the title and supplied "
+                        "snippet/citation context are genuinely insufficient. When an abstract field is present, make "
+                        "a final keep/reject decision instead. Return only list numbers, never URLs or titles. Return "
+                        "only JSON: {\"keep_numbers\": [integer], \"needs_abstract_numbers\": [integer]}."
                     )},
                     {"role": "user", "content": json.dumps({
                         "goal": goal,
                         "candidates": candidates,
                     }, ensure_ascii=False)},
                 ],
-                max_new_tokens=int(getattr(self.model.settings, "research_classifier_max_new_tokens", 512)),
+                max_new_tokens=int(getattr(self.model.settings, "research_classifier_max_new_tokens", 256)),
                 temperature=0,
                 generation_class="research_relevance",
             )
@@ -341,8 +344,16 @@ class Runtime:
             if cleaned.startswith("```"):
                 cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
             payload = json.loads(cleaned[cleaned.find("{"):cleaned.rfind("}") + 1])
-            allowed = {candidate["id"] for candidate in candidates}
-            return {str(value) for value in payload.get("relevant_ids", []) if str(value) in allowed}
+            allowed = {int(candidate["number"]) for candidate in candidates}
+            kept = {
+                int(value) for value in payload.get("keep_numbers", [])
+                if isinstance(value, int) and value in allowed
+            }
+            ambiguous = {
+                int(value) for value in payload.get("needs_abstract_numbers", [])
+                if isinstance(value, int) and value in allowed and value not in kept
+            }
+            return CandidateSelection(keep_numbers=kept, needs_abstract_numbers=ambiguous)
         except (ValueError, TypeError, json.JSONDecodeError):
             raise ValueError("The relevance classifier did not return valid candidate IDs.")
 
@@ -353,7 +364,7 @@ class Runtime:
             return await asyncio.to_thread(
                 self.model.generate,
                 messages,
-                max_new_tokens=int(getattr(self.model.settings, "research_notes_max_new_tokens", 1536)),
+                max_new_tokens=int(getattr(self.model.settings, "research_notes_max_new_tokens", 768)),
                 temperature=self.model.settings.tool_temperature,
                 generation_class="research_notes",
             )
@@ -446,6 +457,7 @@ class Runtime:
                 "research_max_sources": settings.research_max_sources if is_research else None,
                 "research_references_per_source": settings.research_references_per_source if is_research else None,
                 "research_notes_batch_size": settings.research_notes_batch_size if is_research else None,
+                "section_max_segments": 6 if is_research else None,
             },
         })
         task = self.tasks.create_task(content, definition)

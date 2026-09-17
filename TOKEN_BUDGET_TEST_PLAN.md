@@ -158,6 +158,20 @@ Use explicit expected fields and source URLs for deterministic checks. A separat
 
 Keep the raw benchmark results and selected thresholds in a versioned JSON or CSV artifact. Record rejected budgets and their failure modes so later model or hardware changes can rerun the same procedure instead of relying on the thresholds indefinitely.
 
+### 2026-09-17 Gemma 4 12B checkpoint
+
+The first local boundary run used one deterministic repetition per tested value. It is sufficient to choose deliberately conservative defaults, but it is not a substitute for the three-repeat confirmation required before declaring a model/hardware profile final.
+
+- Exact long-URL tool selection passed at 1,024, 384, 192, and 128 tokens. Adopt 192 rather than the observed 128-token floor.
+- Numbered source relevance passed at 512, 256, 192, and 128 tokens. Adopt 256 because the production selector also supports a staged `needs_abstract_numbers` path and richer metadata.
+- Source-specific evidence notes passed at 1,536, 768, and 512 tokens. Adopt 768 rather than the observed 512-token floor.
+- A completed-tool evidence summary passed at 2,048, 768, 384, and 256 tokens. Adopt 256.
+- A bounded 300–450 word report segment passed at 1,024, 768, and 512 tokens. Adopt 768 and checkpoint multiple segments durably to reach the section's total target.
+- A monolithic report-section request failed at a 3,072-token ceiling by ending naturally after 461 words. More ceiling did not make the model use it, so section writing now accumulates bounded, nonredundant segments instead of relying on one long generation.
+- Raw-model continuation of a chunked URL failed even with a 2,048-token ceiling because the model rewrote punctuation inside the URL. Chunk continuation is now host-controlled using the exact prior URL and `next_start`; token tuning is no longer expected to solve identifier integrity.
+
+The measured wall times changed little when ceilings were reduced because the model usually stopped naturally below them. The main efficiency improvement therefore comes from smaller task shapes, host-owned navigation, numbered selection, durable checkpoints, and eliminating unnecessary model turns—not merely lowering token ceilings. The machine-readable record is in `evals/token-budget-decisions.json`; ignored raw run output remains under `data/benchmarks/` on the test machine.
+
 ## Developer tab
 
 Add a clearly labeled **Developer** tab inside Settings for diagnostics, tuning, and model customization that ordinary users should not need during normal operation. Keep broadly useful controls such as model selection, context size, overall response length, and reasoning budget in the normal model settings; do not hide them behind Developer mode.

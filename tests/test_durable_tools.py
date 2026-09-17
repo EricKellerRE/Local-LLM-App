@@ -76,6 +76,42 @@ class DurableToolExecutorTests(unittest.TestCase):
         self.assertEqual(outcome.outcome, "retry")
         self.assertIn("did not meet", outcome.summary)
 
+    def test_section_executor_accumulates_checkpointed_segments_until_minimum(self) -> None:
+        calls = []
+
+        async def generate(messages):
+            calls.append(messages)
+            marker = "first" if len(calls) == 1 else "second"
+            return " ".join([f"{marker} causal mechanism limitation https://example.com/{marker}"] * 50)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            executor = DurableSectionExecutor(generate, Path(temporary))
+            task = {"id": "task-1", "definition": {"goal": "Research memory", "metadata": {}}}
+            item = {
+                "id": "item-1",
+                "key": "section-test",
+                "title": "Mechanisms",
+                "instructions": "Explain the mechanisms.",
+                "completion_check": "At least 600 substantive words with exact source URLs.",
+                "depends_on": ["evidence"],
+                "attempts": 1,
+            }
+            completed = [{
+                "key": "evidence",
+                "title": "Evidence",
+                "result": {"result": "Finding https://example.com/source", "completion_evidence": []},
+            }]
+
+            first = asyncio.run(executor.execute_work_item(task, item, completed))
+            item["attempts"] = 2
+            second = asyncio.run(executor.execute_work_item(task, item, completed))
+
+        self.assertEqual(first.outcome, "retry")
+        self.assertEqual(second.outcome, "completed")
+        self.assertIn("first causal", second.result)
+        self.assertIn("second causal", second.result)
+        self.assertEqual(len(calls), 2)
+
     def test_research_synthesis_exports_a_docx_artifact_without_recompressing_sections(self) -> None:
         async def unused_generate(messages):
             raise AssertionError("Research assembly should not invoke the model again")

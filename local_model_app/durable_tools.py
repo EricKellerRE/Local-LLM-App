@@ -149,8 +149,34 @@ class DurableToolExecutor:
 class DurableSectionExecutor:
     """Draft one substantial report section from the relevant persisted evidence."""
 
-    def __init__(self, generate: AsyncGenerator) -> None:
+    def __init__(self, generate: AsyncGenerator, data_directory: Path | None = None) -> None:
         self.generate = generate
+        self.data_directory = data_directory
+
+    def _checkpoint_path(self, task: dict[str, Any], item: dict[str, Any]) -> Path | None:
+        if self.data_directory is None:
+            return None
+        safe_key = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(item.get("key") or item.get("id") or "section"))
+        return self.data_directory / "research" / str(task["id"]) / "sections" / f"{safe_key}.json"
+
+    @staticmethod
+    def _read_segments(path: Path | None) -> list[str]:
+        if path is None:
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return []
+        return [str(value) for value in payload.get("segments", []) if str(value).strip()]
+
+    @staticmethod
+    def _save_segments(path: Path | None, segments: list[str]) -> None:
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({"segments": segments}, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
 
     async def execute_work_item(
         self,
@@ -170,34 +196,59 @@ class DurableSectionExecutor:
                 "result": outcome.get("result") if isinstance(outcome, dict) else outcome,
                 "completion_evidence": outcome.get("completion_evidence", []) if isinstance(outcome, dict) else [],
             })
-        system = (
-            "Write exactly one substantive section of a longer research report from the recorded evidence. Use "
-            "connected explanatory prose, not a compressed checklist. Preserve mechanisms, conditions, timescales, "
-            "study systems, disagreements, and evidential limitations. Put exact source URLs beside the claims they "
-            "support. Do not invent evidence, do not write the entire report, and do not add a top-level document title."
-        )
-        section = await self.generate([
+        minimum_match = MINIMUM_WORDS_PATTERN.search(item.get("completion_check") or "")
+        minimum_words = int(minimum_match.group(1).replace(",", "")) if minimum_match else 0
+        checkpoint_path = self._checkpoint_path(task, item)
+        segments = self._read_segments(checkpoint_path)
+        existing = "\n\n".join(segments)
+        remaining_words = max(0, minimum_words - report_word_count(existing))
+        if segments:
+            system = (
+                "Continue one existing research-report section using only the recorded evidence. Write a new, "
+                "non-redundant continuation only: do not repeat the title, opening, prior paragraphs, or source list. "
+                "Develop underexplained mechanisms, boundary conditions, causal strength, disagreements, and "
+                "limitations. Preserve exact source URLs beside new claims and do not invent evidence."
+            )
+        else:
+            system = (
+                "Write exactly one substantive section of a longer research report from the recorded evidence. Use "
+                "connected explanatory prose, not a compressed checklist. Preserve mechanisms, conditions, timescales, "
+                "study systems, disagreements, and evidential limitations. Put exact source URLs beside the claims they "
+                "support. Do not invent evidence, do not write the entire report, and do not add a top-level document title."
+            )
+        segment = await self.generate([
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps({
                 "task_goal": task["definition"]["goal"],
                 "section_title": item["title"],
                 "section_instructions": item["instructions"],
                 "completion_check": item["completion_check"],
+                "minimum_additional_words": min(max(remaining_words, 300), 700),
+                "existing_draft": existing,
                 "recorded_evidence": evidence,
             }, ensure_ascii=False)},
         ])
-        minimum_match = MINIMUM_WORDS_PATTERN.search(item.get("completion_check") or "")
-        minimum_words = int(minimum_match.group(1).replace(",", "")) if minimum_match else 0
+        if segment.strip():
+            segments.append(segment.strip())
+            self._save_segments(checkpoint_path, segments)
+        section = "\n\n".join(segments)
         words = report_word_count(section)
         urls = unique_urls(section)
         if words < minimum_words or not urls:
             reason = (
-                f"Section draft did not meet its acceptance check: {words} words and {len(urls)} source URLs; "
-                f"required at least {minimum_words} words and traceable URLs."
+                f"Section checkpoint did not meet its acceptance check yet: {words} words across "
+                f"{len(segments)} bounded segment(s) and {len(urls)} "
+                f"source URLs; continuing toward at least {minimum_words} words with traceable URLs."
             )
-            if int(item.get("attempts") or 1) < 2:
+            max_segments = int((task["definition"].get("metadata") or {}).get("section_max_segments") or 6)
+            if len(segments) < max_segments:
                 return WorkItemOutcome(outcome="retry", summary=reason, wait_seconds=1)
-            return WorkItemOutcome(outcome="failed", summary=reason, result=section, completion_evidence=urls)
+            return WorkItemOutcome(
+                outcome="failed",
+                summary=f"{reason} The configured {max_segments}-segment limit was reached.",
+                result=section,
+                completion_evidence=urls,
+            )
         return WorkItemOutcome(
             outcome="completed",
             summary=f"Drafted {item['title']} ({words:,} words; {len(urls)} source URLs).",

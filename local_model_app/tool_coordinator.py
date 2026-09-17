@@ -182,6 +182,16 @@ class ToolCoordinator:
         tools: list[DiscoveredTool],
         user_message: str,
     ) -> tuple[DiscoveredTool, dict[str, Any]] | None:
+        # Chunked web reads advertise an exact cursor. Continuing this operation is
+        # protocol mechanics, not a reasoning decision; preserve the original URL
+        # byte-for-byte instead of asking the model to reproduce it.
+        next_start = data.get("next_start")
+        source_url = data.get("url")
+        if data.get("complete") is False and isinstance(source_url, str) and source_url and isinstance(next_start, int):
+            fetch_tool = next((tool for tool in tools if tool.native_name.endswith("fetch_url")), None)
+            if fetch_tool:
+                return fetch_tool, {"url": source_url, "start_index": next_start}
+
         next_name = data.get("next_tool")
         if isinstance(next_name, str):
             tool = self._by_native_name(tools, next_name)

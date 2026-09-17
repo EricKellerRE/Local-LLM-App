@@ -75,9 +75,11 @@ class ModelTaskCoordinator:
                 kind="research_discovery",
                 title="Build and expand the source graph",
                 instructions=(
-                    "Collect the configured seed-source count, read those sources, extract their references, resolve "
-                    "novel relevant references, and repeat breadth-first until the configured depth-pass limit, the "
-                    "source cap, or a pass with no novel relevant references. Persist the source ledger and graph."
+                    "Search paginated result lists and have the model select relevant item numbers only; the host must "
+                    "map those numbers to untouched URLs, deduplicate them, and persist the configured seed-source set. "
+                    "Then read those sources, extract and number their references, resolve selected novel references, "
+                    "and repeat breadth-first until the configured depth-pass limit, source cap, or a pass with no "
+                    "novel relevant references. Persist every search-page decision, URL, parent edge, and stop reason."
                 ),
                 completion_check=(
                     "The configured seed count was read and every citation-expansion pass has persisted counts, "

@@ -274,12 +274,12 @@ function selectSettingsTab(name) {
 function resetTuningFields() {
   el("task-planner-tokens").value = 1024;
   el("work-item-planner-tokens").value = 192;
-  el("tool-action-tokens").value = 1024;
-  el("post-tool-tokens").value = el("max-tokens").value || 8192;
-  el("section-tokens").value = 3072;
+  el("tool-action-tokens").value = 192;
+  el("post-tool-tokens").value = 256;
+  el("section-tokens").value = 768;
   el("synthesis-tokens").value = el("max-tokens").value || 8192;
-  el("research-classifier-tokens").value = 512;
-  el("research-notes-tokens").value = 1536;
+  el("research-classifier-tokens").value = 256;
+  el("research-notes-tokens").value = 768;
   el("research-seed-sources").value = 12;
   el("research-depth-passes").value = 3;
   el("research-max-sources").value = 80;

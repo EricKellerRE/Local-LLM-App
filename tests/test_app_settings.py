@@ -15,8 +15,9 @@ class AppSettingsStoreTests(unittest.TestCase):
             self.assertEqual(paths.data_directory, (root / "data").resolve())
             self.assertEqual(paths.models_directory, (root / "models").resolve())
             self.assertEqual(store.public_settings()["max_new_tokens"], 8192)
-            self.assertEqual(store.public_settings()["post_tool_decision_max_new_tokens"], 8192)
-            self.assertEqual(store.public_settings()["section_max_new_tokens"], 3072)
+            self.assertEqual(store.public_settings()["tool_action_max_new_tokens"], 192)
+            self.assertEqual(store.public_settings()["post_tool_decision_max_new_tokens"], 256)
+            self.assertEqual(store.public_settings()["section_max_new_tokens"], 768)
             self.assertEqual(store.public_settings()["synthesis_max_new_tokens"], 8192)
             self.assertEqual(store.public_settings()["max_tool_calls_per_step"], 256)
             self.assertEqual(store.public_settings()["research_seed_sources"], 12)
@@ -84,14 +85,14 @@ class AppSettingsStoreTests(unittest.TestCase):
             self.assertIsNone(settings["context_window"])
             self.assertIsNone(settings["reasoning_budget"])
 
-    def test_intermediate_and_synthesis_defaults_follow_response_budget(self) -> None:
+    def test_only_synthesis_default_follows_response_budget(self) -> None:
         with TemporaryDirectory(dir=Path.cwd()) as directory:
             root = Path(directory)
             (root / ".env").write_text("LOCAL_MODEL_MAX_NEW_TOKENS=4096\n", encoding="utf-8")
 
             settings = AppSettingsStore(root).public_settings()
 
-            self.assertEqual(settings["post_tool_decision_max_new_tokens"], 4096)
+            self.assertEqual(settings["post_tool_decision_max_new_tokens"], 256)
             self.assertEqual(settings["synthesis_max_new_tokens"], 4096)
 
 

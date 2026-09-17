@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
@@ -11,7 +12,13 @@ from local_model_app.mcp_manager import McpPluginManager
 from local_model_app.task_models import WorkItemOutcome
 
 
-ReferenceClassifier = Callable[[str, list[dict[str, str]]], Awaitable[set[str]]]
+@dataclass(frozen=True)
+class CandidateSelection:
+    keep_numbers: set[int]
+    needs_abstract_numbers: set[int]
+
+
+ReferenceClassifier = Callable[[str, list[dict[str, Any]]], Awaitable[CandidateSelection]]
 AsyncGenerator = Callable[[list[dict[str, Any]]], Awaitable[str]]
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\]\[\"']+", re.IGNORECASE)
@@ -174,41 +181,74 @@ class ResearchDiscoveryExecutor:
         goal = ledger["goal"]
         queries = [goal, f'"{goal}" review', f"{goal} primary study"]
         seen = {source["url"] for source in ledger["sources"]}
+        considered = set(ledger.get("considered_seed_urls") or []) | seen
         pages = ledger.setdefault("seed_query_pages", {})
+        page_history = ledger.setdefault("search_pages", [])
         for query in queries:
-            active_seeds = [
-                source for source in ledger["sources"]
-                if source["depth"] == 0 and source.get("status") != "dropped"
-            ]
-            if len(active_seeds) >= target:
-                break
-            page = int(pages.get(query) or 0) + 1
-            result = _structured(await self._call("search_web", {
-                "query": query,
-                "max_results": min(25, max(target, 10)),
-                "page": page,
-            }))
-            pages[query] = page
-            for row in result.get("results") or []:
-                url = canonical_url(str(row.get("href") or row.get("url") or ""))
-                if not url or url in seen:
-                    continue
-                seen.add(url)
-                ledger["sources"].append({
-                    "id": source_id(url),
-                    "url": url,
-                    "title": str(row.get("title") or url),
-                    "snippet": str(row.get("body") or row.get("snippet") or ""),
-                    "depth": 0,
-                    "parents": [],
-                    "status": "queued",
-                })
+            while int(pages.get(query) or 0) < 20:
                 active_count = sum(
                     source["depth"] == 0 and source.get("status") != "dropped"
                     for source in ledger["sources"]
                 )
                 if active_count >= target:
                     break
+                page = int(pages.get(query) or 0) + 1
+                result = _structured(await self._call("search_web", {
+                    "query": query,
+                    "max_results": min(25, max(target, 10)),
+                    "page": page,
+                }))
+                pages[query] = page
+                candidates: list[dict[str, str]] = []
+                for row in result.get("results") or []:
+                    url = canonical_url(str(row.get("href") or row.get("url") or ""))
+                    if not url or url in considered:
+                        continue
+                    candidates.append({
+                        "id": source_id(url),
+                        "url": url,
+                        "title": str(row.get("title") or url),
+                        "context": str(row.get("body") or row.get("snippet") or ""),
+                        "context_kind": "search_snippet",
+                        "authors": row.get("authors") or [],
+                        "year": row.get("year"),
+                        "venue": row.get("venue"),
+                        "abstract": row.get("abstract"),
+                        "abstract_source": row.get("abstract_source"),
+                    })
+                considered.update(candidate["url"] for candidate in candidates)
+                ledger["considered_seed_urls"] = sorted(considered)
+                selected_ids = await self._relevant(goal, candidates)
+                selected = [candidate for candidate in candidates if candidate["id"] in selected_ids]
+                page_history.append({
+                    "query": query,
+                    "page": page,
+                    "novel_candidates": len(candidates),
+                    "relevant_selected": len(selected),
+                    "presented_source_ids": [candidate["id"] for candidate in candidates],
+                    "selected_source_ids": [candidate["id"] for candidate in selected],
+                })
+                for candidate in selected:
+                    seen.add(candidate["url"])
+                    ledger["sources"].append({
+                        "id": candidate["id"],
+                        "url": candidate["url"],
+                        "title": candidate["title"],
+                        "snippet": candidate["context"],
+                        "depth": 0,
+                        "parents": [],
+                        "status": "queued",
+                    })
+                    active_count += 1
+                    if active_count >= target:
+                        break
+                if not selected:
+                    break
+            if sum(
+                source["depth"] == 0 and source.get("status") != "dropped"
+                for source in ledger["sources"]
+            ) >= target:
+                break
 
     async def _fetch_depth(
         self,
@@ -264,7 +304,75 @@ class ResearchDiscoveryExecutor:
             try:
                 selected: set[str] = set()
                 for start in range(0, len(candidates), 40):
-                    selected.update(await self.classify_references(goal, candidates[start:start + 40]))
+                    batch = candidates[start:start + 40]
+                    choices: list[dict[str, Any]] = []
+                    for number, candidate in enumerate(batch, 1):
+                        title = URL_PATTERN.sub("", candidate.get("title", ""))
+                        context = URL_PATTERN.sub("", candidate.get("context", ""))
+                        abstract = str(candidate.get("abstract") or "").strip()
+                        choice: dict[str, Any] = {
+                            "number": number,
+                            "title": " ".join(title.split())[:500],
+                        }
+                        for field in ("authors", "year", "venue"):
+                            if candidate.get(field):
+                                choice[field] = candidate[field]
+                        if abstract:
+                            choice["abstract"] = abstract[:4000]
+                            choice["abstract_source"] = candidate.get("abstract_source") or "provided_metadata"
+                        else:
+                            choice["context"] = " ".join(context.split())[:800]
+                            choice["context_kind"] = candidate.get("context_kind") or "citation_context"
+                        choices.append(choice)
+                    decision = await self.classify_references(goal, choices)
+                    selected.update(
+                        batch[number - 1]["id"]
+                        for number in decision.keep_numbers
+                        if 1 <= number <= len(batch)
+                    )
+                    ambiguous = [
+                        (number, batch[number - 1])
+                        for number in decision.needs_abstract_numbers
+                        if 1 <= number <= len(batch) and number not in decision.keep_numbers
+                    ]
+                    if ambiguous:
+                        enriched: list[dict[str, Any]] = []
+                        source_by_number: dict[int, dict[str, str]] = {}
+                        for enriched_number, (_, candidate) in enumerate(ambiguous, 1):
+                            source_by_number[enriched_number] = candidate
+                            metadata: dict[str, Any] = {}
+                            if candidate.get("url"):
+                                try:
+                                    metadata = _structured(await self._call(
+                                        "fetch_scholarly_metadata", {"url": candidate["url"]}
+                                    ))
+                                except Exception:
+                                    metadata = {}
+                            abstract = str(metadata.get("abstract") or "").strip()
+                            description = str(metadata.get("description") or "").strip()
+                            fallback_context = description or " ".join(
+                                URL_PATTERN.sub("", candidate.get("context", "")).split()
+                            )
+                            enriched.append({
+                                "number": enriched_number,
+                                "title": str(metadata.get("title") or candidate.get("title") or "")[:500],
+                                "authors": [str(value) for value in metadata.get("authors") or []][:12],
+                                "year": metadata.get("year"),
+                                "venue": metadata.get("venue"),
+                                "abstract": abstract[:4000] if abstract else None,
+                                "abstract_source": metadata.get("abstract_source") if abstract else None,
+                                "context": fallback_context[:800] if not abstract else None,
+                                "context_kind": (
+                                    "page_description" if description else
+                                    candidate.get("context_kind") or "citation_context"
+                                ) if not abstract else None,
+                            })
+                        second_decision = await self.classify_references(goal, enriched)
+                        selected.update(
+                            source_by_number[number]["id"]
+                            for number in second_decision.keep_numbers
+                            if number in source_by_number
+                        )
                 return selected
             except Exception:
                 pass

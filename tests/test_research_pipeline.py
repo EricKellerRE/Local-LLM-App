@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from local_model_app.research_pipeline import (
+    CandidateSelection,
     ResearchDiscoveryExecutor,
     ResearchNotesExecutor,
     canonical_url,
@@ -14,13 +15,15 @@ from local_model_app.research_pipeline import (
 
 
 class FakeResearchManager:
-    def __init__(self, seeds, pages):
+    def __init__(self, seeds, pages, metadata=None):
         self.seeds = seeds
         self.pages = pages
+        self.metadata = metadata or {}
         self.calls = []
         self.tools = [
             SimpleNamespace(native_name="search_web", exposed_name="web__search_web"),
             SimpleNamespace(native_name="fetch_url", exposed_name="web__fetch_url"),
+            SimpleNamespace(native_name="fetch_scholarly_metadata", exposed_name="web__fetch_scholarly_metadata"),
         ]
 
     async def ensure_started(self, plugin_ids):
@@ -33,6 +36,8 @@ class FakeResearchManager:
         self.calls.append((exposed_name, arguments))
         if exposed_name == "web__search_web":
             return {"structuredContent": {"results": self.seeds}}
+        if exposed_name == "web__fetch_scholarly_metadata":
+            return {"structuredContent": self.metadata.get(arguments["url"], {})}
         return {"structuredContent": {
             "url": arguments["url"],
             "content": self.pages[arguments["url"]],
@@ -76,7 +81,11 @@ class ResearchPipelineTests(unittest.TestCase):
         }
 
         async def classify(goal, candidates):
-            return {candidate["id"] for candidate in candidates}
+            self.assertTrue(all("url" not in candidate for candidate in candidates))
+            return CandidateSelection(
+                keep_numbers={candidate["number"] for candidate in candidates},
+                needs_abstract_numbers=set(),
+            )
 
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
@@ -108,8 +117,17 @@ class ResearchPipelineTests(unittest.TestCase):
         seeds = [{"title": "Seed", "href": "https://papers.test/a", "body": "memory"}]
         pages = {"https://papers.test/a": "## References\n[Unrelated](https://papers.test/z)"}
 
+        selection_calls = 0
+
         async def reject_all(goal, candidates):
-            return set()
+            nonlocal selection_calls
+            selection_calls += 1
+            return CandidateSelection(
+                keep_numbers=(
+                    {candidate["number"] for candidate in candidates} if selection_calls == 1 else set()
+                ),
+                needs_abstract_numbers=set(),
+            )
 
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
@@ -139,7 +157,10 @@ class ResearchPipelineTests(unittest.TestCase):
         }
 
         async def classify(goal, candidates):
-            return {candidate["id"] for candidate in candidates}
+            return CandidateSelection(
+                keep_numbers={candidate["number"] for candidate in candidates},
+                needs_abstract_numbers=set(),
+            )
 
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
@@ -157,6 +178,78 @@ class ResearchPipelineTests(unittest.TestCase):
         self.assertEqual(ledger["stop_reason"], "source_limit_reached")
         self.assertEqual(len(ledger["sources"]), 3)
         self.assertTrue(all(source["status"] == "fetched" for source in ledger["sources"]))
+
+    def test_ambiguous_number_gets_metadata_then_a_final_numbered_decision(self):
+        url = "https://papers.test/a"
+        manager = FakeResearchManager(
+            [{"title": "Memory dynamics", "href": url, "body": "An ambiguous result snippet."}],
+            {url: "No references."},
+            {url: {
+                "title": "Memory dynamics after learning",
+                "authors": ["Ada Example"],
+                "year": 2025,
+                "venue": "Journal of Memory",
+                "abstract": "Protein synthesis supports long-term memory consolidation.",
+                "abstract_source": "citation_abstract",
+            }},
+        )
+        calls = []
+
+        async def classify(goal, candidates):
+            calls.append(candidates)
+            if len(calls) == 1:
+                self.assertEqual(candidates[0]["context_kind"], "search_snippet")
+                self.assertNotIn("abstract", candidates[0])
+                return CandidateSelection(keep_numbers=set(), needs_abstract_numbers={1})
+            self.assertEqual(candidates[0]["authors"], ["Ada Example"])
+            self.assertEqual(candidates[0]["abstract_source"], "citation_abstract")
+            self.assertNotIn("url", candidates[0])
+            return CandidateSelection(keep_numbers={1}, needs_abstract_numbers=set())
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            executor = ResearchDiscoveryExecutor(manager, root, classify)
+            task = {"id": "task-metadata", "definition": {"goal": "memory", "metadata": {
+                "research_seed_sources": 1, "research_depth_passes": 0,
+            }}}
+            outcome = asyncio.run(executor.execute_work_item(task, {}, []))
+
+        self.assertEqual(outcome.outcome, "completed")
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(any(name == "web__fetch_scholarly_metadata" for name, _ in manager.calls))
+
+    def test_generic_page_description_is_not_presented_as_an_abstract(self):
+        url = "https://papers.test/a"
+        manager = FakeResearchManager(
+            [{"title": "Memory dynamics", "href": url, "body": "Ambiguous search text."}],
+            {url: "No references."},
+            {url: {
+                "title": "Memory dynamics",
+                "description": "A publisher page description, not an abstract.",
+                "description_source": "og:description",
+            }},
+        )
+        calls = []
+
+        async def classify(goal, candidates):
+            calls.append(candidates)
+            if len(calls) == 1:
+                return CandidateSelection(keep_numbers=set(), needs_abstract_numbers={1})
+            self.assertIsNone(candidates[0]["abstract"])
+            self.assertEqual(candidates[0]["context_kind"], "page_description")
+            self.assertEqual(candidates[0]["context"], "A publisher page description, not an abstract.")
+            return CandidateSelection(keep_numbers=set(), needs_abstract_numbers=set())
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            executor = ResearchDiscoveryExecutor(manager, root, classify)
+            task = {"id": "task-description", "definition": {"goal": "memory", "metadata": {
+                "research_seed_sources": 1, "research_depth_passes": 0,
+            }}}
+            outcome = asyncio.run(executor.execute_work_item(task, {}, []))
+
+        self.assertEqual(outcome.outcome, "retry")
+        self.assertEqual(len(calls), 2)
 
     def test_notes_are_batched_and_persisted_for_restart(self):
         calls = []
