@@ -1,11 +1,12 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from pydantic import ValidationError
 
 from local_model_app.server import Runtime, SettingsUpdateRequest
+from local_model_app.workflow_skills import WorkflowSkillRegistry
 
 
 class RuntimePluginRequestTests(unittest.TestCase):
@@ -84,6 +85,44 @@ class RuntimePluginRequestTests(unittest.TestCase):
         self.assertTrue(Runtime._durable_request("Research the literature and write a report", False))
         self.assertTrue(Runtime._durable_request("Optimize this grid until the metric improves", True))
         self.assertFalse(Runtime._durable_request("Explain voltage stability", True))
+
+    def test_durable_research_chat_instantiates_the_workflow_skill(self) -> None:
+        captured = {}
+
+        def create_task(request, definition):
+            captured["request"] = request
+            captured["definition"] = definition
+            return {"id": "task-1"}
+
+        runtime = Runtime.__new__(Runtime)
+        runtime.workflow_skills = WorkflowSkillRegistry.default()
+        runtime.model = SimpleNamespace(settings=SimpleNamespace(
+            research_seed_sources=12,
+            research_depth_passes=3,
+            research_max_sources=80,
+            research_references_per_source=12,
+            research_notes_batch_size=6,
+        ))
+        runtime.tasks = SimpleNamespace(create_task=create_task, start_task=Mock())
+        runtime.task_engine = SimpleNamespace(wake=Mock())
+        runtime.store = SimpleNamespace(append_exchange=Mock())
+        request = (
+            "Produce a comprehensive research report on biological mechanisms of long-term memory formation and "
+            "maintenance. Search deeply, follow references, and export the complete document."
+        )
+
+        asyncio.run(runtime._start_durable_chat_task(
+            {"id": "chat-1", "project_id": None},
+            request,
+            ["local.web-research"],
+        ))
+
+        definition = captured["definition"]
+        self.assertEqual(definition.goal, "biological mechanisms of long-term memory formation and maintenance")
+        self.assertEqual(definition.metadata["workflow_skill_id"], "scholarly-research-report")
+        self.assertEqual(definition.metadata["skill_inputs"]["topic"], definition.goal)
+        runtime.tasks.start_task.assert_called_once_with("task-1")
+        runtime.task_engine.wake.assert_called_once_with()
 
 
 if __name__ == "__main__":

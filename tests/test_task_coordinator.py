@@ -77,7 +77,13 @@ class TaskCoordinatorTests(unittest.TestCase):
         task = {"definition": {
             "goal": "Research long-term memory formation and maintenance",
             "success_criteria": ["A sourced report is complete"],
-            "metadata": {"mode": "durable_tools", "plugin_ids": ["local.web-research"]},
+            "metadata": {
+                "mode": "durable_tools",
+                "plugin_ids": ["local.web-research"],
+                "workflow_skill_id": "scholarly-research-report",
+                "workflow_skill_version": "1.0.0",
+                "skill_inputs": {"topic": "long-term memory formation and maintenance"},
+            },
         }}
 
         items = asyncio.run(coordinator.plan_task(task))
@@ -100,6 +106,9 @@ class TaskCoordinatorTests(unittest.TestCase):
             "success_criteria": ["A complete report is produced."],
             "metadata": {
                 "plugin_ids": ["local.web-research"],
+                "workflow_skill_id": "scholarly-research-report",
+                "workflow_skill_version": "1.0.0",
+                "skill_inputs": {"topic": "memory"},
                 "report_min_words": 6000,
                 "report_min_sources": 12,
             },

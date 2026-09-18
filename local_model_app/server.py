@@ -34,6 +34,7 @@ from local_model_app.task_models import TaskDefinition, TaskStatus, WorkItemOutc
 from local_model_app.task_store import TaskStore
 from local_model_app.tool_coordinator import FINAL_TOKENS, ToolCoordinator, _compact_result
 from local_model_app.tool_router import LocalEmbeddingEncoder, ToolRouter
+from local_model_app.workflow_skills import WorkflowSkillRegistry
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -180,6 +181,7 @@ class Runtime:
         self.store.discard_empty_chats()
         self.tasks = TaskStore(self.paths.data_directory / "tasks.sqlite3")
         self.mcp = McpPluginManager(McpPluginRegistry(ROOT / "config" / "mcp.d", project_root=ROOT))
+        self.workflow_skills = WorkflowSkillRegistry(ROOT / "config" / "skills")
         self.load_error: str | None = None
         self.loading = False
         self.draining = False
@@ -189,6 +191,7 @@ class Runtime:
         self.task_coordinator = ModelTaskCoordinator(
             self.task_generate,
             capability_catalog=self.task_capability_catalog,
+            skill_registry=self.workflow_skills,
         )
         self.task_engine = UniversalTaskEngine(
             self.tasks,
@@ -460,6 +463,30 @@ class Runtime:
                 "section_max_segments": 6 if is_research else None,
             },
         })
+        selected_skill = self.workflow_skills.select(content, plugin_ids)
+        if selected_skill is not None:
+            skill_metadata: dict[str, Any] = {
+                "chat_id": chat["id"],
+                "project_id": chat.get("project_id"),
+            }
+            if selected_skill.id == "scholarly-research-report":
+                skill_metadata.update({
+                    "report_min_words": 6000,
+                    "report_min_sources": 12,
+                    "report_target_words": 8000,
+                    "report_format": "docx",
+                    "research_seed_sources": settings.research_seed_sources,
+                    "research_depth_passes": settings.research_depth_passes,
+                    "research_max_sources": settings.research_max_sources,
+                    "research_references_per_source": settings.research_references_per_source,
+                    "research_notes_batch_size": settings.research_notes_batch_size,
+                    "section_max_segments": 6,
+                })
+            definition = selected_skill.task_definition(
+                content,
+                plugin_ids,
+                metadata=skill_metadata,
+            )
         task = self.tasks.create_task(content, definition)
         self.tasks.start_task(task["id"])
         self.task_engine.wake()
@@ -902,6 +929,12 @@ async def get_settings(request: Request):
         "detected_context_window": service.model.native_context_window,
         "effective_context_window": service.model.effective_context_window,
     }
+
+
+@app.get("/api/skills")
+async def workflow_skill_catalog(request: Request):
+    """List versioned durable-workflow skills available to the coordinator."""
+    return runtime(request).workflow_skills.catalog()
 
 
 @app.put("/api/settings")
