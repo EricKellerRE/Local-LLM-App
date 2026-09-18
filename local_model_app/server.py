@@ -23,7 +23,12 @@ from local_model_app.config import Settings, _load_dotenv
 from local_model_app.coordinator import Coordinator
 from local_model_app.durable_tools import DurableSectionExecutor, DurableSynthesisExecutor, DurableToolExecutor
 from local_model_app.model import TransformersModel
-from local_model_app.research_pipeline import CandidateSelection, ResearchDiscoveryExecutor, ResearchNotesExecutor
+from local_model_app.research_pipeline import (
+    CandidateSelection,
+    ResearchDiscoveryExecutor,
+    ResearchNotesExecutor,
+    ResearchSourceProcessor,
+)
 from local_model_app.huggingface_service import HuggingFaceService
 from local_model_app.mcp_manager import McpPluginManager
 from local_model_app.mcp_plugins import McpPluginRegistry, PluginConfigurationError
@@ -121,11 +126,14 @@ class SettingsUpdateRequest(BaseModel):
     synthesis_max_new_tokens: int = Field(default=8192, ge=1, le=262_144)
     research_classifier_max_new_tokens: int = Field(default=256, ge=1, le=262_144)
     research_notes_max_new_tokens: int = Field(default=768, ge=1, le=262_144)
+    research_source_dossier_max_new_tokens: int = Field(default=1536, ge=1, le=262_144)
+    research_whole_source_max_tokens: int = Field(default=8192, ge=512, le=4_194_304)
+    research_section_input_tokens: int = Field(default=6144, ge=512, le=4_194_304)
+    research_source_max_characters: int = Field(default=160000, ge=1000, le=10_000_000)
     research_seed_sources: int = Field(default=12, ge=1, le=100)
     research_depth_passes: int = Field(default=3, ge=0, le=10)
     research_max_sources: int = Field(default=80, ge=1, le=1000)
     research_references_per_source: int = Field(default=12, ge=1, le=100)
-    research_notes_batch_size: int = Field(default=6, ge=1, le=50)
     max_tool_calls_per_step: int = Field(default=256, ge=1, le=4096)
     temperature: float = Field(default=0.7, ge=0, le=2)
     top_p: float = Field(default=0.9, gt=0, le=1)
@@ -137,6 +145,8 @@ class SettingsUpdateRequest(BaseModel):
     def validate_token_budgets(self) -> "SettingsUpdateRequest":
         if self.research_max_sources < self.research_seed_sources:
             raise ValueError("Research total source cap must be at least the seed-source count.")
+        if self.research_section_input_tokens > self.research_whole_source_max_tokens:
+            raise ValueError("Research section input ceiling cannot exceed the whole-source threshold.")
         if self.context_window is not None and self.max_new_tokens >= self.context_window:
             raise ValueError("Response budget must be smaller than the context window.")
         if self.context_window is not None:
@@ -149,10 +159,15 @@ class SettingsUpdateRequest(BaseModel):
                 "Synthesis": self.synthesis_max_new_tokens,
                 "Research relevance": self.research_classifier_max_new_tokens,
                 "Research notes": self.research_notes_max_new_tokens,
+                "Source dossier": self.research_source_dossier_max_new_tokens,
             }
             invalid = [name for name, value in named_budgets.items() if value >= self.context_window]
             if invalid:
                 raise ValueError(f"{', '.join(invalid)} budget must be smaller than the context window.")
+            if self.research_whole_source_max_tokens >= self.context_window:
+                raise ValueError("Whole-source threshold must be smaller than the context window.")
+            if self.research_section_input_tokens >= self.context_window:
+                raise ValueError("Research section input ceiling must be smaller than the context window.")
         if self.reasoning_budget is not None and self.reasoning_budget > self.max_new_tokens:
             raise ValueError("Reasoning budget cannot exceed the response budget.")
         return self
@@ -210,6 +225,12 @@ class Runtime:
                     self.mcp,
                     self.paths.data_directory,
                     self.classify_references,
+                    ResearchSourceProcessor(
+                        self.task_analyze_sources,
+                        self.task_build_source_dossier,
+                        self.task_count_tokens,
+                        self.paths.data_directory,
+                    ),
                 ),
                 "research_notes": ResearchNotesExecutor(self.task_analyze_sources, self.paths.data_directory),
                 "section": DurableSectionExecutor(self.task_write_section, self.paths.data_directory),
@@ -327,8 +348,9 @@ class Runtime:
                 [
                     {"role": "system", "content": (
                         "Select citation candidates that are substantively relevant to the research goal. Favor "
-                        "primary studies and authoritative reviews; reject navigation, author profiles, unrelated "
-                        "citations, and duplicate editions. Use needs_abstract_numbers only when the title and supplied "
+                        "primary studies and authoritative reviews; reject encyclopedias, retail pages, popular blogs, "
+                        "news items, navigation, author profiles, unrelated citations, and duplicate editions unless "
+                        "the goal explicitly calls for those source types. Use needs_abstract_numbers only when the title and supplied "
                         "snippet/citation context are genuinely insufficient. When an abstract field is present, make "
                         "a final keep/reject decision instead. Return only list numbers, never URLs or titles. Return "
                         "only JSON: {\"keep_numbers\": [integer], \"needs_abstract_numbers\": [integer]}."
@@ -371,6 +393,25 @@ class Runtime:
                 temperature=self.model.settings.tool_temperature,
                 generation_class="research_notes",
             )
+
+    @tracked_activity("a source dossier is being consolidated")
+    async def task_build_source_dossier(self, messages: list[dict[str, Any]]) -> str:
+        async with self._inference_lock:
+            await self.ensure_loaded()
+            return await asyncio.to_thread(
+                self.model.generate,
+                messages,
+                max_new_tokens=int(getattr(
+                    self.model.settings, "research_source_dossier_max_new_tokens", 1536
+                )),
+                temperature=self.model.settings.tool_temperature,
+                generation_class="research_source_dossier",
+            )
+
+    def task_count_tokens(self, text: str) -> int:
+        decoder = self.model.tokenizer or getattr(self.model.processor, "tokenizer", None)
+        count = self.model._text_token_count(decoder, text) if decoder is not None else None
+        return count if count is not None else max(1, (len(text) + 3) // 4)
 
     async def task_capability_catalog(self, plugin_ids: list[str]) -> list[dict[str, Any]]:
         await self.mcp.ensure_started(plugin_ids)
@@ -459,7 +500,10 @@ class Runtime:
                 "research_depth_passes": settings.research_depth_passes if is_research else None,
                 "research_max_sources": settings.research_max_sources if is_research else None,
                 "research_references_per_source": settings.research_references_per_source if is_research else None,
-                "research_notes_batch_size": settings.research_notes_batch_size if is_research else None,
+                "research_source_dossier_max_new_tokens": getattr(settings, "research_source_dossier_max_new_tokens", 1536) if is_research else None,
+                "research_whole_source_max_tokens": getattr(settings, "research_whole_source_max_tokens", 8192) if is_research else None,
+                "research_section_input_tokens": getattr(settings, "research_section_input_tokens", 6144) if is_research else None,
+                "research_source_max_characters": getattr(settings, "research_source_max_characters", 160000) if is_research else None,
                 "section_max_segments": 6 if is_research else None,
             },
         })
@@ -479,7 +523,10 @@ class Runtime:
                     "research_depth_passes": settings.research_depth_passes,
                     "research_max_sources": settings.research_max_sources,
                     "research_references_per_source": settings.research_references_per_source,
-                    "research_notes_batch_size": settings.research_notes_batch_size,
+                    "research_source_dossier_max_new_tokens": getattr(settings, "research_source_dossier_max_new_tokens", 1536),
+                    "research_whole_source_max_tokens": getattr(settings, "research_whole_source_max_tokens", 8192),
+                    "research_section_input_tokens": getattr(settings, "research_section_input_tokens", 6144),
+                    "research_source_max_characters": getattr(settings, "research_source_max_characters", 160000),
                     "section_max_segments": 6,
                 })
             definition = selected_skill.task_definition(

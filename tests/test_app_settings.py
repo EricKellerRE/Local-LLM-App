@@ -23,6 +23,10 @@ class AppSettingsStoreTests(unittest.TestCase):
             self.assertEqual(store.public_settings()["research_seed_sources"], 12)
             self.assertEqual(store.public_settings()["research_depth_passes"], 3)
             self.assertEqual(store.public_settings()["research_max_sources"], 80)
+            self.assertEqual(store.public_settings()["research_source_dossier_max_new_tokens"], 1536)
+            self.assertEqual(store.public_settings()["research_whole_source_max_tokens"], 8192)
+            self.assertEqual(store.public_settings()["research_section_input_tokens"], 6144)
+            self.assertEqual(store.public_settings()["research_source_max_characters"], 160000)
 
     def test_update_persists_model_and_storage_settings(self) -> None:
         with TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -45,11 +49,14 @@ class AppSettingsStoreTests(unittest.TestCase):
                 "synthesis_max_new_tokens": 5000,
                 "research_classifier_max_new_tokens": 400,
                 "research_notes_max_new_tokens": 1400,
+                "research_source_dossier_max_new_tokens": 1800,
+                "research_whole_source_max_tokens": 10000,
+                "research_section_input_tokens": 7000,
+                "research_source_max_characters": 200000,
                 "research_seed_sources": 15,
                 "research_depth_passes": 4,
                 "research_max_sources": 100,
                 "research_references_per_source": 16,
-                "research_notes_batch_size": 8,
                 "temperature": 0.2,
                 "top_p": 0.8,
                 "trust_remote_code": True,
@@ -65,6 +72,8 @@ class AppSettingsStoreTests(unittest.TestCase):
             self.assertEqual(saved["synthesis_max_new_tokens"], 5000)
             self.assertEqual(saved["research_seed_sources"], 15)
             self.assertEqual(saved["research_depth_passes"], 4)
+            self.assertEqual(saved["research_source_dossier_max_new_tokens"], 1800)
+            self.assertEqual(saved["research_whole_source_max_tokens"], 10000)
             self.assertTrue(saved["trust_remote_code"])
             self.assertTrue((root / "chosen-data").is_dir())
             self.assertTrue((root / "chosen-models").is_dir())

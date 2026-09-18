@@ -81,16 +81,16 @@ class TaskCoordinatorTests(unittest.TestCase):
                 "mode": "durable_tools",
                 "plugin_ids": ["local.web-research"],
                 "workflow_skill_id": "scholarly-research-report",
-                "workflow_skill_version": "1.0.0",
+                "workflow_skill_version": "1.1.0",
                 "skill_inputs": {"topic": "long-term memory formation and maintenance"},
             },
         }}
 
         items = asyncio.run(coordinator.plan_task(task))
 
-        self.assertEqual(len(items), 10)
+        self.assertEqual(len(items), 9)
         self.assertEqual(sum(item.kind == "research_discovery" for item in items), 1)
-        self.assertEqual(sum(item.kind == "research_notes" for item in items), 1)
+        self.assertEqual(sum(item.kind == "research_notes" for item in items), 0)
         self.assertEqual(sum(item.kind == "section" for item in items), 7)
         self.assertEqual(items[-1].kind, "synthesis")
         self.assertEqual(
@@ -107,7 +107,7 @@ class TaskCoordinatorTests(unittest.TestCase):
             "metadata": {
                 "plugin_ids": ["local.web-research"],
                 "workflow_skill_id": "scholarly-research-report",
-                "workflow_skill_version": "1.0.0",
+                "workflow_skill_version": "1.1.0",
                 "skill_inputs": {"topic": "memory"},
                 "report_min_words": 6000,
                 "report_min_sources": 12,
@@ -115,7 +115,6 @@ class TaskCoordinatorTests(unittest.TestCase):
         }}
         items = [
             {"kind": "research_discovery", "status": "completed", "result": {}},
-            {"kind": "research_notes", "status": "completed", "result": {}},
             *[{"kind": "section", "status": "completed", "result": {}} for _ in range(7)],
             {"kind": "synthesis", "status": "completed", "result": {
                 "completion_evidence": ["word_count=7000", "source_url_count=20"],

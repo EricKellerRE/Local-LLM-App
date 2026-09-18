@@ -185,6 +185,8 @@ class DurableSectionExecutor:
         completed_items: list[dict[str, Any]],
     ) -> WorkItemOutcome:
         dependencies = set(item.get("depends_on") or [])
+        checkpoint_path = self._checkpoint_path(task, item)
+        segments = self._read_segments(checkpoint_path)
         evidence = []
         for completed in completed_items:
             if dependencies and completed.get("key") not in dependencies:
@@ -196,10 +198,36 @@ class DurableSectionExecutor:
                 "result": outcome.get("result") if isinstance(outcome, dict) else outcome,
                 "completion_evidence": outcome.get("completion_evidence", []) if isinstance(outcome, dict) else [],
             })
+            if completed.get("kind") == "research_discovery" and self.data_directory is not None:
+                analysis_dir = self.data_directory / "research" / str(task["id"]) / "source-analysis"
+                dossiers: list[dict[str, str]] = []
+                for path in sorted(analysis_dir.glob("*.json")):
+                    try:
+                        payload = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError, TypeError):
+                        continue
+                    dossier = str(payload.get("dossier") or "").strip()
+                    if payload.get("status") == "completed" and dossier:
+                        dossiers.append({
+                            "source_id": str(payload.get("source_id") or path.stem),
+                            "title": str(payload.get("title") or "Source"),
+                            "url": str(payload.get("url") or ""),
+                            "dossier": dossier,
+                        })
+                if dossiers:
+                    per_segment = 6
+                    section_key = str(item.get("key") or item.get("title") or "section")
+                    section_offset = sum(ord(character) for character in section_key)
+                    offset = (section_offset + len(segments) * per_segment) % len(dossiers)
+                    selected = (dossiers + dossiers)[offset:offset + min(per_segment, len(dossiers))]
+                    evidence.append({
+                        "key": "source-dossiers",
+                        "title": "Checkpointed source-specific evidence dossiers",
+                        "result": selected,
+                        "completion_evidence": [row["url"] for row in selected if row["url"]],
+                    })
         minimum_match = MINIMUM_WORDS_PATTERN.search(item.get("completion_check") or "")
         minimum_words = int(minimum_match.group(1).replace(",", "")) if minimum_match else 0
-        checkpoint_path = self._checkpoint_path(task, item)
-        segments = self._read_segments(checkpoint_path)
         existing = "\n\n".join(segments)
         remaining_words = max(0, minimum_words - report_word_count(existing))
         if segments:
@@ -282,7 +310,10 @@ class DurableSynthesisExecutor:
             ledger_path = self.data_directory / "research" / str(task["id"]) / "source-ledger.json"
             try:
                 ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-                corpus_sources = [source for source in ledger.get("sources", []) if source.get("status") == "fetched"]
+                corpus_sources = [
+                    source for source in ledger.get("sources", [])
+                    if source.get("status") in {"fetched", "analyzed"}
+                ]
             except (OSError, json.JSONDecodeError, TypeError):
                 corpus_sources = []
             if corpus_sources:

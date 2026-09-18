@@ -6,7 +6,7 @@ Reduce the time and tokens spent between research tool calls without reducing to
 
 The first overnight report is the preserved baseline. It completed all reported stages but produced only about 1,080 words and a handful of unique sources. That is a quality failure even though the old categorical audit passed; future comparisons must treat it as the negative control, not a successful report.
 
-Before another full run, replace model-directed source collection with a host-enforced research pipeline: acquire the configured seed count, expand cited references breadth-first, deduplicate canonical URLs and DOIs, stop only at the depth/source limits or a pass with no novel relevant references, then read every acquired source exactly once in bounded note batches. Persist the source graph, source text, batch notes, pass counts, and stop reason outside model context.
+Before another full run, replace model-directed source collection with a host-enforced research pipeline: acquire the configured usable seed count, fetch and analyze one selected source at a time, refill unusable slots, extract and expand cited references breadth-first, deduplicate canonical URLs and DOIs, and stop only at the depth/source limits or a pass with no novel relevant references. Analyze short papers whole and checkpoint long papers section by section, then consolidate one durable evidence dossier per source. Persist the source graph, source text, section notes, dossiers, pass counts, and stop reason outside model context.
 
 ## Confirmed starting point
 
@@ -76,7 +76,7 @@ Cover at least these cases:
 12. Linked, DOI-only, and plain-text bibliography entries enter the reference frontier.
 13. Duplicate references reached through different parents collapse to one source while preserving both parent edges.
 14. Citation expansion reaches the configured depth and stops early only when a pass adds no novel relevant sources.
-15. Source-note batching reads each fetched source once and resumes without regenerating completed batches.
+15. Per-source analysis resumes without regenerating completed sections or completed source dossiers.
 
 ## Search procedure
 

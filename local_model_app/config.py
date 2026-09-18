@@ -37,11 +37,14 @@ class Settings:
     synthesis_max_new_tokens: int
     research_classifier_max_new_tokens: int
     research_notes_max_new_tokens: int
+    research_source_dossier_max_new_tokens: int
+    research_whole_source_max_tokens: int
+    research_section_input_tokens: int
+    research_source_max_characters: int
     research_seed_sources: int
     research_depth_passes: int
     research_max_sources: int
     research_references_per_source: int
-    research_notes_batch_size: int
     max_tool_calls_per_step: int
     tool_temperature: float
     router_model_id: str
@@ -75,11 +78,16 @@ class Settings:
             synthesis_max_new_tokens=int(os.getenv("LOCAL_SYNTHESIS_MAX_NEW_TOKENS", str(response_budget))),
             research_classifier_max_new_tokens=int(os.getenv("LOCAL_RESEARCH_CLASSIFIER_MAX_NEW_TOKENS", "256")),
             research_notes_max_new_tokens=int(os.getenv("LOCAL_RESEARCH_NOTES_MAX_NEW_TOKENS", "768")),
+            research_source_dossier_max_new_tokens=int(
+                os.getenv("LOCAL_RESEARCH_SOURCE_DOSSIER_MAX_NEW_TOKENS", "1536")
+            ),
+            research_whole_source_max_tokens=int(os.getenv("LOCAL_RESEARCH_WHOLE_SOURCE_MAX_TOKENS", "8192")),
+            research_section_input_tokens=int(os.getenv("LOCAL_RESEARCH_SECTION_INPUT_TOKENS", "6144")),
+            research_source_max_characters=int(os.getenv("LOCAL_RESEARCH_SOURCE_MAX_CHARACTERS", "160000")),
             research_seed_sources=int(os.getenv("LOCAL_RESEARCH_SEED_SOURCES", "12")),
             research_depth_passes=int(os.getenv("LOCAL_RESEARCH_DEPTH_PASSES", "3")),
             research_max_sources=int(os.getenv("LOCAL_RESEARCH_MAX_SOURCES", "80")),
             research_references_per_source=int(os.getenv("LOCAL_RESEARCH_REFERENCES_PER_SOURCE", "12")),
-            research_notes_batch_size=int(os.getenv("LOCAL_RESEARCH_NOTES_BATCH_SIZE", "6")),
             max_tool_calls_per_step=int(os.getenv("LOCAL_MAX_TOOL_CALLS_PER_STEP", "256")),
             tool_temperature=float(os.getenv("LOCAL_TOOL_TEMPERATURE", "0")),
             router_model_id=os.getenv(

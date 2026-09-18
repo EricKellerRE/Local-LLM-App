@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -20,6 +21,7 @@ class CandidateSelection:
 
 ReferenceClassifier = Callable[[str, list[dict[str, Any]]], Awaitable[CandidateSelection]]
 AsyncGenerator = Callable[[list[dict[str, Any]]], Awaitable[str]]
+TokenCounter = Callable[[str], int]
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\]\[\"']+", re.IGNORECASE)
 MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]{1,500})\]\((https?://[^\s)]+(?:\([^)]*\)[^\s)]*)?)\)", re.IGNORECASE)
@@ -139,7 +141,197 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    for attempt in range(5):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.02 * (attempt + 1))
+
+
+def split_source_sections(
+    markdown: str,
+    count_tokens: TokenCounter,
+    max_tokens: int,
+) -> list[dict[str, str]]:
+    """Split a long source at headings, then paragraph boundaries, without losing text."""
+    max_tokens = max(256, int(max_tokens))
+    heading_parts = re.split(r"(?m)(?=^#{1,6}\s+\S)", markdown)
+    logical_parts = [part.strip() for part in heading_parts if part.strip()]
+    if not logical_parts:
+        logical_parts = [markdown.strip()]
+    chunks: list[str] = []
+    current = ""
+    for part in logical_parts:
+        if count_tokens(part) > max_tokens:
+            paragraphs = [value.strip() for value in re.split(r"\n\s*\n", part) if value.strip()]
+        else:
+            paragraphs = [part]
+        bounded_paragraphs: list[str] = []
+        for paragraph in paragraphs:
+            if count_tokens(paragraph) <= max_tokens:
+                bounded_paragraphs.append(paragraph)
+                continue
+            word_chunk: list[str] = []
+            for word in paragraph.split():
+                candidate = " ".join([*word_chunk, word])
+                if word_chunk and count_tokens(candidate) > max_tokens:
+                    bounded_paragraphs.append(" ".join(word_chunk))
+                    word_chunk = [word]
+                else:
+                    word_chunk.append(word)
+            if word_chunk:
+                bounded_paragraphs.append(" ".join(word_chunk))
+        for paragraph in bounded_paragraphs:
+            candidate = f"{current}\n\n{paragraph}".strip()
+            if current and count_tokens(candidate) > max_tokens:
+                chunks.append(current)
+                current = paragraph
+            else:
+                current = candidate
+    if current:
+        chunks.append(current)
+    return [
+        {"key": f"section-{index:04d}", "label": f"Document segment {index}", "content": chunk}
+        for index, chunk in enumerate(chunks, 1)
+    ]
+
+
+class ResearchSourceProcessor:
+    """Analyze one paper at a time and checkpoint every bounded model call."""
+
+    def __init__(
+        self,
+        analyze_section: AsyncGenerator,
+        build_dossier: AsyncGenerator,
+        count_tokens: TokenCounter,
+        data_directory: Path,
+    ) -> None:
+        self.analyze_section = analyze_section
+        self.build_dossier = build_dossier
+        self.count_tokens = count_tokens
+        self.data_directory = data_directory
+
+    def _path(self, task_id: str, source_key: str) -> Path:
+        return self.data_directory / "research" / task_id / "source-analysis" / f"{source_key}.json"
+
+    async def process(
+        self,
+        task: dict[str, Any],
+        source: dict[str, Any],
+        content: str,
+    ) -> dict[str, Any]:
+        metadata = task["definition"].get("metadata") or {}
+        whole_limit = max(512, int(metadata.get("research_whole_source_max_tokens") or 8192))
+        section_limit = max(512, min(whole_limit, int(metadata.get("research_section_input_tokens") or 6144)))
+        path = self._path(str(task["id"]), source["id"])
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            state = {
+                "version": 1,
+                "source_id": source["id"],
+                "title": source.get("title") or source["url"],
+                "url": source["url"],
+                "depth": source.get("depth", 0),
+                "token_count": self.count_tokens(content),
+                "mode": "whole_document" if self.count_tokens(content) <= whole_limit else "sections",
+                "sections": [],
+                "reduction_levels": [],
+                "dossier": "",
+                "status": "in_progress",
+            }
+        if state.get("status") == "completed" and str(state.get("dossier") or "").strip():
+            return state
+
+        if state["mode"] == "whole_document":
+            sections = [{"key": "whole-document", "label": "Whole document", "content": content}]
+        else:
+            sections = split_source_sections(content, self.count_tokens, section_limit)
+        saved_by_key = {row["key"]: row for row in state.get("sections") or []}
+        for section in sections:
+            if str(saved_by_key.get(section["key"], {}).get("notes") or "").strip():
+                continue
+            notes = await self.analyze_section([
+                {"role": "system", "content": (
+                    "Analyze one bounded portion of one scholarly source. Extract only source-grounded evidence: "
+                    "specific findings, mechanisms, methods, study system or population, causal strength, boundary "
+                    "conditions, limitations, disagreements, and important references mentioned in this portion. "
+                    "Do not write the report or infer beyond the supplied text. Preserve the exact source URL."
+                )},
+                {"role": "user", "content": json.dumps({
+                    "task_goal": task["definition"]["goal"],
+                    "source": {
+                        "id": source["id"], "title": source.get("title"), "url": source["url"],
+                        "depth": source.get("depth", 0),
+                    },
+                    "segment": {"label": section["label"], "content": section["content"]},
+                }, ensure_ascii=False)},
+            ])
+            saved_by_key[section["key"]] = {
+                "key": section["key"], "label": section["label"], "notes": notes.strip(),
+            }
+            state["sections"] = [saved_by_key[value["key"]] for value in sections if value["key"] in saved_by_key]
+            _atomic_json(path, state)
+
+        note_blocks = [
+            f"### {row['label']}\n{row['notes']}" for row in state["sections"] if str(row.get("notes") or "").strip()
+        ]
+        current_blocks = note_blocks
+        reduction_levels = list(state.get("reduction_levels") or [])
+        level = 0
+        while self.count_tokens("\n\n".join(current_blocks)) > whole_limit and level < 8:
+            reduction_chunks = split_source_sections(
+                "\n\n".join(current_blocks), self.count_tokens, max(512, whole_limit // 2)
+            )
+            reductions = list(reduction_levels[level]) if level < len(reduction_levels) else []
+            for index, chunk in enumerate(reduction_chunks):
+                if index < len(reductions) and str(reductions[index]).strip():
+                    continue
+                reduced = await self.build_dossier([
+                    {"role": "system", "content": (
+                        "Compress these notes from one source without dropping methods, findings, mechanisms, "
+                        "evidence strength, limitations, disagreements, or the exact source URL. Do not add claims."
+                    )},
+                    {"role": "user", "content": chunk["content"]},
+                ])
+                if index < len(reductions):
+                    reductions[index] = reduced.strip()
+                else:
+                    reductions.append(reduced.strip())
+                if level < len(reduction_levels):
+                    reduction_levels[level] = reductions
+                else:
+                    reduction_levels.append(reductions)
+                state["reduction_levels"] = reduction_levels
+                _atomic_json(path, state)
+            reduced_text = "\n\n".join(reductions)
+            if self.count_tokens(reduced_text) >= self.count_tokens("\n\n".join(current_blocks)):
+                current_blocks = reductions
+                break
+            current_blocks = reductions
+            level += 1
+        consolidation_input = "\n\n".join(current_blocks)
+
+        dossier = await self.build_dossier([
+            {"role": "system", "content": (
+                "Create a reusable evidence dossier for exactly one scholarly source. Preserve the title and exact "
+                "URL, then organize the source-grounded methods, study system or population, principal findings, "
+                "mechanisms, causal strength, boundary conditions, limitations, disagreements, and useful cited leads. "
+                "Distinguish what the source reports from interpretation. Do not write a multi-source report."
+            )},
+            {"role": "user", "content": json.dumps({
+                "task_goal": task["definition"]["goal"],
+                "source": {"id": source["id"], "title": source.get("title"), "url": source["url"]},
+                "source_notes": consolidation_input,
+            }, ensure_ascii=False)},
+        ])
+        state["dossier"] = dossier.strip()
+        state["status"] = "completed"
+        _atomic_json(path, state)
+        return state
 
 
 class ResearchDiscoveryExecutor:
@@ -150,10 +342,12 @@ class ResearchDiscoveryExecutor:
         manager: McpPluginManager,
         data_directory: Path,
         classify_references: ReferenceClassifier | None = None,
+        source_processor: ResearchSourceProcessor | None = None,
     ) -> None:
         self.manager = manager
         self.data_directory = data_directory
         self.classify_references = classify_references
+        self.source_processor = source_processor
 
     async def _call(self, native_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         tool = next(
@@ -165,6 +359,39 @@ class ResearchDiscoveryExecutor:
     def _paths(self, task_id: str) -> tuple[Path, Path]:
         root = self.data_directory / "research" / task_id
         return root / "source-ledger.json", root / "sources"
+
+    @staticmethod
+    def _usable_source(url: str, content: str) -> bool:
+        host = (urlparse(url).hostname or "").lower()
+        if host == "wikipedia.org" or host.endswith(".wikipedia.org"):
+            return False
+        if host == "amazon.com" or host.endswith(".amazon.com"):
+            return False
+        normalized = " ".join(content.lower().split())
+        return bool(content.strip()) and not any(marker in normalized[:1000] for marker in (
+            "access denied", "captcha", "enable javascript to continue", "page not found",
+        ))
+
+    async def _fetch_complete(self, url: str, max_characters: int) -> tuple[str, bool]:
+        chunks: list[str] = []
+        start = 0
+        complete = False
+        chunk_size = min(30_000, max_characters)
+        while start < max_characters:
+            payload = _structured(await self._call("fetch_url", {
+                "url": url,
+                "start_index": start,
+                "max_length": min(chunk_size, max_characters - start),
+            }))
+            content = str(payload.get("content") or "")
+            if content:
+                chunks.append(content)
+            next_start = payload.get("next_start")
+            complete = payload.get("complete") is not False or not isinstance(next_start, int)
+            if complete or not content or next_start <= start:
+                break
+            start = next_start
+        return "\n\n".join(chunks), complete
 
     @staticmethod
     def _new_ledger(goal: str, config: dict[str, int]) -> dict[str, Any]:
@@ -252,6 +479,7 @@ class ResearchDiscoveryExecutor:
 
     async def _fetch_depth(
         self,
+        task: dict[str, Any],
         ledger: dict[str, Any],
         sources_dir: Path,
         ledger_path: Path,
@@ -265,24 +493,28 @@ class ResearchDiscoveryExecutor:
             if item["depth"] == depth and item["status"] != "dropped"
         ]:
             try:
-                if source["status"] == "fetched":
+                if source.get("content_file"):
                     content = (sources_dir / source["content_file"]).read_text(encoding="utf-8")
                 else:
                     source["fetch_attempts"] = int(source.get("fetch_attempts") or 0) + 1
-                    payload = _structured(await self._call("fetch_url", {
-                        "url": source["url"],
-                        "start_index": 0,
-                        "max_length": max_characters,
-                    }))
-                    content = str(payload.get("content") or "")
-                    if not content.strip():
-                        raise ValueError("The source returned no readable text.")
+                    content, complete = await self._fetch_complete(source["url"], max_characters)
+                    if not self._usable_source(source["url"], content):
+                        raise ValueError("The source was unreachable, non-scholarly, or returned no readable text.")
                     sources_dir.mkdir(parents=True, exist_ok=True)
                     content_path = sources_dir / f"{source['id']}.md"
                     content_path.write_text(content, encoding="utf-8")
                     source["status"] = "fetched"
                     source["content_file"] = content_path.name
                     source["characters"] = len(content)
+                    source["fetch_complete"] = complete
+                if self.source_processor is not None and source.get("status") != "analyzed":
+                    analysis = await self.source_processor.process(task, source, content)
+                    source["analysis_file"] = str(
+                        self.source_processor._path(str(task["id"]), source["id"]).relative_to(self.data_directory)
+                    )
+                    source["analysis_mode"] = analysis["mode"]
+                    source["content_tokens"] = analysis["token_count"]
+                    source["status"] = "analyzed"
                 references = extract_reference_candidates(content, source["url"])
                 source["references_found"] = len(references)
                 for candidate in references[:reference_cap]:
@@ -292,8 +524,16 @@ class ResearchDiscoveryExecutor:
                     if source["id"] not in parents:
                         parents.append(source["id"])
             except Exception as exc:
-                source["status"] = "failed"
+                if source.get("content_file"):
+                    source["status"] = "fetched"
+                elif int(source.get("fetch_attempts") or 0) >= 2:
+                    source["status"] = "dropped"
+                else:
+                    source["status"] = "failed"
                 source["error"] = f"{type(exc).__name__}: {exc}"[:1000]
+                _atomic_json(ledger_path, ledger)
+                if source.get("content_file"):
+                    raise
             _atomic_json(ledger_path, ledger)
         return list(candidates.values())
 
@@ -418,7 +658,7 @@ class ResearchDiscoveryExecutor:
             "depth_passes": int(metadata.get("research_depth_passes") or 3),
             "max_sources": int(metadata.get("research_max_sources") or 80),
             "references_per_source": int(metadata.get("research_references_per_source") or 12),
-            "source_max_characters": int(metadata.get("research_source_max_characters") or 30000),
+            "source_max_characters": int(metadata.get("research_source_max_characters") or 160000),
         }
         ledger_path, sources_dir = self._paths(str(task["id"]))
         try:
@@ -452,13 +692,24 @@ class ResearchDiscoveryExecutor:
             if depth in existing_depths:
                 continue
             candidates = await self._fetch_depth(
-                ledger, sources_dir, ledger_path, depth, config["references_per_source"],
+                task, ledger, sources_dir, ledger_path, depth, config["references_per_source"],
                 config["source_max_characters"]
             )
+            pending_fetches = [
+                source for source in ledger["sources"]
+                if source["depth"] == depth and source.get("status") == "failed"
+            ]
+            if pending_fetches:
+                return WorkItemOutcome(
+                    outcome="retry",
+                    summary=(f"{len(pending_fetches)} selected source(s) could not be read on the first attempt; "
+                             "their failures were checkpointed for one retry before replacement or exclusion."),
+                    wait_seconds=30,
+                )
             if depth == 0:
                 readable_seeds = [
                     source for source in ledger["sources"]
-                    if source["depth"] == 0 and source["status"] == "fetched"
+                    if source["depth"] == 0 and source["status"] in {"fetched", "analyzed"}
                 ]
                 if len(readable_seeds) < config["seed_sources"]:
                     for source in ledger["sources"]:
@@ -474,7 +725,8 @@ class ResearchDiscoveryExecutor:
                         wait_seconds=30,
                     )
             novel = [candidate for candidate in candidates if not candidate["url"] or candidate["url"] not in known]
-            capacity = max(0, config["max_sources"] - len(ledger["sources"]))
+            active_sources = sum(source.get("status") != "dropped" for source in ledger["sources"])
+            capacity = max(0, config["max_sources"] - active_sources)
             selected_ids = (
                 await self._relevant(ledger["goal"], novel)
                 if depth < config["depth_passes"] and capacity > 0 else set()
@@ -508,7 +760,7 @@ class ResearchDiscoveryExecutor:
             if depth >= config["depth_passes"]:
                 ledger["stop_reason"] = "depth_limit_reached"
                 break
-            if len(ledger["sources"]) >= config["max_sources"]:
+            if active_sources + len(accepted) >= config["max_sources"]:
                 queued_deeper = any(
                     source["depth"] > depth and source["status"] in {"queued", "failed"}
                     for source in ledger["sources"]
@@ -522,7 +774,7 @@ class ResearchDiscoveryExecutor:
                 break
 
         _atomic_json(ledger_path, ledger)
-        fetched = [source for source in ledger["sources"] if source["status"] == "fetched"]
+        fetched = [source for source in ledger["sources"] if source["status"] in {"fetched", "analyzed"}]
         if len([source for source in fetched if source["depth"] == 0]) < config["seed_sources"]:
             return WorkItemOutcome(
                 outcome="retry",

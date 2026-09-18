@@ -9,8 +9,10 @@ from local_model_app.research_pipeline import (
     CandidateSelection,
     ResearchDiscoveryExecutor,
     ResearchNotesExecutor,
+    ResearchSourceProcessor,
     canonical_url,
     extract_reference_candidates,
+    split_source_sections,
 )
 
 
@@ -46,6 +48,127 @@ class FakeResearchManager:
 
 
 class ResearchPipelineTests(unittest.TestCase):
+    def test_long_source_sections_are_bounded_and_preserve_text(self):
+        text = "# Intro\n\n" + " ".join(f"word{i}" for i in range(1300))
+        sections = split_source_sections(text, lambda value: len(value.split()), 512)
+        self.assertGreaterEqual(len(sections), 3)
+        self.assertTrue(all(len(section["content"].split()) <= 512 for section in sections))
+        self.assertIn("word1299", sections[-1]["content"])
+
+    def test_source_processor_uses_whole_or_section_mode_and_resumes(self):
+        section_calls = []
+        dossier_calls = []
+
+        async def analyze(messages):
+            payload = json.loads(messages[-1]["content"])
+            section_calls.append(payload["segment"]["label"])
+            return f"notes for {payload['segment']['label']} https://papers.test/a"
+
+        async def dossier(messages):
+            dossier_calls.append(messages[-1]["content"])
+            return "source dossier https://papers.test/a"
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            processor = ResearchSourceProcessor(analyze, dossier, lambda value: len(value.split()), root)
+            source = {"id": "a", "title": "A", "url": "https://papers.test/a", "depth": 0}
+            task = {"id": "task-source", "definition": {"goal": "memory", "metadata": {
+                "research_whole_source_max_tokens": 512,
+                "research_section_input_tokens": 512,
+            }}}
+            content = "# Intro\n\n" + " ".join(f"word{i}" for i in range(1200))
+            first = asyncio.run(processor.process(task, source, content))
+            call_count = len(section_calls) + len(dossier_calls)
+            second = asyncio.run(processor.process(task, source, content))
+
+        self.assertEqual(first["mode"], "sections")
+        self.assertEqual(first["status"], "completed")
+        self.assertGreaterEqual(len(first["sections"]), 3)
+        self.assertEqual(second["dossier"], first["dossier"])
+        self.assertEqual(len(section_calls) + len(dossier_calls), call_count)
+
+    def test_discovery_fetches_a_long_source_in_exact_url_chunks(self):
+        url = "https://papers.test/long"
+        document = "A" * 65_000
+
+        class ChunkManager(FakeResearchManager):
+            async def call_tool(self, exposed_name, arguments):
+                self.calls.append((exposed_name, arguments))
+                if exposed_name == "web__search_web":
+                    return {"structuredContent": {"results": self.seeds}}
+                start = int(arguments.get("start_index") or 0)
+                length = int(arguments.get("max_length") or 30_000)
+                end = min(len(document), start + length)
+                return {"structuredContent": {
+                    "url": url,
+                    "content": document[start:end],
+                    "complete": end >= len(document),
+                    "next_start": end if end < len(document) else None,
+                }}
+
+        async def keep_all(goal, candidates):
+            return CandidateSelection(
+                keep_numbers={candidate["number"] for candidate in candidates},
+                needs_abstract_numbers=set(),
+            )
+
+        manager = ChunkManager([{"title": "Long paper", "href": url, "body": "memory"}], {url: document})
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            executor = ResearchDiscoveryExecutor(manager, root, keep_all)
+            task = {"id": "task-chunks", "definition": {"goal": "memory", "metadata": {
+                "research_seed_sources": 1,
+                "research_depth_passes": 0,
+                "research_source_max_characters": 80_000,
+            }}}
+            outcome = asyncio.run(executor.execute_work_item(task, {}, []))
+            saved = (root / "research" / "task-chunks" / "sources").glob("*.md")
+            content = next(saved).read_text(encoding="utf-8")
+
+        fetch_calls = [args for name, args in manager.calls if name == "web__fetch_url"]
+        self.assertEqual(outcome.outcome, "completed")
+        self.assertEqual([call["start_index"] for call in fetch_calls], [0, 30000, 60000])
+        self.assertGreaterEqual(len(content), len(document))
+
+    def test_unusable_seed_is_dropped_and_refilled(self):
+        bad = "https://en.wikipedia.org/wiki/Memory"
+        good = "https://papers.test/replacement"
+
+        class RefillManager(FakeResearchManager):
+            async def call_tool(self, exposed_name, arguments):
+                self.calls.append((exposed_name, arguments))
+                if exposed_name == "web__search_web":
+                    page = int(arguments.get("page") or 1)
+                    row = ({"title": "Memory", "href": bad, "body": "memory"} if page == 1 else
+                           {"title": "Replacement paper", "href": good, "body": "memory"})
+                    return {"structuredContent": {"results": [row]}}
+                content = "encyclopedia" if arguments["url"] == bad else "Scholarly paper with no references."
+                return {"structuredContent": {"url": arguments["url"], "content": content, "complete": True}}
+
+        async def keep_all(goal, candidates):
+            return CandidateSelection(
+                keep_numbers={candidate["number"] for candidate in candidates},
+                needs_abstract_numbers=set(),
+            )
+
+        manager = RefillManager([], {})
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            executor = ResearchDiscoveryExecutor(manager, root, keep_all)
+            task = {"id": "task-refill", "definition": {"goal": "memory", "metadata": {
+                "research_seed_sources": 1, "research_depth_passes": 0,
+            }}}
+            first = asyncio.run(executor.execute_work_item(task, {}, []))
+            second = asyncio.run(executor.execute_work_item(task, {}, []))
+            third = asyncio.run(executor.execute_work_item(task, {}, []))
+            ledger = json.loads((root / "research" / "task-refill" / "source-ledger.json").read_text())
+
+        self.assertEqual(first.outcome, "retry")
+        self.assertEqual(second.outcome, "retry")
+        self.assertEqual(third.outcome, "completed")
+        self.assertEqual(next(source for source in ledger["sources"] if source["url"] == bad)["status"], "dropped")
+        self.assertEqual(next(source for source in ledger["sources"] if source["url"] == good)["status"], "fetched")
+
     def test_canonical_url_removes_tracking_and_fragment(self):
         self.assertEqual(
             canonical_url("https://EXAMPLE.com/paper/?utm_source=x&id=2#results"),

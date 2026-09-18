@@ -142,7 +142,8 @@
             <label>Report section<input id="section-tokens" type="number" min="1" max="262144" /><small>Writes one bounded section of a long report.</small></label>
             <label>Final synthesis<input id="synthesis-tokens" type="number" min="1" max="262144" /><small>Writes the final durable-task deliverable.</small></label>
             <label>Reference relevance<input id="research-classifier-tokens" type="number" min="1" max="262144" /><small>Filters one batch of cited references.</small></label>
-            <label>Source-note batch<input id="research-notes-tokens" type="number" min="1" max="262144" /><small>Extracts reusable evidence from a bounded source batch.</small></label>
+            <label>Source section notes<input id="research-notes-tokens" type="number" min="1" max="262144" /><small>Analyzes one bounded section of one source.</small></label>
+            <label>Source dossier<input id="research-source-dossier-tokens" type="number" min="1" max="262144" /><small>Consolidates one paper's section notes.</small></label>
           </div>
           <h3>Research traversal</h3>
           <p class="settings-explanation">The host enforces this breadth-first citation crawl; these are task limits, not model suggestions.</p>
@@ -151,7 +152,9 @@
             <label>Depth passes<input id="research-depth-passes" type="number" min="0" max="10" /><small>Reference-expansion passes after the seed set.</small></label>
             <label>Total source cap<input id="research-max-sources" type="number" min="1" max="1000" /><small>Safety bound; not a completion target.</small></label>
             <label>References per source<input id="research-references-per-source" type="number" min="1" max="100" /><small>Maximum candidates admitted from each source.</small></label>
-            <label>Sources per note batch<input id="research-notes-batch-size" type="number" min="1" max="50" /><small>Balances repeated prompts against CPU/context cost.</small></label>
+            <label>Whole-source threshold<input id="research-whole-source-tokens" type="number" min="512" max="4194304" /><small>Analyze a paper in one pass only below this token count.</small></label>
+            <label>Section input ceiling<input id="research-section-input-tokens" type="number" min="512" max="4194304" /><small>Maximum source text in each resumable analysis pass.</small></label>
+            <label>Source character cap<input id="research-source-max-characters" type="number" min="1000" max="10000000" /><small>Maximum fetched text retained per source.</small></label>
           </div>
         </section>
 

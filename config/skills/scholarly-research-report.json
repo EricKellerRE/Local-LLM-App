@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "scholarly-research-report",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "Scholarly research report",
   "description": "Discover, expand, analyze, draft, audit, and export a source-traceable scholarly report.",
   "trigger": {
@@ -52,22 +52,13 @@
   },
   "work_items": [
     {
-      "key": "source-discovery",
+      "key": "source-corpus",
       "kind": "research_discovery",
-      "title": "Build and expand the source graph",
-      "instructions": "Research {topic}. Search paginated result lists and have the model select relevant item numbers only; the host maps those numbers to untouched URLs, deduplicates them, and persists the configured seed-source set. Then read those sources, extract and number their references, resolve selected novel references, and repeat breadth-first until the configured depth-pass limit, source cap, or a pass with no novel relevant references. Persist every search-page decision, URL, parent edge, and stop reason.",
-      "completion_check": "The configured seed count was read and every citation-expansion pass has persisted counts, exact URLs, parent links, and an objective stop reason.",
+      "title": "Build and analyze the source graph",
+      "instructions": "Research {topic}. Search paginated result lists and have the model select relevant item numbers only; the host maps those numbers to untouched URLs and deduplicates them. Fetch and validate one selected source at a time, refill unusable seed slots, analyze a short paper whole or checkpoint a long paper section by section, and consolidate a source-specific evidence dossier. Extract references deterministically, select novel relevant numbered references, and continue breadth-first until the depth limit, usable-source cap, or a pass with no novel relevant references. Persist every decision, source dossier, URL, parent edge, and stop reason.",
+      "completion_check": "The configured usable seed count and every admitted reference source have checkpointed source-specific evidence dossiers; every citation-expansion pass has exact URLs, parent links, counts, and an objective stop reason.",
       "priority": 20,
       "depends_on": []
-    },
-    {
-      "key": "source-notes",
-      "kind": "research_notes",
-      "title": "Extract reusable evidence from the source corpus",
-      "instructions": "Read every fetched source once in hardware-bounded batches. Preserve source-specific findings, mechanisms, methods, study systems, evidential strength, limitations, disagreements, and exact URLs as reusable notes for all report sections about {topic}.",
-      "completion_check": "Every readable source has persisted, source-specific evidence notes with its exact URL.",
-      "priority": 15,
-      "depends_on": ["source-discovery"]
     },
     {
       "key": "section-executive",
@@ -76,7 +67,7 @@
       "instructions": "Write the opening section of the report on {topic}. State the central conclusions, define the scope, explain the evidence-selection method, and preview the integrated account. Use connected prose and cite exact source URLs beside material claims. Write 600-900 words.",
       "completion_check": "At least 600 substantive words with conclusions, scope, method, and source URLs.",
       "priority": 8,
-      "depends_on": ["source-notes"]
+      "depends_on": ["source-corpus"]
     },
     {
       "key": "section-foundations-mechanisms",
@@ -85,7 +76,7 @@
       "instructions": "Write a detailed section on the foundations, principal theories, and proposed mechanisms of {topic}. Define important concepts, connect rather than merely list mechanisms, distinguish necessity, sufficiency, association, and inference, and state the applicable scale, population, system, and timescale. Explain important disagreements and cite exact source URLs. Write 1,200-1,800 words.",
       "completion_check": "At least 1,200 substantive words with conceptual and mechanistic explanation and exact source URLs.",
       "priority": 7,
-      "depends_on": ["source-notes"]
+      "depends_on": ["source-corpus"]
     },
     {
       "key": "section-evidence-contexts",
@@ -94,7 +85,7 @@
       "instructions": "Write a detailed section comparing the strongest evidence about {topic} across relevant scales, populations, systems, environments, and study contexts. Connect findings across levels, identify boundary conditions and generalization limits, and distinguish causal, quasi-experimental, observational, and theoretical evidence. Cite exact source URLs. Write 1,000-1,600 words.",
       "completion_check": "At least 1,000 substantive words comparing evidence across relevant contexts with URLs.",
       "priority": 7,
-      "depends_on": ["source-notes"]
+      "depends_on": ["source-corpus"]
     },
     {
       "key": "section-process-change",
@@ -103,7 +94,7 @@
       "instructions": "Write a detailed process-oriented or chronological section about {topic}. Distinguish the relevant stages, transitions, feedbacks, maintenance conditions, failure modes, adaptation, and long-term change. State boundary conditions and timescales and identify contested terminology or evidence. Cite exact URLs. Write 1,000-1,600 words.",
       "completion_check": "At least 1,000 substantive words clearly distinguishing relevant processes and timescales with URLs.",
       "priority": 7,
-      "depends_on": ["source-notes"]
+      "depends_on": ["source-corpus"]
     },
     {
       "key": "section-methods",
@@ -112,7 +103,7 @@
       "instructions": "Write a comparative methods section for {topic}. Explain what the major experimental and observational techniques can establish, their resolution, confounds, causal reach, and generalization limits. Include a compact comparison table where useful and cite exact URLs. Write 900-1,400 words.",
       "completion_check": "At least 900 substantive words comparing methods, causal reach, limitations, and URLs.",
       "priority": 6,
-      "depends_on": ["source-notes"]
+      "depends_on": ["source-corpus"]
     },
     {
       "key": "section-disagreements-gaps",
@@ -121,7 +112,7 @@
       "instructions": "Write a critical section on competing explanations, replication and translation problems, measurement limits, unresolved links, and high-value open questions for {topic}. Identify evidence that would discriminate between alternatives. Separate sourced findings from synthesis and cite exact URLs. Write 900-1,400 words.",
       "completion_check": "At least 900 substantive words naming concrete disagreements, limitations, gaps, and URLs.",
       "priority": 6,
-      "depends_on": ["source-notes"]
+      "depends_on": ["source-corpus"]
     },
     {
       "key": "section-conclusions",
@@ -130,7 +121,7 @@
       "instructions": "Write the concluding section for {topic}. Integrate evidence across levels, state the strongest supported conclusions and their limits, identify useful experimental designs for closing the major gaps, and avoid merely repeating the executive summary. Cite exact URLs for source-dependent claims. Write 700-1,100 words.",
       "completion_check": "At least 700 substantive words with integrated conclusions, limitations, next steps, and URLs.",
       "priority": 5,
-      "depends_on": ["source-notes"]
+      "depends_on": ["source-corpus"]
     },
     {
       "key": "synthesis",
@@ -153,7 +144,6 @@
   "audit": {
     "required_completed": {
       "research_discovery": 1,
-      "research_notes": 1,
       "section": 7,
       "synthesis": 1
     },
