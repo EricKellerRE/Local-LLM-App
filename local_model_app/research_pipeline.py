@@ -22,6 +22,8 @@ class CandidateSelection:
 ReferenceClassifier = Callable[[str, list[dict[str, Any]]], Awaitable[CandidateSelection]]
 AsyncGenerator = Callable[[list[dict[str, Any]]], Awaitable[str]]
 TokenCounter = Callable[[str], int]
+MIN_SOURCE_CHARACTERS = 600
+MIN_SOURCE_WORDS = 100
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\]\[\"']+", re.IGNORECASE)
 MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]{1,500})\]\((https?://[^\s)]+(?:\([^)]*\)[^\s)]*)?)\)", re.IGNORECASE)
@@ -38,6 +40,10 @@ STOP_WORDS = {
     "then", "there", "these", "they", "this", "those", "through", "under", "using", "what", "when",
     "where", "which", "while", "with", "would", "your", "report", "research", "topic",
 }
+
+
+class SourceRejectedError(ValueError):
+    """The fetched response is deterministically unusable as research evidence."""
 
 
 def canonical_url(url: str, base_url: str | None = None) -> str:
@@ -361,16 +367,37 @@ class ResearchDiscoveryExecutor:
         return root / "source-ledger.json", root / "sources"
 
     @staticmethod
-    def _usable_source(url: str, content: str) -> bool:
+    def _source_rejection_reason(url: str, content: str) -> str | None:
         host = (urlparse(url).hostname or "").lower()
         if host == "wikipedia.org" or host.endswith(".wikipedia.org"):
-            return False
+            return "encyclopedia pages are not scholarly sources"
         if host == "amazon.com" or host.endswith(".amazon.com"):
-            return False
+            return "retail pages are not scholarly sources"
         normalized = " ".join(content.lower().split())
-        return bool(content.strip()) and not any(marker in normalized[:1000] for marker in (
-            "access denied", "captcha", "enable javascript to continue", "page not found",
-        ))
+        if not normalized:
+            return "the source returned no readable text"
+        boilerplate = (
+            "access denied",
+            "captcha",
+            "javascript is disabled",
+            "enable javascript to continue",
+            "enable javascript to proceed",
+            "please enable javascript",
+            "required part of this site couldn't load",
+            "required part of this site couldn’t load",
+            "checking your browser",
+            "verify you are human",
+            "page not found",
+        )
+        if any(marker in normalized[:2000] for marker in boilerplate):
+            return "the response is an access, JavaScript, or anti-bot interstitial"
+        word_count = len(re.findall(r"\b[\w'-]+\b", content))
+        if len(content) < MIN_SOURCE_CHARACTERS or word_count < MIN_SOURCE_WORDS:
+            return (
+                f"the response is too small to support source analysis "
+                f"({len(content)} characters, {word_count} words)"
+            )
+        return None
 
     async def _fetch_complete(self, url: str, max_characters: int) -> tuple[str, bool]:
         chunks: list[str] = []
@@ -498,8 +525,9 @@ class ResearchDiscoveryExecutor:
                 else:
                     source["fetch_attempts"] = int(source.get("fetch_attempts") or 0) + 1
                     content, complete = await self._fetch_complete(source["url"], max_characters)
-                    if not self._usable_source(source["url"], content):
-                        raise ValueError("The source was unreachable, non-scholarly, or returned no readable text.")
+                    rejection_reason = self._source_rejection_reason(source["url"], content)
+                    if rejection_reason:
+                        raise SourceRejectedError(rejection_reason)
                     sources_dir.mkdir(parents=True, exist_ok=True)
                     content_path = sources_dir / f"{source['id']}.md"
                     content_path.write_text(content, encoding="utf-8")
@@ -526,6 +554,8 @@ class ResearchDiscoveryExecutor:
             except Exception as exc:
                 if source.get("content_file"):
                     source["status"] = "fetched"
+                elif isinstance(exc, SourceRejectedError):
+                    source["status"] = "dropped"
                 elif int(source.get("fetch_attempts") or 0) >= 2:
                     source["status"] = "dropped"
                 else:

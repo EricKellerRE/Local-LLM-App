@@ -40,14 +40,37 @@ class FakeResearchManager:
             return {"structuredContent": {"results": self.seeds}}
         if exposed_name == "web__fetch_scholarly_metadata":
             return {"structuredContent": self.metadata.get(arguments["url"], {})}
+        content = self.pages[arguments["url"]]
+        if len(content.split()) < 120:
+            content += "\n\n" + " ".join(["substantive research evidence"] * 120)
         return {"structuredContent": {
             "url": arguments["url"],
-            "content": self.pages[arguments["url"]],
+            "content": content,
             "complete": True,
         }}
 
 
 class ResearchPipelineTests(unittest.TestCase):
+    def test_source_quality_gate_rejects_interstitials_and_undersized_text(self):
+        interstitial = """JavaScript is disabled in your browser.
+Please enable JavaScript to proceed. A required part of this site couldn’t load."""
+        self.assertIn(
+            "interstitial",
+            ResearchDiscoveryExecutor._source_rejection_reason(
+                "https://www.nature.com/articles/example", interstitial
+            ),
+        )
+        self.assertIn(
+            "too small",
+            ResearchDiscoveryExecutor._source_rejection_reason(
+                "https://journal.test/paper", "A short publisher message without usable evidence."
+            ),
+        )
+        substantive = " ".join(["memory mechanism evidence"] * 120)
+        self.assertIsNone(ResearchDiscoveryExecutor._source_rejection_reason(
+            "https://journal.test/paper", substantive
+        ))
+
     def test_long_source_sections_are_bounded_and_preserve_text(self):
         text = "# Intro\n\n" + " ".join(f"word{i}" for i in range(1300))
         sections = split_source_sections(text, lambda value: len(value.split()), 512)
@@ -89,7 +112,7 @@ class ResearchPipelineTests(unittest.TestCase):
 
     def test_discovery_fetches_a_long_source_in_exact_url_chunks(self):
         url = "https://papers.test/long"
-        document = "A" * 65_000
+        document = ("memory mechanism evidence supports consolidation and maintenance. " * 1400)[:65_000]
 
         class ChunkManager(FakeResearchManager):
             async def call_tool(self, exposed_name, arguments):
@@ -131,7 +154,7 @@ class ResearchPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(len(content), len(document))
 
     def test_unusable_seed_is_dropped_and_refilled(self):
-        bad = "https://en.wikipedia.org/wiki/Memory"
+        bad = "https://www.nature.com/articles/blocked"
         good = "https://papers.test/replacement"
 
         class RefillManager(FakeResearchManager):
@@ -142,7 +165,11 @@ class ResearchPipelineTests(unittest.TestCase):
                     row = ({"title": "Memory", "href": bad, "body": "memory"} if page == 1 else
                            {"title": "Replacement paper", "href": good, "body": "memory"})
                     return {"structuredContent": {"results": [row]}}
-                content = "encyclopedia" if arguments["url"] == bad else "Scholarly paper with no references."
+                content = (
+                    "JavaScript is disabled in your browser. Please enable JavaScript to proceed. "
+                    "A required part of this site couldn’t load." if arguments["url"] == bad else
+                    " ".join(["scholarly memory mechanism evidence"] * 120)
+                )
                 return {"structuredContent": {"url": arguments["url"], "content": content, "complete": True}}
 
         async def keep_all(goal, candidates):
@@ -160,12 +187,10 @@ class ResearchPipelineTests(unittest.TestCase):
             }}}
             first = asyncio.run(executor.execute_work_item(task, {}, []))
             second = asyncio.run(executor.execute_work_item(task, {}, []))
-            third = asyncio.run(executor.execute_work_item(task, {}, []))
             ledger = json.loads((root / "research" / "task-refill" / "source-ledger.json").read_text())
 
         self.assertEqual(first.outcome, "retry")
-        self.assertEqual(second.outcome, "retry")
-        self.assertEqual(third.outcome, "completed")
+        self.assertEqual(second.outcome, "completed")
         self.assertEqual(next(source for source in ledger["sources"] if source["url"] == bad)["status"], "dropped")
         self.assertEqual(next(source for source in ledger["sources"] if source["url"] == good)["status"], "fetched")
 
