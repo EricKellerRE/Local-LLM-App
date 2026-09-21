@@ -348,9 +348,11 @@ class Runtime:
                 [
                     {"role": "system", "content": (
                         "Select citation candidates that are substantively relevant to the research goal. Favor "
-                        "primary studies and authoritative reviews; reject encyclopedias, retail pages, popular blogs, "
-                        "news items, navigation, author profiles, unrelated citations, and duplicate editions unless "
-                        "the goal explicitly calls for those source types. Use needs_abstract_numbers only when the title and supplied "
+                        "candidates labelled core evidence. A candidate labelled supplemental may be kept when it is "
+                        "relevant for orientation or useful reference leads, but it is not core evidence. Reject candidates "
+                        "labelled disallowed, plus navigation, author profiles, unrelated citations, and duplicate editions. "
+                        "Treat the host-supplied source_type_hint and evidence_role as task policy, not suggestions. "
+                        "Use needs_abstract_numbers only when the title and supplied "
                         "snippet/citation context are genuinely insufficient. When an abstract field is present, make "
                         "a final keep/reject decision instead. Return only list numbers, never URLs or titles. Return "
                         "only JSON: {\"keep_numbers\": [integer], \"needs_abstract_numbers\": [integer]}."

@@ -11,7 +11,9 @@ from local_model_app.research_pipeline import (
     ResearchNotesExecutor,
     ResearchSourceProcessor,
     canonical_url,
+    evidence_role,
     extract_reference_candidates,
+    source_type_hint,
     split_source_sections,
 )
 
@@ -51,6 +53,82 @@ class FakeResearchManager:
 
 
 class ResearchPipelineTests(unittest.TestCase):
+    def test_source_type_hints_separate_document_role_from_relevance(self):
+        policy = {
+            "core_types": ["scholarly_article", "scholarly_candidate"],
+            "supplemental_types": ["tertiary_overview", "reference_work"],
+            "disallowed_types": ["topic_index", "retail"],
+            "unknown_role": "needs_metadata",
+        }
+        self.assertEqual(source_type_hint({
+            "url": "https://www.ebsco.com/research-starters/health/physiology",
+            "title": "Physiology of memory - EBSCO",
+        }), "tertiary_overview")
+        self.assertEqual(source_type_hint({
+            "url": "https://www.nature.com/subjects/long-term-memory/neuro",
+            "title": "Long-term memory",
+        }), "topic_index")
+        self.assertEqual(source_type_hint({
+            "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC123",
+            "title": "Memory mechanisms",
+        }), "scholarly_candidate")
+        self.assertEqual(evidence_role("tertiary_overview", policy), "supplemental")
+        self.assertEqual(evidence_role("topic_index", policy), "disallowed")
+
+    def test_supplemental_seed_is_processed_for_leads_but_does_not_fill_core_quota(self):
+        tertiary = "https://www.ebsco.com/research-starters/health/physiology"
+        article = "https://journal.test/article/memory"
+        manager = FakeResearchManager(
+            [
+                {"title": "Physiology of memory - EBSCO", "href": tertiary, "body": "Memory overview."},
+                {"title": "Memory mechanism study", "href": article, "body": "Molecular memory evidence."},
+            ],
+            {
+                tertiary: "# RESEARCH STARTER\n\n" + " ".join(["general memory overview"] * 120),
+                article: "# Abstract\n\n" + " ".join(["experimental memory evidence"] * 120),
+            },
+            {article: {
+                "title": "Memory mechanism study", "authors": ["A. Scientist"],
+                "year": 2025, "venue": "Journal of Memory",
+            }},
+        )
+        seen_roles = []
+
+        async def keep_all(goal, candidates):
+            seen_roles.extend(candidate["evidence_role"] for candidate in candidates)
+            return CandidateSelection(
+                keep_numbers={candidate["number"] for candidate in candidates},
+                needs_abstract_numbers=set(),
+            )
+
+        policy = {
+            "core_types": ["scholarly_article", "scholarly_candidate"],
+            "supplemental_types": ["tertiary_overview", "reference_work"],
+            "disallowed_types": ["topic_index", "retail"],
+            "unknown_role": "needs_metadata",
+            "unresolved_role": "disallowed",
+            "max_supplemental_sources": 3,
+            "follow_supplemental_references": True,
+        }
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            executor = ResearchDiscoveryExecutor(manager, root, keep_all)
+            task = {"id": "task-policy", "definition": {"goal": "memory", "metadata": {
+                "research_seed_sources": 1, "research_depth_passes": 0, "source_policy": policy,
+            }}}
+            outcome = asyncio.run(executor.execute_work_item(task, {}, []))
+            ledger = json.loads((root / "research" / "task-policy" / "source-ledger.json").read_text())
+
+        self.assertEqual(outcome.outcome, "completed", f"{outcome.summary}: {ledger}")
+        self.assertIn("supplemental", seen_roles)
+        self.assertIn("needs_metadata", seen_roles)
+        by_url = {source["url"]: source for source in ledger["sources"]}
+        self.assertEqual(by_url[tertiary]["status"], "supplemental")
+        self.assertEqual(by_url[tertiary]["evidence_role"], "supplemental")
+        self.assertEqual(by_url[article]["status"], "fetched")
+        self.assertEqual(by_url[article]["evidence_role"], "core")
+        self.assertIn("seed_sources=1", outcome.completion_evidence)
+
     def test_source_quality_gate_rejects_interstitials_and_undersized_text(self):
         interstitial = """JavaScript is disabled in your browser.
 Please enable JavaScript to proceed. A required part of this site couldn’t load."""

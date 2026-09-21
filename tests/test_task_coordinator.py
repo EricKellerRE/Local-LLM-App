@@ -81,7 +81,7 @@ class TaskCoordinatorTests(unittest.TestCase):
                 "mode": "durable_tools",
                 "plugin_ids": ["local.web-research"],
                 "workflow_skill_id": "scholarly-research-report",
-                "workflow_skill_version": "1.1.0",
+                "workflow_skill_version": "1.2.0",
                 "skill_inputs": {"topic": "long-term memory formation and maintenance"},
             },
         }}
@@ -107,7 +107,7 @@ class TaskCoordinatorTests(unittest.TestCase):
             "metadata": {
                 "plugin_ids": ["local.web-research"],
                 "workflow_skill_id": "scholarly-research-report",
-                "workflow_skill_version": "1.1.0",
+                "workflow_skill_version": "1.2.0",
                 "skill_inputs": {"topic": "memory"},
                 "report_min_words": 6000,
                 "report_min_sources": 12,
