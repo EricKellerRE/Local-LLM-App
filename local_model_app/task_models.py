@@ -78,12 +78,20 @@ class ProposedWorkItem(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
 
 
+class TaskArtifact(BaseModel):
+    name: str = Field(min_length=1)
+    relative_path: str = Field(min_length=1)
+    media_type: str = Field(min_length=1)
+    size_bytes: int = Field(ge=0)
+
+
 class WorkItemOutcome(BaseModel):
     outcome: Literal["completed", "retry", "waiting_for_input", "waiting_for_tools", "failed"]
     summary: str = Field(min_length=1)
     result: str = ""
     follow_up_items: list[ProposedWorkItem] = Field(default_factory=list)
     completion_evidence: list[str] = Field(default_factory=list)
+    artifacts: list[TaskArtifact] = Field(default_factory=list)
     wait_seconds: int | None = Field(default=None, ge=1)
 
 

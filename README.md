@@ -48,7 +48,9 @@ Chats, scratchpads, and activity records use `data/` by default. Models use `mod
 
 Ask for research, a literature review, an overnight report, or iterative project-tool work in an ordinary chat. The app turns that request into persisted evidence checkpoints, uses the selected tools, audits the requested outcome, and posts the final report back into the same chat. There is no eight-call or other fixed whole-task limit. The configurable tool-call value is a context-checkpoint interval: reaching it compacts the working context and execution continues automatically. The task stops only when it completes, genuinely needs user input or approval, is cancelled, or encounters an actual unrecoverable failure.
 
-Public-web research automatically uses the built-in search and chunked page reader. Long Grid Workshop operations use the MCP durable-task protocol, persist the Grid task ID before waiting, and resume polling that same operation after an app restart instead of launching a duplicate. Grid mutations and simulator runs still require explicit approval.
+Versioned workflow skills under `config/skills/` define reliable long-task methods. A skill declares its trigger, required tools, structured inputs, checkpoint graph, completion gates, and deliverables. The coordinator extracts only the subject-specific inputs from a request and instantiates the selected skill; it does not turn the user's entire instruction into a search query or improvise a known multi-stage method on every run. Requests without a matching skill still use the generic planner.
+
+Public-web research automatically uses the built-in search and chunked page reader. Each workflow carries an explicit source policy: core evidence satisfies the requested source target and supports report claims, supplemental material may supply orientation or reference leads without counting toward that target, and disallowed source types are excluded. The pipeline selects numbered search results with host-derived source-type hints, enriches missing scholarly metadata, validates and analyzes one core source at a time, refills unusable core slots, checkpoints long papers section by section, consolidates one evidence dossier per core source, and expands deduplicated references breadth-first. Short papers can use a whole-document pass; the thresholds and separate section-note/dossier budgets are exposed in Developer settings. Long Grid Workshop operations use the MCP durable-task protocol, persist the Grid task ID before waiting, and resume polling that same operation after an app restart instead of launching a duplicate. Grid mutations and simulator runs still require explicit approval.
 
 ## Optional: open at sign-in
 
@@ -112,6 +114,7 @@ For architecture and roadmap details, see [PROJECT.md](PROJECT.md). For plugin m
 ### Verification fixtures
 
 - `tests/` contains model-free unit and integration coverage.
+- `config/skills/` contains versioned durable-workflow skill manifests.
 - `evals/powerworld_routing_eval.py` measures PowerWorld tool-routing quality.
 - `scripts/powerworld_tool_smoke.py` runs a live read-only PowerWorld catalog smoke test.
 - `scripts/mcp_everything_smoke.py` checks interoperability with the official MCP Everything reference server.

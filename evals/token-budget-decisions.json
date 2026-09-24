@@ -1,0 +1,54 @@
+{
+  "recorded_at": "2026-09-17",
+  "model": "gemma-4-12B-it",
+  "repetitions_per_budget": 1,
+  "status": "conservative_defaults_selected_pending_three_repeat_confirmation",
+  "fixtures": {
+    "tool_long_url": {
+      "tested_passes": [1024, 384, 192, 128],
+      "observed_floor": 128,
+      "adopted_default": 192,
+      "failure_mode": null
+    },
+    "numbered_reference_relevance": {
+      "tested_passes": [512, 256, 192, 128],
+      "observed_floor": 128,
+      "adopted_default": 256,
+      "note": "Production schema includes keep_numbers and needs_abstract_numbers with staged metadata."
+    },
+    "source_notes": {
+      "tested_passes": [1536, 768, 512],
+      "observed_floor": 512,
+      "adopted_default": 768
+    },
+    "completed_tool_summary": {
+      "tested_passes": [2048, 768, 384, 256],
+      "observed_floor": 256,
+      "adopted_default": 256
+    },
+    "bounded_report_segment": {
+      "tested_passes": [1024, 768, 512],
+      "observed_floor": 512,
+      "adopted_default": 768,
+      "result": "313 words with two exact URLs plus causal-strength, limitation, and conclusion markers"
+    },
+    "monolithic_report_section": {
+      "tested_failures": [3072],
+      "result": "461 words and two URLs before a natural completed stop",
+      "resolution": "durably accumulate bounded nonredundant section segments"
+    },
+    "raw_model_chunk_continuation": {
+      "tested_failures": [2048],
+      "result": "model changed punctuation inside the exact URL",
+      "resolution": "host deterministically reuses the prior URL and next_start cursor"
+    }
+  },
+  "adopted_defaults": {
+    "tool_action_max_new_tokens": 192,
+    "post_tool_decision_max_new_tokens": 256,
+    "section_max_new_tokens": 768,
+    "research_classifier_max_new_tokens": 256,
+    "research_notes_max_new_tokens": 768,
+    "synthesis_max_new_tokens": 8192
+  }
+}

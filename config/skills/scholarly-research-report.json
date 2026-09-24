@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "id": "scholarly-research-report",
+  "version": "1.3.0",
+  "name": "Scholarly research report",
+  "description": "Discover, expand, analyze, draft, audit, and export a source-traceable scholarly report.",
+  "trigger": {
+    "plugin_ids_all": ["local.web-research"],
+    "request_terms_any": ["research", "literature", "papers", "sources", "scholarly"]
+  },
+  "inputs": {
+    "topic": {
+      "source": "request",
+      "transform": "research_topic",
+      "required": true
+    }
+  },
+  "title_template": "Scholarly research report: {topic}",
+  "goal_template": "{topic}",
+  "success_criteria": [
+    "The requested work is executed with persisted evidence rather than only described.",
+    "Every requested conclusion, technique, comparison, disagreement, limitation, and open gap is addressed.",
+    "Claims are traceable to exact source URLs and source-specific evidence notes.",
+    "The configured source target is satisfied by core scholarly evidence; supplemental sources are labelled and do not count toward that target.",
+    "The research report contains at least 6,000 substantive words organized into independently drafted sections.",
+    "A downloadable Word document is produced and preserved in app data."
+  ],
+  "deliverables": [
+    "A downloadable Word research document stored in app data.",
+    "A concise completion message and document link posted into the originating chat."
+  ],
+  "constraints": [
+    "Never invent sources, findings, methods, measurements, or completion evidence.",
+    "Checkpoint each bounded work item and resume after application restart.",
+    "Use numbered relevance decisions; the host retains and invokes exact URLs.",
+    "Label search snippets, citation contexts, page descriptions, and scholarly abstracts distinctly.",
+    "Apply the task source policy: core evidence supports report claims, supplemental material may supply orientation or reference leads, and disallowed material is excluded.",
+    "Pause for explicit approval or missing user input when required by tool policy."
+  ],
+  "execution": {
+    "deadline": null,
+    "max_steps_per_episode": 64,
+    "maximum_attempts": null,
+    "retry_initial_seconds": 30,
+    "retry_maximum_seconds": 3600,
+    "resume_after_restart": true
+  },
+  "metadata_defaults": {
+    "report_min_words": 6000,
+    "report_min_sources": 12,
+    "report_target_words": 8000,
+    "report_format": "docx",
+    "section_max_segments": 6,
+    "source_policy": {
+      "core_types": [
+        "primary_study",
+        "systematic_review",
+        "scholarly_review",
+        "authoritative_review",
+        "scholarly_article",
+        "scholarly_candidate"
+      ],
+      "supplemental_types": [
+        "reference_work",
+        "tertiary_overview"
+      ],
+      "disallowed_types": [
+        "retail",
+        "topic_index",
+        "popular_summary"
+      ],
+      "unknown_role": "needs_metadata",
+      "unresolved_role": "disallowed",
+      "max_supplemental_sources": 8,
+      "supplemental_counts_toward_target": false,
+      "follow_supplemental_references": true
+    }
+  },
+  "work_items": [
+    {
+      "key": "source-corpus",
+      "kind": "research_discovery",
+      "title": "Build and analyze the source graph",
+      "instructions": "Research {topic}. Apply the user's stated source requirements through the workflow source policy: core sources satisfy the evidence target and support report claims; supplemental material may provide orientation or reference leads but never satisfies the core quota; disallowed material is excluded. Search paginated result lists and have the model select relevant item numbers while independently recording document type, primary-source status, confidence, and descriptive qualifiers from the supplied metadata or abstract/snippet. The host maps numbers to untouched URLs, saves those model qualifiers, enriches missing metadata, and deduplicates sources. Fetch and validate one selected source at a time, replay the saved qualifiers for confirmation or revision against the fetched document, refill unusable core slots, analyze a short core paper whole or checkpoint a long core paper section by section, and consolidate a source-specific evidence dossier. Extract references deterministically, select and classify novel relevant numbered references, and continue breadth-first until the depth limit, usable core-source cap, or a pass with no novel relevant references. Persist every decision, assessment history, source role, dossier, URL, parent edge, and stop reason.",
+      "completion_check": "The configured usable core-source seed count and every admitted core reference source have checkpointed source-specific evidence dossiers; supplemental sources are labelled and excluded from the quota; every citation-expansion pass has exact URLs, parent links, counts, and an objective stop reason.",
+      "priority": 20,
+      "depends_on": []
+    },
+    {
+      "key": "section-executive",
+      "kind": "section",
+      "title": "Executive summary and scope",
+      "instructions": "Write the opening section of the report on {topic}. State the central conclusions, define the scope, explain the evidence-selection method, and preview the integrated account. Use connected prose and cite exact source URLs beside material claims. Write 600-900 words.",
+      "completion_check": "At least 600 substantive words with conclusions, scope, method, and source URLs.",
+      "priority": 8,
+      "depends_on": ["source-corpus"]
+    },
+    {
+      "key": "section-foundations-mechanisms",
+      "kind": "section",
+      "title": "Foundations theories and mechanisms",
+      "instructions": "Write a detailed section on the foundations, principal theories, and proposed mechanisms of {topic}. Define important concepts, connect rather than merely list mechanisms, distinguish necessity, sufficiency, association, and inference, and state the applicable scale, population, system, and timescale. Explain important disagreements and cite exact source URLs. Write 1,200-1,800 words.",
+      "completion_check": "At least 1,200 substantive words with conceptual and mechanistic explanation and exact source URLs.",
+      "priority": 7,
+      "depends_on": ["source-corpus"]
+    },
+    {
+      "key": "section-evidence-contexts",
+      "kind": "section",
+      "title": "Evidence across scales populations and contexts",
+      "instructions": "Write a detailed section comparing the strongest evidence about {topic} across relevant scales, populations, systems, environments, and study contexts. Connect findings across levels, identify boundary conditions and generalization limits, and distinguish causal, quasi-experimental, observational, and theoretical evidence. Cite exact source URLs. Write 1,000-1,600 words.",
+      "completion_check": "At least 1,000 substantive words comparing evidence across relevant contexts with URLs.",
+      "priority": 7,
+      "depends_on": ["source-corpus"]
+    },
+    {
+      "key": "section-process-change",
+      "kind": "section",
+      "title": "Processes development change and persistence",
+      "instructions": "Write a detailed process-oriented or chronological section about {topic}. Distinguish the relevant stages, transitions, feedbacks, maintenance conditions, failure modes, adaptation, and long-term change. State boundary conditions and timescales and identify contested terminology or evidence. Cite exact URLs. Write 1,000-1,600 words.",
+      "completion_check": "At least 1,000 substantive words clearly distinguishing relevant processes and timescales with URLs.",
+      "priority": 7,
+      "depends_on": ["source-corpus"]
+    },
+    {
+      "key": "section-methods",
+      "kind": "section",
+      "title": "Techniques and strength of evidence",
+      "instructions": "Write a comparative methods section for {topic}. Explain what the major experimental and observational techniques can establish, their resolution, confounds, causal reach, and generalization limits. Include a compact comparison table where useful and cite exact URLs. Write 900-1,400 words.",
+      "completion_check": "At least 900 substantive words comparing methods, causal reach, limitations, and URLs.",
+      "priority": 6,
+      "depends_on": ["source-corpus"]
+    },
+    {
+      "key": "section-disagreements-gaps",
+      "kind": "section",
+      "title": "Disagreements limitations and open research gaps",
+      "instructions": "Write a critical section on competing explanations, replication and translation problems, measurement limits, unresolved links, and high-value open questions for {topic}. Identify evidence that would discriminate between alternatives. Separate sourced findings from synthesis and cite exact URLs. Write 900-1,400 words.",
+      "completion_check": "At least 900 substantive words naming concrete disagreements, limitations, gaps, and URLs.",
+      "priority": 6,
+      "depends_on": ["source-corpus"]
+    },
+    {
+      "key": "section-conclusions",
+      "kind": "section",
+      "title": "Integrated conclusions and research agenda",
+      "instructions": "Write the concluding section for {topic}. Integrate evidence across levels, state the strongest supported conclusions and their limits, identify useful experimental designs for closing the major gaps, and avoid merely repeating the executive summary. Cite exact URLs for source-dependent claims. Write 700-1,100 words.",
+      "completion_check": "At least 700 substantive words with integrated conclusions, limitations, next steps, and URLs.",
+      "priority": 5,
+      "depends_on": ["source-corpus"]
+    },
+    {
+      "key": "synthesis",
+      "kind": "synthesis",
+      "title": "Assemble and export the complete research document",
+      "instructions": "Assemble every completed report section without compressing it, preserve exact inline source URLs, append a deduplicated source URL index, and export a readable Word document.",
+      "completion_check": "A traceable report of at least 6,000 words exists as a downloadable DOCX artifact.",
+      "priority": 0,
+      "depends_on": [
+        "section-executive",
+        "section-foundations-mechanisms",
+        "section-evidence-contexts",
+        "section-process-change",
+        "section-methods",
+        "section-disagreements-gaps",
+        "section-conclusions"
+      ]
+    }
+  ],
+  "audit": {
+    "required_completed": {
+      "research_discovery": 1,
+      "section": 7,
+      "synthesis": 1
+    },
+    "final_kind": "synthesis",
+    "minimum_evidence": [
+      {"name": "word_count", "metadata_key": "report_min_words", "default": 6000},
+      {"name": "source_url_count", "metadata_key": "report_min_sources", "default": 12}
+    ],
+    "required_artifact_media_types": [
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ]
+  }
+}

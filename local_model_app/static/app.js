@@ -21,6 +21,12 @@ async function api(path, options = {}) {
 function escapeHtml(text) {
   const node = document.createElement("div"); node.textContent = text ?? ""; return node.innerHTML;
 }
+function renderMessageContent(text) {
+  const escaped = escapeHtml(text);
+  return escaped
+    .replace(/\[([^\]]+)\]\((\/api\/tasks\/[a-zA-Z0-9-]+\/artifacts\/[a-zA-Z0-9._-]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/\n/g, "<br>");
+}
 function projectById(id) { return state.projects.find((project) => project.id === id) || null; }
 function setProjectLabel(id) {
   const project = projectById(id);
@@ -116,7 +122,7 @@ async function refreshOpenChat() {
   } catch (error) { console.warn("Could not refresh durable-task progress", error); }
 }
 function renderMessages(messages) {
-  el("messages").innerHTML = messages.map((message) => `<article class="message ${message.role}"><div class="bubble">${escapeHtml(message.content)}</div></article>`).join("");
+  el("messages").innerHTML = messages.map((message) => `<article class="message ${message.role}"><div class="bubble">${renderMessageContent(message.content)}</div></article>`).join("");
   el("messages").scrollTop = el("messages").scrollHeight;
 }
 
@@ -256,15 +262,61 @@ function updatePromptBudgetNote() {
   const prompt = effective - response;
   el("prompt-budget-note").textContent = prompt > 0 ? `Usable prompt capacity: ${prompt.toLocaleString()} tokens (${effective.toLocaleString()} context − ${response.toLocaleString()} reserved for generation).` : "Response budget must be smaller than the effective context window.";
 }
+function selectSettingsTab(name) {
+  document.querySelectorAll("[data-settings-tab]").forEach((button) => {
+    const selected = button.dataset.settingsTab === name;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", selected ? "true" : "false");
+  });
+  document.querySelectorAll("[data-settings-panel]").forEach((panel) => { panel.hidden = panel.dataset.settingsPanel !== name; });
+  if (name === "developer") loadGenerationTelemetry();
+}
+function resetTuningFields() {
+  el("task-planner-tokens").value = 1024;
+  el("work-item-planner-tokens").value = 192;
+  el("tool-action-tokens").value = 192;
+  el("post-tool-tokens").value = 256;
+  el("section-tokens").value = 768;
+  el("synthesis-tokens").value = el("max-tokens").value || 8192;
+  el("research-classifier-tokens").value = 256;
+  el("research-notes-tokens").value = 768;
+  el("research-source-dossier-tokens").value = 1536;
+  el("research-seed-sources").value = 12;
+  el("research-depth-passes").value = 3;
+  el("research-max-sources").value = 80;
+  el("research-references-per-source").value = 12;
+  el("research-whole-source-tokens").value = 8192;
+  el("research-section-input-tokens").value = 6144;
+  el("research-source-max-characters").value = 160000;
+  el("settings-status").textContent = "Tuning fields reset. Save settings to persist them.";
+}
+function renderGenerationTelemetry(payload) {
+  const records = payload.records || [];
+  el("telemetry-summary").textContent = records.length
+    ? `${records.length} recent generation${records.length === 1 ? "" : "s"} · ${payload.path}`
+    : `No generation telemetry recorded yet. Data will be written to ${payload.path}.`;
+  el("telemetry-rows").innerHTML = [...records].reverse().map((record) => {
+    const elapsed = record.elapsed_seconds == null ? "—" : `${Number(record.elapsed_seconds).toFixed(1)}s`;
+    const rate = record.tokens_per_second == null ? "—" : Number(record.tokens_per_second).toFixed(2);
+    return `<tr><td>${escapeHtml(record.generation_class || "unknown")}</td><td>${formatNumber(record.prompt_tokens)}</td><td>${formatNumber(record.generated_tokens)} / ${formatNumber(record.max_new_tokens)}</td><td>${escapeHtml(record.stop_reason || "—")}</td><td>${elapsed}</td><td>${rate}</td></tr>`;
+  }).join("") || '<tr><td colspan="6">No records</td></tr>';
+}
+async function loadGenerationTelemetry() {
+  el("refresh-telemetry").disabled = true;
+  try { renderGenerationTelemetry(await api("/api/developer/generations?limit=50")); }
+  catch (error) { el("telemetry-summary").textContent = error.message; }
+  finally { el("refresh-telemetry").disabled = false; }
+}
 async function openSettings() {
-  el("settings-status").textContent = "Loading…"; el("settings-dialog").showModal();
+  el("settings-status").textContent = "Loading…"; selectSettingsTab("general"); el("settings-dialog").showModal();
   try {
     const settings = await api("/api/settings");
-    const values = { "data-directory": settings.data_directory, "models-directory": settings.models_directory, "model-id": settings.model_id, "offload-directory": settings.offload_dir, "model-kind": settings.model_kind, "model-device": settings.device, "model-dtype": settings.dtype, "cpu-memory": settings.cpu_memory_gb ?? "", "context-window": settings.context_window ?? "", "max-tokens": settings.max_new_tokens, "reasoning-budget": settings.reasoning_budget ?? "", "max-tool-calls": settings.max_tool_calls_per_step, temperature: settings.temperature, "top-p": settings.top_p };
+    const values = { "data-directory": settings.data_directory, "models-directory": settings.models_directory, "model-id": settings.model_id, "offload-directory": settings.offload_dir, "model-kind": settings.model_kind, "model-device": settings.device, "model-dtype": settings.dtype, "cpu-memory": settings.cpu_memory_gb ?? "", "context-window": settings.context_window ?? "", "max-tokens": settings.max_new_tokens, "reasoning-budget": settings.reasoning_budget ?? "", "max-tool-calls": settings.max_tool_calls_per_step, temperature: settings.temperature, "top-p": settings.top_p, "task-planner-tokens": settings.task_planner_max_new_tokens, "work-item-planner-tokens": settings.work_item_planner_max_new_tokens, "tool-action-tokens": settings.tool_action_max_new_tokens, "post-tool-tokens": settings.post_tool_decision_max_new_tokens, "section-tokens": settings.section_max_new_tokens, "synthesis-tokens": settings.synthesis_max_new_tokens, "research-classifier-tokens": settings.research_classifier_max_new_tokens, "research-notes-tokens": settings.research_notes_max_new_tokens, "research-source-dossier-tokens": settings.research_source_dossier_max_new_tokens, "research-seed-sources": settings.research_seed_sources, "research-depth-passes": settings.research_depth_passes, "research-max-sources": settings.research_max_sources, "research-references-per-source": settings.research_references_per_source, "research-whole-source-tokens": settings.research_whole_source_max_tokens, "research-section-input-tokens": settings.research_section_input_tokens, "research-source-max-characters": settings.research_source_max_characters };
     Object.entries(values).forEach(([id, value]) => { el(id).value = value; }); el("trust-remote-code").checked = settings.trust_remote_code;
     const nativeContext = settings.detected_context_window;
     const effectiveContext = settings.effective_context_window;
     state.detectedContextWindow = nativeContext;
+    el("developer-model-summary").textContent = `${settings.model_id || "No model selected"} · ${settings.device} · ${settings.dtype} · effective context ${effectiveContext?.toLocaleString() || "unknown"}`;
     el("context-window-note").textContent = nativeContext ? `Detected model limit: ${nativeContext.toLocaleString()} tokens${effectiveContext && effectiveContext !== nativeContext ? ` · effective limit: ${effectiveContext.toLocaleString()}` : ""}.` : "The model's native context limit is detected after it loads.";
     updatePromptBudgetNote();
     el("installed-models").innerHTML = settings.installed_models.map((model) => `<option value="${escapeHtml(model.path)}">${escapeHtml(model.name)}</option>`).join(""); el("settings-status").textContent = "";
@@ -272,7 +324,7 @@ async function openSettings() {
 }
 async function saveSettings() {
   const numeric = (id) => el(id).value === "" ? null : Number(el(id).value);
-  const body = { data_directory: el("data-directory").value, models_directory: el("models-directory").value, model_id: el("model-id").value.trim(), offload_dir: el("offload-directory").value.trim(), model_kind: el("model-kind").value, device: el("model-device").value, dtype: el("model-dtype").value, cpu_memory_gb: numeric("cpu-memory"), context_window: numeric("context-window"), max_new_tokens: numeric("max-tokens"), reasoning_budget: numeric("reasoning-budget"), max_tool_calls_per_step: numeric("max-tool-calls"), temperature: numeric("temperature"), top_p: numeric("top-p"), trust_remote_code: el("trust-remote-code").checked };
+  const body = { data_directory: el("data-directory").value, models_directory: el("models-directory").value, model_id: el("model-id").value.trim(), offload_dir: el("offload-directory").value.trim(), model_kind: el("model-kind").value, device: el("model-device").value, dtype: el("model-dtype").value, cpu_memory_gb: numeric("cpu-memory"), context_window: numeric("context-window"), max_new_tokens: numeric("max-tokens"), reasoning_budget: numeric("reasoning-budget"), task_planner_max_new_tokens: numeric("task-planner-tokens"), work_item_planner_max_new_tokens: numeric("work-item-planner-tokens"), tool_action_max_new_tokens: numeric("tool-action-tokens"), post_tool_decision_max_new_tokens: numeric("post-tool-tokens"), section_max_new_tokens: numeric("section-tokens"), synthesis_max_new_tokens: numeric("synthesis-tokens"), research_classifier_max_new_tokens: numeric("research-classifier-tokens"), research_notes_max_new_tokens: numeric("research-notes-tokens"), research_source_dossier_max_new_tokens: numeric("research-source-dossier-tokens"), research_seed_sources: numeric("research-seed-sources"), research_depth_passes: numeric("research-depth-passes"), research_max_sources: numeric("research-max-sources"), research_references_per_source: numeric("research-references-per-source"), research_whole_source_max_tokens: numeric("research-whole-source-tokens"), research_section_input_tokens: numeric("research-section-input-tokens"), research_source_max_characters: numeric("research-source-max-characters"), max_tool_calls_per_step: numeric("max-tool-calls"), temperature: numeric("temperature"), top_p: numeric("top-p"), trust_remote_code: el("trust-remote-code").checked };
   el("save-settings").disabled = true;
   try { const result = await api("/api/settings", { method: "PUT", body: JSON.stringify(body) }); el("settings-status").textContent = result.restart_required ? "Saved. Restart Local Model to apply these changes." : "Settings are up to date."; }
   catch (error) { el("settings-status").textContent = error.message; } finally { el("save-settings").disabled = false; }
@@ -299,6 +351,7 @@ async function updateHealth() {
 el("new-chat").addEventListener("click", () => startBlankChat()); el("new-project").addEventListener("click", openProjectDialog); el("chat-project").addEventListener("click", openProjectChoice);
 el("close-project-dialog").addEventListener("click", () => el("project-dialog").close()); el("browse-project").addEventListener("click", () => chooseDirectory("project-path")); el("create-project").addEventListener("click", createProject); el("close-project-choice").addEventListener("click", () => el("project-choice-dialog").close());
 el("open-settings").addEventListener("click", openSettings); el("close-settings").addEventListener("click", () => el("settings-dialog").close()); el("save-settings").addEventListener("click", saveSettings); el("search-models").addEventListener("click", searchModels); el("hf-search").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); searchModels(); } });
+document.querySelectorAll("[data-settings-tab]").forEach((button) => button.addEventListener("click", () => selectSettingsTab(button.dataset.settingsTab))); el("refresh-telemetry").addEventListener("click", loadGenerationTelemetry); el("reset-tuning-defaults").addEventListener("click", resetTuningFields);
 el("context-window").addEventListener("input", updatePromptBudgetNote); el("max-tokens").addEventListener("input", updatePromptBudgetNote);
 document.querySelectorAll(".browse-directory").forEach((button) => button.addEventListener("click", () => chooseDirectory(button.dataset.target)));
 el("plugin-menu-button").addEventListener("click", async () => { const menu = el("plugin-menu"); menu.hidden = !menu.hidden; el("plugin-menu-button").classList.toggle("active", !menu.hidden); if (!menu.hidden) await loadPlugins(); });

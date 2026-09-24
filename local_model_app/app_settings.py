@@ -17,6 +17,22 @@ MODEL_ENV_KEYS = {
     "context_window": "LOCAL_MODEL_CONTEXT_WINDOW",
     "max_new_tokens": "LOCAL_MODEL_MAX_NEW_TOKENS",
     "reasoning_budget": "LOCAL_MODEL_REASONING_BUDGET",
+    "task_planner_max_new_tokens": "LOCAL_TASK_PLANNER_MAX_NEW_TOKENS",
+    "work_item_planner_max_new_tokens": "LOCAL_PLANNER_MAX_NEW_TOKENS",
+    "tool_action_max_new_tokens": "LOCAL_TOOL_ACTION_MAX_NEW_TOKENS",
+    "post_tool_decision_max_new_tokens": "LOCAL_POST_TOOL_DECISION_MAX_NEW_TOKENS",
+    "section_max_new_tokens": "LOCAL_SECTION_MAX_NEW_TOKENS",
+    "synthesis_max_new_tokens": "LOCAL_SYNTHESIS_MAX_NEW_TOKENS",
+    "research_classifier_max_new_tokens": "LOCAL_RESEARCH_CLASSIFIER_MAX_NEW_TOKENS",
+    "research_notes_max_new_tokens": "LOCAL_RESEARCH_NOTES_MAX_NEW_TOKENS",
+    "research_source_dossier_max_new_tokens": "LOCAL_RESEARCH_SOURCE_DOSSIER_MAX_NEW_TOKENS",
+    "research_whole_source_max_tokens": "LOCAL_RESEARCH_WHOLE_SOURCE_MAX_TOKENS",
+    "research_section_input_tokens": "LOCAL_RESEARCH_SECTION_INPUT_TOKENS",
+    "research_source_max_characters": "LOCAL_RESEARCH_SOURCE_MAX_CHARACTERS",
+    "research_seed_sources": "LOCAL_RESEARCH_SEED_SOURCES",
+    "research_depth_passes": "LOCAL_RESEARCH_DEPTH_PASSES",
+    "research_max_sources": "LOCAL_RESEARCH_MAX_SOURCES",
+    "research_references_per_source": "LOCAL_RESEARCH_REFERENCES_PER_SOURCE",
     "max_tool_calls_per_step": "LOCAL_MAX_TOOL_CALLS_PER_STEP",
     "temperature": "LOCAL_MODEL_TEMPERATURE",
     "top_p": "LOCAL_MODEL_TOP_P",
@@ -72,6 +88,22 @@ class AppSettingsStore:
             "context_window": None,
             "max_new_tokens": 8192,
             "reasoning_budget": None,
+            "task_planner_max_new_tokens": 1024,
+            "work_item_planner_max_new_tokens": 192,
+            "tool_action_max_new_tokens": 192,
+            "post_tool_decision_max_new_tokens": 256,
+            "section_max_new_tokens": 768,
+            "synthesis_max_new_tokens": 8192,
+            "research_classifier_max_new_tokens": 256,
+            "research_notes_max_new_tokens": 768,
+            "research_source_dossier_max_new_tokens": 1536,
+            "research_whole_source_max_tokens": 8192,
+            "research_section_input_tokens": 6144,
+            "research_source_max_characters": 160000,
+            "research_seed_sources": 12,
+            "research_depth_passes": 3,
+            "research_max_sources": 80,
+            "research_references_per_source": 12,
             "max_tool_calls_per_step": 256,
             "temperature": 0.7,
             "top_p": 0.9,
@@ -86,7 +118,30 @@ class AppSettingsStore:
         result["context_window"] = int(result["context_window"]) if str(result["context_window"] or "") else None
         result["max_new_tokens"] = int(result["max_new_tokens"])
         result["reasoning_budget"] = int(result["reasoning_budget"]) if str(result["reasoning_budget"] or "") else None
-        result["max_tool_calls_per_step"] = int(result["max_tool_calls_per_step"])
+        for key in ("synthesis_max_new_tokens",):
+            env_key = MODEL_ENV_KEYS[key]
+            if not str(values.get(env_key) or "").strip():
+                result[key] = result["max_new_tokens"]
+        for key in (
+            "task_planner_max_new_tokens",
+            "work_item_planner_max_new_tokens",
+            "tool_action_max_new_tokens",
+            "post_tool_decision_max_new_tokens",
+            "section_max_new_tokens",
+            "synthesis_max_new_tokens",
+            "research_classifier_max_new_tokens",
+            "research_notes_max_new_tokens",
+            "research_source_dossier_max_new_tokens",
+            "research_whole_source_max_tokens",
+            "research_section_input_tokens",
+            "research_source_max_characters",
+            "research_seed_sources",
+            "research_depth_passes",
+            "research_max_sources",
+            "research_references_per_source",
+            "max_tool_calls_per_step",
+        ):
+            result[key] = int(result[key])
         result["temperature"] = float(result["temperature"])
         result["top_p"] = float(result["top_p"])
         result["trust_remote_code"] = str(result["trust_remote_code"]).lower() in {"1", "true", "yes"}

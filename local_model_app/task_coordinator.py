@@ -10,6 +10,7 @@ from local_model_app.task_models import (
     TaskDefinition,
     WorkItemOutcome,
 )
+from local_model_app.workflow_skills import WorkflowSkillRegistry
 
 
 AsyncGenerator = Callable[[list[dict[str, Any]]], Awaitable[str]]
@@ -55,6 +56,7 @@ class WorkItemExecutorProtocol(Protocol):
         completed_items: list[dict[str, Any]],
     ) -> WorkItemOutcome: ...
 
+
 class ModelTaskCoordinator:
     """Uses the local model for planning while leaving lifecycle control to the host."""
 
@@ -62,9 +64,11 @@ class ModelTaskCoordinator:
         self,
         generate: AsyncGenerator,
         capability_catalog: CapabilityCatalog | None = None,
+        skill_registry: WorkflowSkillRegistry | None = None,
     ) -> None:
         self.generate = generate
         self.capability_catalog = capability_catalog
+        self.skill_registry = skill_registry or WorkflowSkillRegistry.default()
 
     async def propose(self, request: str) -> TaskDefinition:
         prompt = (
@@ -84,6 +88,10 @@ class ModelTaskCoordinator:
     async def plan_task(self, task: dict[str, Any]) -> list[ProposedWorkItem]:
         definition = task["definition"]
         metadata = definition.get("metadata") or {}
+        skill = self.skill_registry.for_task(definition)
+        if skill is not None:
+            inputs = metadata.get("skill_inputs") or skill.resolve_inputs(str(definition.get("goal") or ""))
+            return skill.instantiate_work_items(dict(inputs))
         if metadata.get("mode") == "durable_tools":
             plugin_ids = [str(value) for value in metadata.get("plugin_ids") or []]
             capabilities = (
@@ -176,15 +184,28 @@ class ModelTaskCoordinator:
         task: dict[str, Any],
         work_items: list[dict[str, Any]],
     ) -> CompletionAudit:
-        evidence = [
-            {
+        metadata = task["definition"].get("metadata") or {}
+        skill = self.skill_registry.for_task(task["definition"])
+        if skill is not None:
+            return skill.audit_completion(task, work_items)
+        evidence = []
+        for item in work_items[-40:]:
+            outcome = item.get("result") or {}
+            result = outcome.get("result") if isinstance(outcome, dict) else outcome
+            result_text = str(result or "")
+            evidence.append({
+                "key": item.get("key"),
+                "kind": item.get("kind"),
                 "title": item["title"],
                 "status": item["status"],
-                "result": item.get("result"),
-            }
-            for item in work_items[-40:]
-        ]
-        durable_tools = (task["definition"].get("metadata") or {}).get("mode") == "durable_tools"
+                "summary": outcome.get("summary") if isinstance(outcome, dict) else "",
+                "word_count": len(re.findall(r"\b[\w'-]+\b", result_text)),
+                "source_url_count": len(set(re.findall(r"https?://[^\s<>)\]}]+", result_text))),
+                "completion_evidence": outcome.get("completion_evidence", []) if isinstance(outcome, dict) else [],
+                "artifacts": outcome.get("artifacts", []) if isinstance(outcome, dict) else [],
+                "result_preview": result_text[:1200],
+            })
+        durable_tools = metadata.get("mode") == "durable_tools"
         prompt = (
             "Audit a durable task against every success criterion using only recorded evidence. Be conservative. "
             "A plan or assertion is not evidence that external work occurred. Return only JSON with: passed, summary, "
@@ -195,6 +216,8 @@ class ModelTaskCoordinator:
                 "follow-up is created, also create a new kind 'synthesis' item depending on every new follow-up key. "
                 "Do not pass an optimization without baseline/final metric evidence, and do not pass research without "
                 "source URLs, conclusions, techniques, and explicit gaps or limitations."
+                " For document-backed research, do not pass unless the recorded synthesis has a DOCX artifact and "
+                "its completion evidence meets the configured minimum word count."
                 if durable_tools else ""
             )
         )

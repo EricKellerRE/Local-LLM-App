@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import ipaddress
+import io
+import re
 import socket
+import urllib.request
+from html import unescape
 from typing import Any
 from urllib.parse import urlparse
+
+MAX_PDF_BYTES = 50_000_000
 
 try:
     from mcp.server.mcpserver import MCPServer as _Server
@@ -36,6 +42,75 @@ def _require_public_url(url: str) -> str:
     return url
 
 
+META_PATTERN = re.compile(
+    r"<meta\s+[^>]*(?:name|property)=[\"']([^\"']+)[\"'][^>]*content=[\"']([^\"']*)[\"'][^>]*>|"
+    r"<meta\s+[^>]*content=[\"']([^\"']*)[\"'][^>]*(?:name|property)=[\"']([^\"']+)[\"'][^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _scholarly_metadata(html: str, url: str) -> dict[str, Any]:
+    values: dict[str, list[str]] = {}
+    for match in META_PATTERN.finditer(html):
+        name = (match.group(1) or match.group(4) or "").strip().lower()
+        content = unescape(match.group(2) or match.group(3) or "").strip()
+        if name and content:
+            values.setdefault(name, []).append(content)
+
+    def first(*names: str) -> str | None:
+        return next((values[name][0] for name in names if values.get(name)), None)
+
+    date = first("citation_publication_date", "citation_date", "article:published_time", "dc.date")
+    year_match = re.search(r"\b(?:19|20)\d{2}\b", date or "")
+    # Only scholarly metadata fields are called abstracts. Generic HTML/OpenGraph
+    # descriptions remain clearly labelled fallback context for the selector.
+    abstract = first("citation_abstract", "dc.description", "dcterms.abstract")
+    abstract_source = next((name for name in (
+        "citation_abstract", "dc.description", "dcterms.abstract"
+    ) if values.get(name)), None)
+    description = first("description", "og:description", "twitter:description")
+    description_source = next((name for name in (
+        "description", "og:description", "twitter:description"
+    ) if values.get(name)), None)
+    return {
+        "url": url,
+        "title": first("citation_title", "dc.title", "og:title", "twitter:title"),
+        "authors": values.get("citation_author") or values.get("dc.creator") or [],
+        "year": int(year_match.group(0)) if year_match else None,
+        "venue": first("citation_journal_title", "citation_conference_title", "dc.source"),
+        "abstract": abstract,
+        "abstract_source": abstract_source,
+        "description": description,
+        "description_source": description_source,
+    }
+
+
+def _extract_pdf_text(url: str) -> str:
+    """Download a public PDF and deterministically extract page text."""
+    from pypdf import PdfReader
+
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "LocalModelResearch/1.0 (+local desktop research client)"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        raw = response.read(MAX_PDF_BYTES + 1)
+    if len(raw) > MAX_PDF_BYTES:
+        raise ValueError(f"PDF exceeds the {MAX_PDF_BYTES // 1_000_000} MB extraction limit.")
+    if not raw.lstrip().startswith(b"%PDF-"):
+        raise ValueError("The PDF URL did not return a PDF document.")
+    reader = PdfReader(io.BytesIO(raw))
+    pages: list[str] = []
+    for number, page in enumerate(reader.pages, 1):
+        text = str(page.extract_text() or "").strip()
+        if text:
+            pages.append(f"## Page {number}\n\n{text}")
+    extracted = "\n\n".join(pages).strip()
+    if not extracted:
+        raise ValueError("The PDF contains no extractable text; it may require OCR.")
+    return extracted
+
+
 @server.tool(structured_output=True)
 def search_web(
     query: str,
@@ -66,17 +141,47 @@ def fetch_url(url: str, start_index: int = 0, max_length: int = 30_000) -> dict[
     safe_url = _require_public_url(url)
     start = max(0, int(start_index))
     length = max(1_000, min(int(max_length), 100_000))
-    extracted = DDGS(timeout=30).extract(safe_url, fmt="text_markdown")
-    content = str(extracted.get("content") or "")
+    is_pdf_url = urlparse(safe_url).path.lower().endswith(".pdf")
+    if is_pdf_url:
+        content = _extract_pdf_text(safe_url)
+        extracted_url = safe_url
+        content_kind = "pdf_text"
+    else:
+        extracted = DDGS(timeout=30).extract(safe_url, fmt="text_markdown")
+        content = str(extracted.get("content") or "")
+        extracted_url = str(extracted.get("url") or safe_url)
+        content_kind = "markdown"
+        if content.lstrip().startswith("%PDF-"):
+            content = _extract_pdf_text(extracted_url)
+            content_kind = "pdf_text"
     end = min(len(content), start + length)
     return {
-        "url": str(extracted.get("url") or safe_url),
+        "url": extracted_url,
         "start_index": start,
         "content": content[start:end],
+        "content_kind": content_kind,
         "total_characters": len(content),
         "next_start": end if end < len(content) else None,
         "complete": end >= len(content),
     }
+
+
+@server.tool(structured_output=True)
+def fetch_scholarly_metadata(url: str) -> dict[str, Any]:
+    """Fetch lightweight scholarly metadata fields without downloading and extracting a full paper."""
+    safe_url = _require_public_url(url)
+    request = urllib.request.Request(
+        safe_url,
+        headers={"User-Agent": "LocalModelResearch/1.0 (+local desktop research client)"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        content_type = str(response.headers.get("Content-Type") or "")
+        if "html" not in content_type.lower():
+            return _scholarly_metadata("", str(response.geturl() or safe_url))
+        raw = response.read(2_000_000)
+        charset = response.headers.get_content_charset() or "utf-8"
+        html = raw.decode(charset, errors="replace")
+        return _scholarly_metadata(html, str(response.geturl() or safe_url))
 
 
 def main() -> None:

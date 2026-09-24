@@ -19,7 +19,7 @@
   ],
   "policy": {
     "default_access": "deny",
-    "allow_tools": ["search_web", "fetch_url"],
+    "allow_tools": ["search_web", "fetch_url", "fetch_scholarly_metadata"],
     "deny_tools": [],
     "max_calls_per_turn": 256
   }

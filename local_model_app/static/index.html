@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local Model</title>
-    <link rel="stylesheet" href="/static/styles.css?v=desktop-chat-7" />
+    <link rel="stylesheet" href="/static/styles.css?v=desktop-chat-8" />
   </head>
   <body>
     <div class="shell">
@@ -79,8 +79,12 @@
 
     <dialog id="settings-dialog" class="modal-dialog settings-dialog">
       <div class="dialog-heading"><div><h2>Settings</h2><p>Model and storage changes take effect after restarting Local Model.</p></div><button id="close-settings" class="text-button" type="button">Close</button></div>
+      <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+        <button class="settings-tab active" type="button" role="tab" aria-selected="true" data-settings-tab="general">General</button>
+        <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="developer">Developer</button>
+      </div>
       <div class="settings-scroll">
-        <section class="settings-section">
+        <section class="settings-section" data-settings-panel="general">
           <h3>Storage</h3>
           <label>App data</label>
           <div class="path-row"><input id="data-directory" type="text" readonly /><button class="text-button browse-directory" data-target="data-directory" type="button">Browse…</button></div>
@@ -89,7 +93,7 @@
           <div class="path-row"><input id="models-directory" type="text" readonly /><button class="text-button browse-directory" data-target="models-directory" type="button">Browse…</button></div>
         </section>
 
-        <section class="settings-section">
+        <section class="settings-section" data-settings-panel="general">
           <h3>Active model</h3>
           <label for="model-id">Model ID or local folder</label>
           <input id="model-id" type="text" list="installed-models" placeholder="organization/model or C:\\models\\model" />
@@ -105,7 +109,7 @@
           <label class="checkbox-row"><input id="trust-remote-code" type="checkbox" /> Allow remote model code (only for repositories you trust)</label>
         </section>
 
-        <section class="settings-section">
+        <section class="settings-section" data-settings-panel="general">
           <h3>Context and generation</h3>
           <p class="settings-explanation">The context window is shared by the conversation, tool results, reasoning, and the response.</p>
           <div class="settings-grid context-settings">
@@ -120,17 +124,55 @@
           <small id="prompt-budget-note"></small>
         </section>
 
-        <section class="settings-section">
+        <section class="settings-section" data-settings-panel="general">
           <h3>Find models on Hugging Face</h3>
           <div class="path-row"><input id="hf-search" type="search" placeholder="Search compatible Transformers chat models" /><button id="search-models" class="text-button" type="button">Search</button></div>
           <p id="hf-status" class="dialog-status"></p>
           <div id="hf-results" class="model-results"></div>
+        </section>
+
+        <section class="settings-section" data-settings-panel="developer" hidden>
+          <div class="developer-heading"><div><h3>Generation budgets</h3><p id="developer-model-summary"></p></div><button id="reset-tuning-defaults" class="text-button" type="button">Reset fields</button></div>
+          <p class="settings-explanation">Advanced per-turn ceilings. These are maximums, not token targets, and apply after restart.</p>
+          <div class="settings-grid context-settings">
+            <label>Task planner<input id="task-planner-tokens" type="number" min="1" max="262144" /><small>Creates the durable task definition.</small></label>
+            <label>Work-item planner<input id="work-item-planner-tokens" type="number" min="1" max="262144" /><small>Plans one checkpoint before tool use.</small></label>
+            <label>Tool action<input id="tool-action-tokens" type="number" min="1" max="262144" /><small>Selects and formats the next tool call.</small></label>
+            <label>Post-tool decision<input id="post-tool-tokens" type="number" min="1" max="262144" /><small>Interprets a result and continues or completes a checkpoint.</small></label>
+            <label>Report section<input id="section-tokens" type="number" min="1" max="262144" /><small>Writes one bounded section of a long report.</small></label>
+            <label>Final synthesis<input id="synthesis-tokens" type="number" min="1" max="262144" /><small>Writes the final durable-task deliverable.</small></label>
+            <label>Reference relevance<input id="research-classifier-tokens" type="number" min="1" max="262144" /><small>Filters one batch of cited references.</small></label>
+            <label>Source section notes<input id="research-notes-tokens" type="number" min="1" max="262144" /><small>Analyzes one bounded section of one source.</small></label>
+            <label>Source dossier<input id="research-source-dossier-tokens" type="number" min="1" max="262144" /><small>Consolidates one paper's section notes.</small></label>
+          </div>
+          <h3>Research traversal</h3>
+          <p class="settings-explanation">The host enforces this breadth-first citation crawl; these are task limits, not model suggestions.</p>
+          <div class="settings-grid context-settings">
+            <label>Seed sources<input id="research-seed-sources" type="number" min="1" max="100" /><small>Readable sources required before expansion begins.</small></label>
+            <label>Depth passes<input id="research-depth-passes" type="number" min="0" max="10" /><small>Reference-expansion passes after the seed set.</small></label>
+            <label>Total source cap<input id="research-max-sources" type="number" min="1" max="1000" /><small>Safety bound; not a completion target.</small></label>
+            <label>References per source<input id="research-references-per-source" type="number" min="1" max="100" /><small>Maximum candidates admitted from each source.</small></label>
+            <label>Whole-source threshold<input id="research-whole-source-tokens" type="number" min="512" max="4194304" /><small>Analyze a paper in one pass only below this token count.</small></label>
+            <label>Section input ceiling<input id="research-section-input-tokens" type="number" min="512" max="4194304" /><small>Maximum source text in each resumable analysis pass.</small></label>
+            <label>Source character cap<input id="research-source-max-characters" type="number" min="1000" max="10000000" /><small>Maximum fetched text retained per source.</small></label>
+          </div>
+        </section>
+
+        <section class="settings-section" data-settings-panel="developer" hidden>
+          <div class="developer-heading"><div><h3>Generation telemetry</h3><p>Counts and timings are stored without hidden reasoning text.</p></div><button id="refresh-telemetry" class="text-button" type="button">Refresh</button></div>
+          <div id="telemetry-summary" class="telemetry-summary">Telemetry begins after the next restart.</div>
+          <div class="telemetry-table-wrap">
+            <table class="telemetry-table">
+              <thead><tr><th>Turn</th><th>Input</th><th>Output / max</th><th>Stop</th><th>Time</th><th>tok/s</th></tr></thead>
+              <tbody id="telemetry-rows"></tbody>
+            </table>
+          </div>
         </section>
       </div>
       <p id="settings-status" class="dialog-status"></p>
       <div class="dialog-actions"><button id="save-settings" class="primary-button" type="button">Save settings</button></div>
     </dialog>
 
-    <script src="/static/app.js?v=desktop-chat-7" defer></script>
+    <script src="/static/app.js?v=desktop-chat-9" defer></script>
   </body>
 </html>

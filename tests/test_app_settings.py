@@ -15,7 +15,18 @@ class AppSettingsStoreTests(unittest.TestCase):
             self.assertEqual(paths.data_directory, (root / "data").resolve())
             self.assertEqual(paths.models_directory, (root / "models").resolve())
             self.assertEqual(store.public_settings()["max_new_tokens"], 8192)
+            self.assertEqual(store.public_settings()["tool_action_max_new_tokens"], 192)
+            self.assertEqual(store.public_settings()["post_tool_decision_max_new_tokens"], 256)
+            self.assertEqual(store.public_settings()["section_max_new_tokens"], 768)
+            self.assertEqual(store.public_settings()["synthesis_max_new_tokens"], 8192)
             self.assertEqual(store.public_settings()["max_tool_calls_per_step"], 256)
+            self.assertEqual(store.public_settings()["research_seed_sources"], 12)
+            self.assertEqual(store.public_settings()["research_depth_passes"], 3)
+            self.assertEqual(store.public_settings()["research_max_sources"], 80)
+            self.assertEqual(store.public_settings()["research_source_dossier_max_new_tokens"], 1536)
+            self.assertEqual(store.public_settings()["research_whole_source_max_tokens"], 8192)
+            self.assertEqual(store.public_settings()["research_section_input_tokens"], 6144)
+            self.assertEqual(store.public_settings()["research_source_max_characters"], 160000)
 
     def test_update_persists_model_and_storage_settings(self) -> None:
         with TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -30,6 +41,22 @@ class AppSettingsStoreTests(unittest.TestCase):
                 "context_window": 32768,
                 "max_new_tokens": 900,
                 "reasoning_budget": 400,
+                "task_planner_max_new_tokens": 700,
+                "work_item_planner_max_new_tokens": 160,
+                "tool_action_max_new_tokens": 300,
+                "post_tool_decision_max_new_tokens": 1200,
+                "section_max_new_tokens": 2400,
+                "synthesis_max_new_tokens": 5000,
+                "research_classifier_max_new_tokens": 400,
+                "research_notes_max_new_tokens": 1400,
+                "research_source_dossier_max_new_tokens": 1800,
+                "research_whole_source_max_tokens": 10000,
+                "research_section_input_tokens": 7000,
+                "research_source_max_characters": 200000,
+                "research_seed_sources": 15,
+                "research_depth_passes": 4,
+                "research_max_sources": 100,
+                "research_references_per_source": 16,
                 "temperature": 0.2,
                 "top_p": 0.8,
                 "trust_remote_code": True,
@@ -39,6 +66,14 @@ class AppSettingsStoreTests(unittest.TestCase):
             self.assertEqual(saved["device"], "cuda")
             self.assertEqual(saved["context_window"], 32768)
             self.assertEqual(saved["reasoning_budget"], 400)
+            self.assertEqual(saved["tool_action_max_new_tokens"], 300)
+            self.assertEqual(saved["post_tool_decision_max_new_tokens"], 1200)
+            self.assertEqual(saved["section_max_new_tokens"], 2400)
+            self.assertEqual(saved["synthesis_max_new_tokens"], 5000)
+            self.assertEqual(saved["research_seed_sources"], 15)
+            self.assertEqual(saved["research_depth_passes"], 4)
+            self.assertEqual(saved["research_source_dossier_max_new_tokens"], 1800)
+            self.assertEqual(saved["research_whole_source_max_tokens"], 10000)
             self.assertTrue(saved["trust_remote_code"])
             self.assertTrue((root / "chosen-data").is_dir())
             self.assertTrue((root / "chosen-models").is_dir())
@@ -58,6 +93,16 @@ class AppSettingsStoreTests(unittest.TestCase):
 
             self.assertIsNone(settings["context_window"])
             self.assertIsNone(settings["reasoning_budget"])
+
+    def test_only_synthesis_default_follows_response_budget(self) -> None:
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            (root / ".env").write_text("LOCAL_MODEL_MAX_NEW_TOKENS=4096\n", encoding="utf-8")
+
+            settings = AppSettingsStore(root).public_settings()
+
+            self.assertEqual(settings["post_tool_decision_max_new_tokens"], 256)
+            self.assertEqual(settings["synthesis_max_new_tokens"], 4096)
 
 
 if __name__ == "__main__":
