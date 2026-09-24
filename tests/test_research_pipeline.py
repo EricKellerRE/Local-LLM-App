@@ -536,6 +536,7 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
         self.assertEqual(len(calls), 3)
         self.assertEqual(calls[2][0]["previous_assessment"]["document_type"], "primary_study")
         self.assertIn("document_excerpt", calls[2][0])
+        self.assertEqual(calls[2][0]["host_type_hint"], "scholarly_article")
         self.assertTrue(any(name == "web__fetch_scholarly_metadata" for name, _ in manager.calls))
 
     def test_generic_page_description_is_not_presented_as_an_abstract(self):

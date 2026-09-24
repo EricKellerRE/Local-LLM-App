@@ -623,6 +623,7 @@ class ResearchDiscoveryExecutor:
             "number": 1,
             "title": str(source.get("title") or source.get("url") or "")[:500],
             "source_locator": source.get("source_locator") or "",
+            "host_type_hint": source.get("host_type_hint") or "unknown_web",
             "previous_assessment": source.get("model_assessment"),
             "document_excerpt": content[:8000],
         }
