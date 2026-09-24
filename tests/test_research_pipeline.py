@@ -10,6 +10,7 @@ from local_model_app.research_pipeline import (
     ResearchDiscoveryExecutor,
     ResearchNotesExecutor,
     ResearchSourceProcessor,
+    SourceRejectedError,
     canonical_url,
     evidence_role,
     extract_reference_candidates,
@@ -52,6 +53,25 @@ class FakeResearchManager:
         }}
 
 
+def assessed_selection(candidates, keep_numbers=None, document_type="primary_study"):
+    kept = set(keep_numbers) if keep_numbers is not None else {
+        candidate["number"] for candidate in candidates
+    }
+    return CandidateSelection(
+        keep_numbers=kept,
+        needs_abstract_numbers=set(),
+        assessments={
+            candidate["number"]: {
+                "document_type": document_type,
+                "primary_source": document_type == "primary_study",
+                "confidence": "high",
+                "qualifiers": ["test fixture classification"],
+            }
+            for candidate in candidates if candidate["number"] in kept
+        },
+    )
+
+
 class ResearchPipelineTests(unittest.TestCase):
     def test_source_type_hints_separate_document_role_from_relevance(self):
         policy = {
@@ -92,17 +112,29 @@ class ResearchPipelineTests(unittest.TestCase):
                 "year": 2025, "venue": "Journal of Memory",
             }},
         )
-        seen_roles = []
+        presented_fields = []
 
         async def keep_all(goal, candidates):
-            seen_roles.extend(candidate["evidence_role"] for candidate in candidates)
+            presented_fields.extend(set(candidate) for candidate in candidates)
+            assessments = {}
+            for candidate in candidates:
+                document_type = (
+                    "reference_work" if "EBSCO" in candidate["title"] else "primary_study"
+                )
+                assessments[candidate["number"]] = {
+                    "document_type": document_type,
+                    "primary_source": False,
+                    "confidence": "high",
+                    "qualifiers": ["fixture"],
+                }
             return CandidateSelection(
                 keep_numbers={candidate["number"] for candidate in candidates},
                 needs_abstract_numbers=set(),
+                assessments=assessments,
             )
 
         policy = {
-            "core_types": ["scholarly_article", "scholarly_candidate"],
+            "core_types": ["primary_study"],
             "supplemental_types": ["tertiary_overview", "reference_work"],
             "disallowed_types": ["topic_index", "retail"],
             "unknown_role": "needs_metadata",
@@ -120,8 +152,8 @@ class ResearchPipelineTests(unittest.TestCase):
             ledger = json.loads((root / "research" / "task-policy" / "source-ledger.json").read_text())
 
         self.assertEqual(outcome.outcome, "completed", f"{outcome.summary}: {ledger}")
-        self.assertIn("supplemental", seen_roles)
-        self.assertIn("needs_metadata", seen_roles)
+        self.assertTrue(all("source_type_hint" not in fields for fields in presented_fields))
+        self.assertTrue(all("evidence_role" not in fields for fields in presented_fields))
         by_url = {source["url"]: source for source in ledger["sources"]}
         self.assertEqual(by_url[tertiary]["status"], "supplemental")
         self.assertEqual(by_url[tertiary]["evidence_role"], "supplemental")
@@ -148,6 +180,19 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
         self.assertIsNone(ResearchDiscoveryExecutor._source_rejection_reason(
             "https://journal.test/paper", substantive
         ))
+
+    def test_source_quality_gate_rejects_raw_pdf_bytes_and_corrupt_text(self):
+        raw_pdf = "%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nstream\n" + ("\ufffd\x00" * 500)
+        reason = ResearchDiscoveryExecutor._source_rejection_reason(
+            "https://arxiv.org/pdf/example", raw_pdf
+        )
+        self.assertIn("raw PDF bytes", reason)
+
+        corrupt = ("binary \ufffd\ufffd\ufffd data " * 300) + "stream endobj xref"
+        reason = ResearchDiscoveryExecutor._source_rejection_reason(
+            "https://papers.test/example", corrupt
+        )
+        self.assertIn("binary or corrupt text", reason)
 
     def test_long_source_sections_are_bounded_and_preserve_text(self):
         text = "# Intro\n\n" + " ".join(f"word{i}" for i in range(1300))
@@ -188,6 +233,67 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
         self.assertEqual(second["dossier"], first["dossier"])
         self.assertEqual(len(section_calls) + len(dossier_calls), call_count)
 
+    def test_source_processor_stops_after_first_unreadable_segment(self):
+        section_calls = []
+        dossier_calls = []
+
+        async def analyze(messages):
+            section_calls.append(messages[-1]["content"])
+            return "The provided text is corrupted/binary and no source-grounded evidence can be extracted."
+
+        async def dossier(messages):
+            dossier_calls.append(messages[-1]["content"])
+            return "This must not be called."
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            processor = ResearchSourceProcessor(
+                analyze, dossier, lambda value: len(value.split()), Path(temporary)
+            )
+            source = {"id": "bad", "title": "Bad", "url": "https://papers.test/bad", "depth": 0}
+            task = {"id": "task-bad", "definition": {"goal": "memory", "metadata": {
+                "research_whole_source_max_tokens": 512,
+                "research_section_input_tokens": 512,
+            }}}
+            content = "# Paper\n\n" + " ".join(["apparently readable source content"] * 500)
+            with self.assertRaises(SourceRejectedError):
+                asyncio.run(processor.process(task, source, content))
+
+        self.assertEqual(len(section_calls), 1)
+        self.assertEqual(dossier_calls, [])
+
+    def test_exhausted_seed_discovery_fails_instead_of_retrying_forever(self):
+        goal = "memory"
+        queries = [goal, f'"{goal}" review', f"{goal} primary study"]
+
+        async def keep_none(goal, candidates):
+            return assessed_selection(candidates, set())
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            ledger_path = root / "research" / "task-exhausted" / "source-ledger.json"
+            ledger_path.parent.mkdir(parents=True)
+            ledger_path.write_text(json.dumps({
+                "version": 1,
+                "goal": goal,
+                "config": {},
+                "sources": [],
+                "passes": [],
+                "stop_reason": None,
+                "seed_query_pages": {query: 20 for query in queries},
+                "search_pages": [],
+            }), encoding="utf-8")
+            executor = ResearchDiscoveryExecutor(FakeResearchManager([], {}), root, keep_none)
+            task = {"id": "task-exhausted", "definition": {"goal": goal, "metadata": {
+                "research_seed_sources": 12,
+                "research_depth_passes": 0,
+            }}}
+            outcome = asyncio.run(executor.execute_work_item(task, {}, []))
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(outcome.outcome, "failed")
+        self.assertIn("stopped instead of retrying", outcome.summary)
+        self.assertEqual(ledger["stop_reason"], "seed_discovery_exhausted")
+
     def test_discovery_fetches_a_long_source_in_exact_url_chunks(self):
         url = "https://papers.test/long"
         document = ("memory mechanism evidence supports consolidation and maintenance. " * 1400)[:65_000]
@@ -208,10 +314,7 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
                 }}
 
         async def keep_all(goal, candidates):
-            return CandidateSelection(
-                keep_numbers={candidate["number"] for candidate in candidates},
-                needs_abstract_numbers=set(),
-            )
+            return assessed_selection(candidates)
 
         manager = ChunkManager([{"title": "Long paper", "href": url, "body": "memory"}], {url: document})
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
@@ -251,10 +354,7 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
                 return {"structuredContent": {"url": arguments["url"], "content": content, "complete": True}}
 
         async def keep_all(goal, candidates):
-            return CandidateSelection(
-                keep_numbers={candidate["number"] for candidate in candidates},
-                needs_abstract_numbers=set(),
-            )
+            return assessed_selection(candidates)
 
         manager = RefillManager([], {})
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
@@ -308,10 +408,7 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
 
         async def classify(goal, candidates):
             self.assertTrue(all("url" not in candidate for candidate in candidates))
-            return CandidateSelection(
-                keep_numbers={candidate["number"] for candidate in candidates},
-                needs_abstract_numbers=set(),
-            )
+            return assessed_selection(candidates)
 
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
@@ -348,12 +445,10 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
         async def reject_all(goal, candidates):
             nonlocal selection_calls
             selection_calls += 1
-            return CandidateSelection(
-                keep_numbers=(
-                    {candidate["number"] for candidate in candidates} if selection_calls == 1 else set()
-                ),
-                needs_abstract_numbers=set(),
+            keep_numbers = (
+                {candidate["number"] for candidate in candidates} if selection_calls == 1 else set()
             )
+            return assessed_selection(candidates, keep_numbers)
 
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
@@ -383,10 +478,7 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
         }
 
         async def classify(goal, candidates):
-            return CandidateSelection(
-                keep_numbers={candidate["number"] for candidate in candidates},
-                needs_abstract_numbers=set(),
-            )
+            return assessed_selection(candidates)
 
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
@@ -430,7 +522,7 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
             self.assertEqual(candidates[0]["authors"], ["Ada Example"])
             self.assertEqual(candidates[0]["abstract_source"], "citation_abstract")
             self.assertNotIn("url", candidates[0])
-            return CandidateSelection(keep_numbers={1}, needs_abstract_numbers=set())
+            return assessed_selection(candidates, {1}, "primary_study")
 
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
@@ -441,7 +533,9 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
             outcome = asyncio.run(executor.execute_work_item(task, {}, []))
 
         self.assertEqual(outcome.outcome, "completed")
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[2][0]["previous_assessment"]["document_type"], "primary_study")
+        self.assertIn("document_excerpt", calls[2][0])
         self.assertTrue(any(name == "web__fetch_scholarly_metadata" for name, _ in manager.calls))
 
     def test_generic_page_description_is_not_presented_as_an_abstract(self):

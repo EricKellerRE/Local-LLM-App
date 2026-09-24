@@ -279,7 +279,8 @@ class TaskStore:
             now = _timestamp()
             self._connection.execute(
                 """UPDATE tasks SET status = ?, completed_at = ?, lease_owner = NULL,
-                   lease_expires_at = NULL, updated_at = ? WHERE id = ?""",
+                   lease_expires_at = NULL, next_run_at = NULL, waiting_reason = NULL,
+                   last_error = NULL, updated_at = ? WHERE id = ?""",
                 (TaskStatus.CANCELLED.value, now, now, task_id),
             )
             self._connection.execute(

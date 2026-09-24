@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
@@ -17,6 +17,7 @@ from local_model_app.task_models import WorkItemOutcome
 class CandidateSelection:
     keep_numbers: set[int]
     needs_abstract_numbers: set[int]
+    assessments: dict[int, dict[str, Any]] = field(default_factory=dict)
 
 
 ReferenceClassifier = Callable[[str, list[dict[str, Any]]], Awaitable[CandidateSelection]]
@@ -24,6 +25,7 @@ AsyncGenerator = Callable[[list[dict[str, Any]]], Awaitable[str]]
 TokenCounter = Callable[[str], int]
 MIN_SOURCE_CHARACTERS = 600
 MIN_SOURCE_WORDS = 100
+MAX_SEED_SEARCH_PAGES = 20
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\]\[\"']+", re.IGNORECASE)
 MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]{1,500})\]\((https?://[^\s)]+(?:\([^)]*\)[^\s)]*)?)\)", re.IGNORECASE)
@@ -44,6 +46,76 @@ STOP_WORDS = {
 
 class SourceRejectedError(ValueError):
     """The fetched response is deterministically unusable as research evidence."""
+
+
+def _obvious_unreadable_reason(content: str) -> str | None:
+    """Reject byte streams and extractor failures before they consume model turns."""
+    sample = content[:50_000]
+    if not sample:
+        return "the source returned no readable text"
+    stripped = sample.lstrip()
+    if stripped.startswith("%PDF-"):
+        return "the fetch returned raw PDF bytes instead of extracted text"
+    replacement_ratio = sample.count("\ufffd") / len(sample)
+    nul_ratio = sample.count("\x00") / len(sample)
+    control_ratio = sum(
+        1 for value in sample if ord(value) < 32 and value not in "\n\r\t\f"
+    ) / len(sample)
+    if replacement_ratio >= 0.01 or nul_ratio >= 0.001 or control_ratio >= 0.01:
+        return "the fetch returned binary or corrupt text instead of readable source content"
+    lowered = stripped[:10_000].lower()
+    if all(marker in lowered for marker in ("stream", "endobj")) and (
+        "xref" in lowered or "/type /page" in lowered
+    ):
+        return "the fetch returned PDF object data instead of extracted text"
+    return None
+
+
+def source_rejection_reason(content: str) -> str | None:
+    obvious = _obvious_unreadable_reason(content)
+    if obvious:
+        return obvious
+    normalized = " ".join(content.lower().split())
+    boilerplate = (
+        "access denied",
+        "captcha",
+        "javascript is disabled",
+        "enable javascript to continue",
+        "enable javascript to proceed",
+        "please enable javascript",
+        "required part of this site couldn't load",
+        "required part of this site couldn’t load",
+        "checking your browser",
+        "verify you are human",
+        "page not found",
+    )
+    if any(marker in normalized[:2000] for marker in boilerplate):
+        return "the response is an access, JavaScript, or anti-bot interstitial"
+    word_count = len(re.findall(r"\b[A-Za-z][A-Za-z0-9'-]*\b", content))
+    if len(content) < MIN_SOURCE_CHARACTERS or word_count < MIN_SOURCE_WORDS:
+        return (
+            f"the response is too small to support source analysis "
+            f"({len(content)} characters, {word_count} words)"
+        )
+    return None
+
+
+def _analysis_rejection_reason(notes: str) -> str | None:
+    """Detect a model's explicit finding that a segment cannot be read."""
+    normalized = " ".join(notes.lower().split())
+    unreadable_markers = (
+        "corrupted/binary",
+        "corrupted and contains non-human-readable",
+        "non-human-readable binary",
+        "raw pdf",
+        "pdf object stream",
+        "no source-grounded evidence",
+        "cannot be extracted from this segment",
+        "cannot be extracted from this portion",
+    )
+    if any(marker in normalized for marker in unreadable_markers):
+        return "the first analysis segment confirmed that the fetched source is unreadable"
+    return None
 
 
 DEFAULT_SOURCE_POLICY: dict[str, Any] = {
@@ -297,6 +369,9 @@ class ResearchSourceProcessor:
         source: dict[str, Any],
         content: str,
     ) -> dict[str, Any]:
+        rejection_reason = source_rejection_reason(content)
+        if rejection_reason:
+            raise SourceRejectedError(rejection_reason)
         metadata = task["definition"].get("metadata") or {}
         whole_limit = max(512, int(metadata.get("research_whole_source_max_tokens") or 8192))
         section_limit = max(512, min(whole_limit, int(metadata.get("research_section_input_tokens") or 6144)))
@@ -310,6 +385,9 @@ class ResearchSourceProcessor:
                 "title": source.get("title") or source["url"],
                 "url": source["url"],
                 "depth": source.get("depth", 0),
+                "candidate_assessment": source.get("model_assessment"),
+                "source_type": source.get("source_type"),
+                "evidence_role": source.get("evidence_role"),
                 "token_count": self.count_tokens(content),
                 "mode": "whole_document" if self.count_tokens(content) <= whole_limit else "sections",
                 "sections": [],
@@ -326,20 +404,29 @@ class ResearchSourceProcessor:
             sections = split_source_sections(content, self.count_tokens, section_limit)
         saved_by_key = {row["key"]: row for row in state.get("sections") or []}
         for section in sections:
-            if str(saved_by_key.get(section["key"], {}).get("notes") or "").strip():
+            saved_notes = str(saved_by_key.get(section["key"], {}).get("notes") or "").strip()
+            if saved_notes:
+                analysis_rejection = _analysis_rejection_reason(saved_notes)
+                if analysis_rejection:
+                    raise SourceRejectedError(analysis_rejection)
                 continue
             notes = await self.analyze_section([
                 {"role": "system", "content": (
                     "Analyze one bounded portion of one scholarly source. Extract only source-grounded evidence: "
                     "specific findings, mechanisms, methods, study system or population, causal strength, boundary "
                     "conditions, limitations, disagreements, and important references mentioned in this portion. "
-                    "Do not write the report or infer beyond the supplied text. Preserve the exact source URL."
+                    "The source record includes the model's earlier candidate qualifiers; use them as provenance and "
+                    "revise them explicitly if the fetched text contradicts them. Do not write the report or infer "
+                    "beyond the supplied text. Preserve the exact source URL."
                 )},
                 {"role": "user", "content": json.dumps({
                     "task_goal": task["definition"]["goal"],
                     "source": {
                         "id": source["id"], "title": source.get("title"), "url": source["url"],
                         "depth": source.get("depth", 0),
+                        "candidate_assessment": source.get("model_assessment"),
+                        "source_type": source.get("source_type"),
+                        "evidence_role": source.get("evidence_role"),
                     },
                     "segment": {"label": section["label"], "content": section["content"]},
                 }, ensure_ascii=False)},
@@ -349,6 +436,12 @@ class ResearchSourceProcessor:
             }
             state["sections"] = [saved_by_key[value["key"]] for value in sections if value["key"] in saved_by_key]
             _atomic_json(path, state)
+            analysis_rejection = _analysis_rejection_reason(notes)
+            if analysis_rejection:
+                state["status"] = "rejected"
+                state["rejection_reason"] = analysis_rejection
+                _atomic_json(path, state)
+                raise SourceRejectedError(analysis_rejection)
 
         note_blocks = [
             f"### {row['label']}\n{row['notes']}" for row in state["sections"] if str(row.get("notes") or "").strip()
@@ -394,11 +487,17 @@ class ResearchSourceProcessor:
                 "Create a reusable evidence dossier for exactly one scholarly source. Preserve the title and exact "
                 "URL, then organize the source-grounded methods, study system or population, principal findings, "
                 "mechanisms, causal strength, boundary conditions, limitations, disagreements, and useful cited leads. "
+                "Preserve or explicitly revise the candidate document-type qualifiers supplied in the source record. "
                 "Distinguish what the source reports from interpretation. Do not write a multi-source report."
             )},
             {"role": "user", "content": json.dumps({
                 "task_goal": task["definition"]["goal"],
-                "source": {"id": source["id"], "title": source.get("title"), "url": source["url"]},
+                "source": {
+                    "id": source["id"], "title": source.get("title"), "url": source["url"],
+                    "candidate_assessment": source.get("model_assessment"),
+                    "source_type": source.get("source_type"),
+                    "evidence_role": source.get("evidence_role"),
+                },
                 "source_notes": consolidation_input,
             }, ensure_ascii=False)},
         ])
@@ -445,9 +544,7 @@ class ResearchDiscoveryExecutor:
 
     @staticmethod
     def _annotate_candidate(candidate: dict[str, Any], policy: dict[str, Any], content: str = "") -> dict[str, Any]:
-        source_type = source_type_hint(candidate, content)
-        candidate["source_type"] = source_type
-        candidate["evidence_role"] = evidence_role(source_type, policy)
+        candidate["host_type_hint"] = source_type_hint(candidate, content)
         parsed = urlparse(str(candidate.get("url") or ""))
         candidate["source_locator"] = " / ".join(filter(None, [
             (parsed.hostname or "").lower(),
@@ -455,9 +552,53 @@ class ResearchDiscoveryExecutor:
         ]))
         return candidate
 
+    @staticmethod
+    def _apply_model_assessment(
+        candidate: dict[str, Any],
+        assessment: dict[str, Any] | None,
+        policy: dict[str, Any] | None,
+    ) -> None:
+        if not assessment:
+            return
+        aliases = {
+            "primary": "primary_study",
+            "primary_source": "primary_study",
+            "research_article": "primary_study",
+            "experimental_study": "primary_study",
+            "literature_review": "scholarly_review",
+            "review": "scholarly_review",
+            "review_article": "scholarly_review",
+            "meta_analysis": "systematic_review",
+            "meta-analysis": "systematic_review",
+            "textbook": "book_chapter",
+            "textbook_chapter": "book_chapter",
+        }
+        raw_type = str(assessment.get("document_type") or "unknown").strip().lower().replace(" ", "_")
+        document_type = aliases.get(raw_type, raw_type)
+        if document_type not in {
+            "primary_study", "systematic_review", "scholarly_review", "book_chapter",
+            "reference_work", "popular_summary", "topic_index", "unknown",
+        }:
+            document_type = "unknown"
+        stored = {
+            "document_type": document_type,
+            "primary_source": assessment.get("primary_source") if assessment.get("primary_source") in {True, False} else None,
+            "confidence": str(assessment.get("confidence") or "low"),
+            "qualifiers": [str(value)[:200] for value in assessment.get("qualifiers") or []][:8],
+        }
+        previous = candidate.get("model_assessment")
+        if previous and previous != stored:
+            history = candidate.setdefault("assessment_history", [])
+            if previous not in history:
+                history.append(previous)
+        candidate["model_assessment"] = stored
+        candidate["source_type"] = document_type
+        candidate["evidence_role"] = evidence_role(document_type, policy)
+
     async def _enrich_candidate(self, candidate: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
         self._annotate_candidate(candidate, policy)
-        if candidate["source_type"] != "unknown_web" or not candidate.get("url"):
+        assessment = candidate.get("model_assessment") or {}
+        if assessment.get("document_type") != "unknown" or not candidate.get("url"):
             return candidate
         try:
             metadata = _structured(await self._call("fetch_scholarly_metadata", {"url": candidate["url"]}))
@@ -467,37 +608,36 @@ class ResearchDiscoveryExecutor:
             if metadata.get(field):
                 candidate[field] = metadata[field]
         self._annotate_candidate(candidate, policy)
-        if candidate["source_type"] == "unknown_web" and candidate.get("evidence_role") == "needs_metadata":
-            candidate["evidence_role"] = str(policy.get("unresolved_role") or "disallowed")
         return candidate
+
+    async def _confirm_fetched_assessment(
+        self,
+        goal: str,
+        source: dict[str, Any],
+        content: str,
+        policy: dict[str, Any],
+    ) -> None:
+        if self.classify_references is None:
+            return
+        choice: dict[str, Any] = {
+            "number": 1,
+            "title": str(source.get("title") or source.get("url") or "")[:500],
+            "source_locator": source.get("source_locator") or "",
+            "previous_assessment": source.get("model_assessment"),
+            "document_excerpt": content[:8000],
+        }
+        for field in ("authors", "year", "venue", "abstract", "abstract_source"):
+            if source.get(field):
+                choice[field] = source[field]
+        decision = await self.classify_references(goal, [choice])
+        assessment = decision.assessments.get(1)
+        if assessment:
+            self._apply_model_assessment(source, assessment, policy)
 
     @staticmethod
     def _source_rejection_reason(url: str, content: str) -> str | None:
-        normalized = " ".join(content.lower().split())
-        if not normalized:
-            return "the source returned no readable text"
-        boilerplate = (
-            "access denied",
-            "captcha",
-            "javascript is disabled",
-            "enable javascript to continue",
-            "enable javascript to proceed",
-            "please enable javascript",
-            "required part of this site couldn't load",
-            "required part of this site couldn’t load",
-            "checking your browser",
-            "verify you are human",
-            "page not found",
-        )
-        if any(marker in normalized[:2000] for marker in boilerplate):
-            return "the response is an access, JavaScript, or anti-bot interstitial"
-        word_count = len(re.findall(r"\b[\w'-]+\b", content))
-        if len(content) < MIN_SOURCE_CHARACTERS or word_count < MIN_SOURCE_WORDS:
-            return (
-                f"the response is too small to support source analysis "
-                f"({len(content)} characters, {word_count} words)"
-            )
-        return None
+        del url
+        return source_rejection_reason(content)
 
     async def _fetch_complete(self, url: str, max_characters: int) -> tuple[str, bool]:
         chunks: list[str] = []
@@ -511,6 +651,10 @@ class ResearchDiscoveryExecutor:
                 "max_length": min(chunk_size, max_characters - start),
             }))
             content = str(payload.get("content") or "")
+            if start == 0:
+                obvious_rejection = _obvious_unreadable_reason(content)
+                if obvious_rejection:
+                    raise SourceRejectedError(obvious_rejection)
             if content:
                 chunks.append(content)
             next_start = payload.get("next_start")
@@ -531,15 +675,17 @@ class ResearchDiscoveryExecutor:
             "stop_reason": None,
         }
 
-    async def _seed(self, ledger: dict[str, Any], target: int, policy: dict[str, Any]) -> None:
+    async def _seed(self, ledger: dict[str, Any], target: int, policy: dict[str, Any]) -> dict[str, Any]:
         goal = ledger["goal"]
         queries = [goal, f'"{goal}" review', f"{goal} primary study"]
+        initial_sources = len(ledger["sources"])
+        initial_page_count = len(ledger.get("search_pages") or [])
         seen = {source["url"] for source in ledger["sources"]}
         considered = set(ledger.get("considered_seed_urls") or []) | seen
         pages = ledger.setdefault("seed_query_pages", {})
         page_history = ledger.setdefault("search_pages", [])
         for query in queries:
-            while int(pages.get(query) or 0) < 20:
+            while int(pages.get(query) or 0) < MAX_SEED_SEARCH_PAGES:
                 active_count = sum(
                     source["depth"] == 0 and self._counts_toward_target(source)
                     for source in ledger["sources"]
@@ -574,8 +720,11 @@ class ResearchDiscoveryExecutor:
                     self._annotate_candidate(candidate, policy)
                 considered.update(candidate["url"] for candidate in candidates)
                 ledger["considered_seed_urls"] = sorted(considered)
-                eligible = [candidate for candidate in candidates if candidate["evidence_role"] != "disallowed"]
-                selected_ids = await self._relevant(goal, eligible, policy)
+                selected_ids = await self._relevant(
+                    f"{goal}\nUser source requirements: {ledger.get('source_requirements') or 'Use source types appropriate to the request.'}",
+                    candidates,
+                    policy,
+                )
                 selected = [candidate for candidate in candidates if candidate["id"] in selected_ids]
                 selected = [await self._enrich_candidate(candidate, policy) for candidate in selected]
                 page_history.append({
@@ -586,11 +735,11 @@ class ResearchDiscoveryExecutor:
                     "presented_source_ids": [candidate["id"] for candidate in candidates],
                     "selected_source_ids": [candidate["id"] for candidate in selected],
                     "disallowed_source_ids": [
-                        candidate["id"] for candidate in candidates if candidate["evidence_role"] == "disallowed"
+                        candidate["id"] for candidate in candidates if candidate.get("evidence_role") == "disallowed"
                     ],
                 })
                 for candidate in selected:
-                    role = candidate["evidence_role"]
+                    role = candidate.get("evidence_role") or str(policy.get("unresolved_role") or "disallowed")
                     if role == "disallowed":
                         continue
                     if role == "supplemental":
@@ -609,8 +758,12 @@ class ResearchDiscoveryExecutor:
                         "depth": 0,
                         "parents": [],
                         "status": "queued",
-                        "source_type": candidate["source_type"],
+                        "source_type": candidate.get("source_type") or "unknown",
                         "evidence_role": role,
+                        "model_assessment": candidate.get("model_assessment"),
+                        "assessment_history": candidate.get("assessment_history") or [],
+                        "host_type_hint": candidate.get("host_type_hint"),
+                        "source_locator": candidate.get("source_locator"),
                         "authors": candidate.get("authors") or [],
                         "year": candidate.get("year"),
                         "venue": candidate.get("venue"),
@@ -628,6 +781,15 @@ class ResearchDiscoveryExecutor:
                 for source in ledger["sources"]
             ) >= target:
                 break
+        activity = {
+            "sources_added": len(ledger["sources"]) - initial_sources,
+            "pages_examined": len(page_history) - initial_page_count,
+            "search_exhausted": all(
+                int(pages.get(query) or 0) >= MAX_SEED_SEARCH_PAGES for query in queries
+            ),
+        }
+        ledger["last_seed_discovery"] = activity
+        return activity
 
     async def _fetch_depth(
         self,
@@ -654,10 +816,19 @@ class ResearchDiscoveryExecutor:
                     rejection_reason = self._source_rejection_reason(source["url"], content)
                     if rejection_reason:
                         raise SourceRejectedError(rejection_reason)
-                    source_type = source_type_hint(source, content)
-                    role = evidence_role(source_type, policy)
-                    source["source_type"] = source_type
-                    source["evidence_role"] = role
+                    self._annotate_candidate(source, policy, content)
+                    source_requirements = str(
+                        (task["definition"].get("metadata") or {}).get("research_source_requirements")
+                        or task.get("request") or "Use source types appropriate to the request."
+                    )
+                    await self._confirm_fetched_assessment(
+                        f"{task['definition']['goal']}\nUser source requirements: {source_requirements}",
+                        source,
+                        content,
+                        policy,
+                    )
+                    source_type = str(source.get("source_type") or "unknown")
+                    role = str(source.get("evidence_role") or policy.get("unresolved_role") or "disallowed")
                     if role not in {"core", "supplemental"}:
                         raise SourceRejectedError(
                             f"the task source policy does not admit document type {source_type} as evidence"
@@ -669,7 +840,7 @@ class ResearchDiscoveryExecutor:
                     source["content_file"] = content_path.name
                     source["characters"] = len(content)
                     source["fetch_complete"] = complete
-                role = source.get("evidence_role", "core")
+                role = source.get("evidence_role") or str(policy.get("unresolved_role") or "disallowed")
                 if role == "supplemental":
                     source["status"] = "supplemental"
                 elif self.source_processor is not None and source.get("status") != "analyzed":
@@ -694,17 +865,19 @@ class ResearchDiscoveryExecutor:
                     if source["id"] not in parents:
                         parents.append(source["id"])
             except Exception as exc:
-                if source.get("content_file"):
-                    source["status"] = "fetched"
-                elif isinstance(exc, SourceRejectedError):
+                if isinstance(exc, SourceRejectedError):
                     source["status"] = "dropped"
+                    source.pop("content_file", None)
+                    source.pop("analysis_file", None)
+                elif source.get("content_file"):
+                    source["status"] = "fetched"
                 elif int(source.get("fetch_attempts") or 0) >= 2:
                     source["status"] = "dropped"
                 else:
                     source["status"] = "failed"
                 source["error"] = f"{type(exc).__name__}: {exc}"[:1000]
                 _atomic_json(ledger_path, ledger)
-                if source.get("content_file"):
+                if source.get("content_file") and not isinstance(exc, SourceRejectedError):
                     raise
             _atomic_json(ledger_path, ledger)
         return list(candidates.values())
@@ -720,8 +893,8 @@ class ResearchDiscoveryExecutor:
         if self.classify_references is not None:
             try:
                 selected: set[str] = set()
-                for start in range(0, len(candidates), 40):
-                    batch = candidates[start:start + 40]
+                for start in range(0, len(candidates), 4):
+                    batch = candidates[start:start + 4]
                     choices: list[dict[str, Any]] = []
                     for number, candidate in enumerate(batch, 1):
                         title = URL_PATTERN.sub("", candidate.get("title", ""))
@@ -730,12 +903,10 @@ class ResearchDiscoveryExecutor:
                         choice: dict[str, Any] = {
                             "number": number,
                             "title": " ".join(title.split())[:500],
-                            "source_type_hint": candidate.get("source_type") or "unknown_web",
-                            "evidence_role": candidate.get("evidence_role") or evidence_role(
-                                str(candidate.get("source_type") or "unknown_web"), policy
-                            ),
                             "source_locator": candidate.get("source_locator") or "",
                         }
+                        if candidate.get("model_assessment"):
+                            choice["previous_assessment"] = candidate["model_assessment"]
                         for field in ("authors", "year", "venue"):
                             if candidate.get(field):
                                 choice[field] = candidate[field]
@@ -747,15 +918,19 @@ class ResearchDiscoveryExecutor:
                             choice["context_kind"] = candidate.get("context_kind") or "citation_context"
                         choices.append(choice)
                     decision = await self.classify_references(goal, choices)
+                    for number, assessment in decision.assessments.items():
+                        if 1 <= number <= len(batch):
+                            self._apply_model_assessment(batch[number - 1], assessment, policy)
                     selected.update(
                         batch[number - 1]["id"]
                         for number in decision.keep_numbers
-                        if 1 <= number <= len(batch)
+                        if 1 <= number <= len(batch) and number in decision.assessments
                     )
+                    unresolved_keeps = decision.keep_numbers - set(decision.assessments)
                     ambiguous = [
                         (number, batch[number - 1])
-                        for number in decision.needs_abstract_numbers
-                        if 1 <= number <= len(batch) and number not in decision.keep_numbers
+                        for number in (decision.needs_abstract_numbers | unresolved_keeps)
+                        if 1 <= number <= len(batch)
                     ]
                     if ambiguous:
                         enriched: list[dict[str, Any]] = []
@@ -772,6 +947,9 @@ class ResearchDiscoveryExecutor:
                                     metadata = {}
                             abstract = str(metadata.get("abstract") or "").strip()
                             description = str(metadata.get("description") or "").strip()
+                            for field in ("title", "authors", "year", "venue", "abstract", "abstract_source"):
+                                if metadata.get(field):
+                                    candidate[field] = metadata[field]
                             fallback_context = description or " ".join(
                                 URL_PATTERN.sub("", candidate.get("context", "")).split()
                             )
@@ -788,16 +966,18 @@ class ResearchDiscoveryExecutor:
                                     "page_description" if description else
                                     candidate.get("context_kind") or "citation_context"
                                 ) if not abstract else None,
-                                "source_type_hint": candidate.get("source_type") or "unknown_web",
-                                "evidence_role": candidate.get("evidence_role") or "core",
                                 "source_locator": candidate.get("source_locator") or "",
+                                "previous_assessment": candidate.get("model_assessment"),
                             }
                             enriched.append(enriched_candidate)
                         second_decision = await self.classify_references(goal, enriched)
+                        for number, assessment in second_decision.assessments.items():
+                            if number in source_by_number:
+                                self._apply_model_assessment(source_by_number[number], assessment, policy)
                         selected.update(
                             source_by_number[number]["id"]
                             for number in second_decision.keep_numbers
-                            if number in source_by_number
+                            if number in source_by_number and number in second_decision.assessments
                         )
                 return selected
             except Exception:
@@ -853,20 +1033,33 @@ class ResearchDiscoveryExecutor:
         except (OSError, json.JSONDecodeError, TypeError):
             ledger = self._new_ledger(str(task["definition"]["goal"]), config)
         ledger["source_policy"] = policy
+        ledger["source_requirements"] = str(
+            metadata.get("research_source_requirements") or task.get("request") or ""
+        )
 
         await self.manager.ensure_started(["local.web-research"])
         active_seed_count = sum(
             source["depth"] == 0 and self._counts_toward_target(source)
             for source in ledger["sources"]
         )
+        seed_activity = {"sources_added": 0, "pages_examined": 0, "search_exhausted": False}
         if active_seed_count < config["seed_sources"]:
-            await self._seed(ledger, config["seed_sources"], policy)
+            seed_activity = await self._seed(ledger, config["seed_sources"], policy)
             _atomic_json(ledger_path, ledger)
         active_seed_count = sum(
             source["depth"] == 0 and self._counts_toward_target(source)
             for source in ledger["sources"]
         )
         if active_seed_count < config["seed_sources"]:
+            if not seed_activity["sources_added"] and not seed_activity["pages_examined"]:
+                ledger["stop_reason"] = "seed_discovery_exhausted"
+                _atomic_json(ledger_path, ledger)
+                return WorkItemOutcome(
+                    outcome="failed",
+                    summary=(f"Seed discovery exhausted its configured search pages with "
+                             f"{active_seed_count} of {config['seed_sources']} admissible sources. "
+                             "The task stopped instead of retrying without new work."),
+                )
             return WorkItemOutcome(
                 outcome="retry",
                 summary=(f"Seed discovery found only {active_seed_count} unique sources; "
@@ -905,8 +1098,23 @@ class ResearchDiscoveryExecutor:
                         if (source["depth"] == 0 and source.get("status") == "failed" and
                                 int(source.get("fetch_attempts") or 0) >= 2):
                             source["status"] = "dropped"
-                    await self._seed(ledger, config["seed_sources"], policy)
+                    refill_activity = await self._seed(ledger, config["seed_sources"], policy)
                     _atomic_json(ledger_path, ledger)
+                    queued_or_readable = sum(
+                        source["depth"] == 0 and self._counts_toward_target(source)
+                        for source in ledger["sources"]
+                    )
+                    if (queued_or_readable < config["seed_sources"] and
+                            not refill_activity["sources_added"] and
+                            not refill_activity["pages_examined"]):
+                        ledger["stop_reason"] = "seed_discovery_exhausted"
+                        _atomic_json(ledger_path, ledger)
+                        return WorkItemOutcome(
+                            outcome="failed",
+                            summary=(f"Only {len(readable_seeds)} of {config['seed_sources']} required seed "
+                                     "sources were readable, and replacement discovery was exhausted. "
+                                     "The task stopped instead of retrying without new work."),
+                        )
                     return WorkItemOutcome(
                         outcome="retry",
                         summary=(f"Read {len(readable_seeds)} of {config['seed_sources']} required seed sources; "
@@ -917,7 +1125,11 @@ class ResearchDiscoveryExecutor:
             active_sources = sum(source.get("status") != "dropped" for source in ledger["sources"])
             capacity = max(0, config["max_sources"] - active_sources)
             selected_ids = (
-                await self._relevant(ledger["goal"], novel, policy)
+                await self._relevant(
+                    f"{ledger['goal']}\nUser source requirements: {ledger.get('source_requirements') or 'Use source types appropriate to the request.'}",
+                    novel,
+                    policy,
+                )
                 if depth < config["depth_passes"] and capacity > 0 else set()
             )
             selected = [candidate for candidate in novel if candidate["id"] in selected_ids]
@@ -951,8 +1163,12 @@ class ResearchDiscoveryExecutor:
                     "depth": depth + 1,
                     "parents": candidate.get("parents") or [],
                     "status": "queued",
-                    "source_type": candidate.get("source_type") or "unknown_web",
-                    "evidence_role": candidate.get("evidence_role") or "core",
+                    "source_type": candidate.get("source_type") or "unknown",
+                    "evidence_role": candidate.get("evidence_role") or str(policy.get("unresolved_role") or "disallowed"),
+                    "model_assessment": candidate.get("model_assessment"),
+                    "assessment_history": candidate.get("assessment_history") or [],
+                    "host_type_hint": candidate.get("host_type_hint"),
+                    "source_locator": candidate.get("source_locator"),
                     "authors": candidate.get("authors") or [],
                     "year": candidate.get("year"),
                     "venue": candidate.get("venue"),

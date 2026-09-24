@@ -110,6 +110,35 @@ class TaskStoreTests(unittest.TestCase):
             self.assertEqual(store.claim_task("worker")["id"], task["id"])
             store.close()
 
+    def test_cancel_clears_retry_schedule_and_cancels_in_flight_work(self) -> None:
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            store = TaskStore(Path(directory) / "tasks.sqlite3")
+            task = store.create_task(
+                "Cancel safely",
+                TaskDefinition(title="Cancel", goal="Cancel safely", success_criteria=["Stopped"]),
+            )
+            store.start_task(task["id"])
+            store.claim_task("worker")
+            created = store.add_work_items(
+                task["id"],
+                [ProposedWorkItem(title="Work", instructions="Work", completion_check="Done")],
+            )
+            store.claim_work_item(task["id"])
+            retry_at = datetime.now(timezone.utc) + timedelta(hours=1)
+            store.release_task(
+                task["id"], TaskStatus.WAITING, next_run_at=retry_at,
+                waiting_reason="retry_scheduled", error="transient",
+            )
+
+            cancelled = store.cancel_task(task["id"])
+
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertIsNone(cancelled["next_run_at"])
+            self.assertIsNone(cancelled["waiting_reason"])
+            self.assertIsNone(cancelled["last_error"])
+            self.assertEqual(store.get_work_item(created[0]["id"])["status"], "cancelled")
+            store.close()
+
     def test_expired_run_is_recovered_and_scheduled_wait_is_promoted(self) -> None:
         with TemporaryDirectory(dir=Path.cwd()) as directory:
             store = TaskStore(Path(directory) / "tasks.sqlite3")

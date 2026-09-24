@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import ipaddress
+import io
 import re
 import socket
 import urllib.request
 from html import unescape
 from typing import Any
 from urllib.parse import urlparse
+
+MAX_PDF_BYTES = 50_000_000
 
 try:
     from mcp.server.mcpserver import MCPServer as _Server
@@ -82,6 +85,32 @@ def _scholarly_metadata(html: str, url: str) -> dict[str, Any]:
     }
 
 
+def _extract_pdf_text(url: str) -> str:
+    """Download a public PDF and deterministically extract page text."""
+    from pypdf import PdfReader
+
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "LocalModelResearch/1.0 (+local desktop research client)"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        raw = response.read(MAX_PDF_BYTES + 1)
+    if len(raw) > MAX_PDF_BYTES:
+        raise ValueError(f"PDF exceeds the {MAX_PDF_BYTES // 1_000_000} MB extraction limit.")
+    if not raw.lstrip().startswith(b"%PDF-"):
+        raise ValueError("The PDF URL did not return a PDF document.")
+    reader = PdfReader(io.BytesIO(raw))
+    pages: list[str] = []
+    for number, page in enumerate(reader.pages, 1):
+        text = str(page.extract_text() or "").strip()
+        if text:
+            pages.append(f"## Page {number}\n\n{text}")
+    extracted = "\n\n".join(pages).strip()
+    if not extracted:
+        raise ValueError("The PDF contains no extractable text; it may require OCR.")
+    return extracted
+
+
 @server.tool(structured_output=True)
 def search_web(
     query: str,
@@ -112,13 +141,25 @@ def fetch_url(url: str, start_index: int = 0, max_length: int = 30_000) -> dict[
     safe_url = _require_public_url(url)
     start = max(0, int(start_index))
     length = max(1_000, min(int(max_length), 100_000))
-    extracted = DDGS(timeout=30).extract(safe_url, fmt="text_markdown")
-    content = str(extracted.get("content") or "")
+    is_pdf_url = urlparse(safe_url).path.lower().endswith(".pdf")
+    if is_pdf_url:
+        content = _extract_pdf_text(safe_url)
+        extracted_url = safe_url
+        content_kind = "pdf_text"
+    else:
+        extracted = DDGS(timeout=30).extract(safe_url, fmt="text_markdown")
+        content = str(extracted.get("content") or "")
+        extracted_url = str(extracted.get("url") or safe_url)
+        content_kind = "markdown"
+        if content.lstrip().startswith("%PDF-"):
+            content = _extract_pdf_text(extracted_url)
+            content_kind = "pdf_text"
     end = min(len(content), start + length)
     return {
-        "url": str(extracted.get("url") or safe_url),
+        "url": extracted_url,
         "start_index": start,
         "content": content[start:end],
+        "content_kind": content_kind,
         "total_characters": len(content),
         "next_start": end if end < len(content) else None,
         "complete": end >= len(content),

@@ -36,7 +36,7 @@ class WorkflowSkillTests(unittest.TestCase):
 
         self.assertEqual(definition.goal, "biological mechanisms of long-term memory formation and maintenance")
         self.assertEqual(definition.metadata["workflow_skill_id"], "scholarly-research-report")
-        self.assertEqual(definition.metadata["workflow_skill_version"], "1.2.0")
+        self.assertEqual(definition.metadata["workflow_skill_version"], "1.3.0")
         self.assertEqual(definition.metadata["chat_id"], "chat-1")
         self.assertIn("scholarly_article", definition.metadata["source_policy"]["core_types"])
         self.assertIn("tertiary_overview", definition.metadata["source_policy"]["supplemental_types"])

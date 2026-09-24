@@ -86,6 +86,16 @@ class RuntimePluginRequestTests(unittest.TestCase):
         self.assertTrue(Runtime._durable_request("Optimize this grid until the metric improves", True))
         self.assertFalse(Runtime._durable_request("Explain voltage stability", True))
 
+    def test_explicit_primary_source_policy_keeps_reviews_only_for_reference_mining(self) -> None:
+        policy = Runtime._explicit_source_policy(
+            "Use primary sources. Literature reviews can be kept for reference mining but not analyzed as primary sources."
+        )
+        self.assertEqual(policy["core_types"], ["primary_study"])
+        self.assertEqual(policy["supplemental_types"], ["systematic_review", "scholarly_review"])
+        self.assertTrue(policy["follow_supplemental_references"])
+        self.assertFalse(policy["supplemental_counts_toward_target"])
+        self.assertIsNone(Runtime._explicit_source_policy("Write a broad report using appropriate sources."))
+
     def test_durable_research_chat_instantiates_the_workflow_skill(self) -> None:
         captured = {}
 

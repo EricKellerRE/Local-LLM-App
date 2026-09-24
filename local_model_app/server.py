@@ -347,15 +347,21 @@ class Runtime:
                 self.model.generate,
                 [
                     {"role": "system", "content": (
-                        "Select citation candidates that are substantively relevant to the research goal. Favor "
-                        "candidates labelled core evidence. A candidate labelled supplemental may be kept when it is "
-                        "relevant for orientation or useful reference leads, but it is not core evidence. Reject candidates "
-                        "labelled disallowed, plus navigation, author profiles, unrelated citations, and duplicate editions. "
-                        "Treat the host-supplied source_type_hint and evidence_role as task policy, not suggestions. "
-                        "Use needs_abstract_numbers only when the title and supplied "
-                        "snippet/citation context are genuinely insufficient. When an abstract field is present, make "
-                        "a final keep/reject decision instead. Return only list numbers, never URLs or titles. Return "
-                        "only JSON: {\"keep_numbers\": [integer], \"needs_abstract_numbers\": [integer]}."
+                        "Select research candidates that are substantively relevant to the research goal and its explicit "
+                        "source requirements. Independently classify each item from the supplied title, authors, year, "
+                        "venue, locator, abstract, or labelled snippet/citation context. Do not assume that a search result "
+                        "is scholarly or primary. Distinguish topical relevance from document type. Use document_type "
+                        "primary_study, systematic_review, scholarly_review, book_chapter, reference_work, popular_summary, "
+                        "topic_index, or unknown. Set primary_source to true, false, or null. Preserve short descriptive "
+                        "qualifiers that justify the classification. Use needs_abstract_numbers only when the supplied "
+                        "information is genuinely insufficient; otherwise make a final keep/reject decision. When a "
+                        "previous_assessment and fetched document_excerpt are supplied, verify or revise the earlier "
+                        "qualifiers against the document rather than blindly repeating them. Reviews may "
+                        "be kept for reference mining when the user's requirements allow it. Return only list numbers, "
+                        "never URLs or titles. Return only JSON: {\"keep_numbers\":[integer],"
+                        "\"needs_abstract_numbers\":[integer],\"assessments\":[{\"number\":integer,"
+                        "\"document_type\":string,\"primary_source\":true|false|null,\"confidence\":\"high|medium|low\","
+                        "\"qualifiers\":[string]}]}."
                     )},
                     {"role": "user", "content": json.dumps({
                         "goal": goal,
@@ -380,7 +386,36 @@ class Runtime:
                 int(value) for value in payload.get("needs_abstract_numbers", [])
                 if isinstance(value, int) and value in allowed and value not in kept
             }
-            return CandidateSelection(keep_numbers=kept, needs_abstract_numbers=ambiguous)
+            assessments: dict[int, dict[str, Any]] = {}
+            for assessment in payload.get("assessments") or []:
+                if not isinstance(assessment, dict):
+                    continue
+                number = assessment.get("number")
+                if not isinstance(number, int) or number not in allowed:
+                    continue
+                document_type = str(assessment.get("document_type") or "unknown").strip().lower()
+                primary_source = assessment.get("primary_source")
+                if primary_source not in {True, False, None}:
+                    primary_source = None
+                confidence = str(assessment.get("confidence") or "low").strip().lower()
+                if confidence not in {"high", "medium", "low"}:
+                    confidence = "low"
+                qualifiers = [
+                    " ".join(str(value).split())[:200]
+                    for value in assessment.get("qualifiers") or []
+                    if str(value).strip()
+                ][:8]
+                assessments[number] = {
+                    "document_type": document_type,
+                    "primary_source": primary_source,
+                    "confidence": confidence,
+                    "qualifiers": qualifiers,
+                }
+            return CandidateSelection(
+                keep_numbers=kept,
+                needs_abstract_numbers=ambiguous,
+                assessments=assessments,
+            )
         except (ValueError, TypeError, json.JSONDecodeError):
             raise ValueError("The relevance classifier did not return valid candidate IDs.")
 
@@ -446,6 +481,30 @@ class Runtime:
             "research", "literature", "sources", "citations", "web", "internet", "papers", "state of the art",
         ))
 
+    @staticmethod
+    def _explicit_source_policy(content: str) -> dict[str, Any] | None:
+        normalized = " ".join(content.lower().split())
+        primary_requested = bool(re.search(r"\b(?:use|using|only|limited to)\s+(?:peer[- ]reviewed\s+)?primary\s+(?:sources|studies|research)\b", normalized))
+        reviews_for_mining = bool(re.search(
+            r"\b(?:literature|systematic|scholarly)?\s*reviews?\b.{0,100}\b(?:reference|citation)\s+(?:mining|leads?|discovery)\b",
+            normalized,
+        ))
+        if not primary_requested:
+            return None
+        supplemental = ["systematic_review", "scholarly_review"] if reviews_for_mining else []
+        return {
+            "core_types": ["primary_study"],
+            "supplemental_types": supplemental,
+            "disallowed_types": [
+                "book_chapter", "reference_work", "popular_summary", "topic_index", "tertiary_overview",
+            ],
+            "unknown_role": "needs_metadata",
+            "unresolved_role": "disallowed",
+            "max_supplemental_sources": 12 if reviews_for_mining else 0,
+            "supplemental_counts_toward_target": False,
+            "follow_supplemental_references": reviews_for_mining,
+        }
+
     async def _start_durable_chat_task(
         self,
         chat: dict[str, Any],
@@ -454,6 +513,7 @@ class Runtime:
     ) -> str:
         title = " ".join(content.strip().split())[:120] or "Durable task"
         is_research = "local.web-research" in plugin_ids
+        explicit_source_policy = self._explicit_source_policy(content) if is_research else None
         settings = self.model.settings
         success_criteria = [
             "The requested work is executed with persisted evidence rather than only described.",
@@ -507,6 +567,8 @@ class Runtime:
                 "research_section_input_tokens": getattr(settings, "research_section_input_tokens", 6144) if is_research else None,
                 "research_source_max_characters": getattr(settings, "research_source_max_characters", 160000) if is_research else None,
                 "section_max_segments": 6 if is_research else None,
+                "research_source_requirements": content if is_research else None,
+                "source_policy": explicit_source_policy,
             },
         })
         selected_skill = self.workflow_skills.select(content, plugin_ids)
@@ -530,7 +592,10 @@ class Runtime:
                     "research_section_input_tokens": getattr(settings, "research_section_input_tokens", 6144),
                     "research_source_max_characters": getattr(settings, "research_source_max_characters", 160000),
                     "section_max_segments": 6,
+                    "research_source_requirements": content,
                 })
+                if explicit_source_policy is not None:
+                    skill_metadata["source_policy"] = explicit_source_policy
             definition = selected_skill.task_definition(
                 content,
                 plugin_ids,
