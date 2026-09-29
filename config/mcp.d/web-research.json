@@ -13,8 +13,11 @@
       "command": "${PYTHON_EXECUTABLE}",
       "args": ["-m", "local_model_app.research_mcp"],
       "cwd": "${PROJECT_ROOT}",
-      "env": {"PYTHONIOENCODING": "utf-8"},
-      "timeout_seconds": 60
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "LOCAL_APP_DATA_DIRECTORY": "${DATA_DIRECTORY}"
+      },
+      "timeout_seconds": 90
     }
   ],
   "policy": {

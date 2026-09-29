@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -199,21 +200,45 @@ class DurableSectionExecutor:
                 "completion_evidence": outcome.get("completion_evidence", []) if isinstance(outcome, dict) else [],
             })
             if completed.get("kind") == "research_discovery" and self.data_directory is not None:
-                analysis_dir = self.data_directory / "research" / str(task["id"]) / "source-analysis"
+                research_root = self.data_directory / "research" / str(task["id"])
+                paper_report_dir = research_root / "paper-reports"
                 dossiers: list[dict[str, str]] = []
-                for path in sorted(analysis_dir.glob("*.json")):
+                for path in sorted(paper_report_dir.glob("*.md")):
                     try:
-                        payload = json.loads(path.read_text(encoding="utf-8"))
-                    except (OSError, json.JSONDecodeError, TypeError):
+                        paper_report = path.read_text(encoding="utf-8").strip()
+                    except OSError:
                         continue
-                    dossier = str(payload.get("dossier") or "").strip()
-                    if payload.get("status") == "completed" and dossier:
+                    if paper_report:
+                        title = next(
+                            (
+                                line.removeprefix("# ").strip()
+                                for line in paper_report.splitlines()
+                                if line.startswith("# ")
+                            ),
+                            "Source",
+                        )
+                        urls = unique_urls(paper_report)
                         dossiers.append({
-                            "source_id": str(payload.get("source_id") or path.stem),
-                            "title": str(payload.get("title") or "Source"),
-                            "url": str(payload.get("url") or ""),
-                            "dossier": dossier,
+                            "source_id": path.stem,
+                            "title": title,
+                            "url": urls[0] if urls else "",
+                            "paper_report": paper_report,
                         })
+                if not dossiers:
+                    analysis_dir = research_root / "source-analysis"
+                    for path in sorted(analysis_dir.glob("*.json")):
+                        try:
+                            payload = json.loads(path.read_text(encoding="utf-8"))
+                        except (OSError, json.JSONDecodeError, TypeError):
+                            continue
+                        dossier = str(payload.get("dossier") or "").strip()
+                        if payload.get("status") == "completed" and dossier:
+                            dossiers.append({
+                                "source_id": str(payload.get("source_id") or path.stem),
+                                "title": str(payload.get("title") or "Source"),
+                                "url": str(payload.get("url") or ""),
+                                "paper_report": dossier,
+                            })
                 if dossiers:
                     per_segment = 6
                     section_key = str(item.get("key") or item.get("title") or "section")
@@ -221,8 +246,8 @@ class DurableSectionExecutor:
                     offset = (section_offset + len(segments) * per_segment) % len(dossiers)
                     selected = (dossiers + dossiers)[offset:offset + min(per_segment, len(dossiers))]
                     evidence.append({
-                        "key": "source-dossiers",
-                        "title": "Checkpointed source-specific evidence dossiers",
+                        "key": "paper-reports",
+                        "title": "Checkpointed single-paper reports",
                         "result": selected,
                         "completion_evidence": [row["url"] for row in selected if row["url"]],
                     })
@@ -292,6 +317,32 @@ class DurableSynthesisExecutor:
         self.generate = generate
         self.data_directory = data_directory
 
+    def _cleanup_intermediate_notes(self, task_id: str, ledger_path: Path) -> list[str]:
+        research_root = (self.data_directory / "research" / task_id).resolve()
+        removed: list[str] = []
+        for name in ("source-analysis", "sections"):
+            path = (research_root / name).resolve()
+            if path.parent != research_root:
+                raise ValueError("Research note cleanup escaped the task directory.")
+            if path.is_dir():
+                shutil.rmtree(path)
+                removed.append(name)
+        try:
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return removed
+        for source in ledger.get("sources", []):
+            if source.pop("analysis_file", None):
+                source["analysis_notes_deleted"] = True
+        ledger["intermediate_note_cleanup"] = {
+            "completed": True,
+            "removed_directories": removed,
+        }
+        temporary = ledger_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(ledger, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(ledger_path)
+        return removed
+
     async def execute_work_item(
         self,
         task: dict[str, Any],
@@ -348,12 +399,24 @@ class DurableSynthesisExecutor:
             artifact_directory.mkdir(parents=True, exist_ok=True)
             markdown_path.write_text(report, encoding="utf-8")
             await asyncio.to_thread(build_report_docx, report, document_path, title=title)
+            try:
+                removed_notes = self._cleanup_intermediate_notes(str(task["id"]), ledger_path)
+            except OSError as exc:
+                return WorkItemOutcome(
+                    outcome="retry",
+                    summary=(
+                        f"The final report passed acceptance and was exported, but intermediate-note cleanup "
+                        f"must be retried: {exc}"
+                    ),
+                    wait_seconds=1,
+                )
             relative_path = f"{task['id']}/report.docx"
             return WorkItemOutcome(
                 outcome="completed",
                 summary=(
                     f"Assembled a {words:,}-word research document from {len(sections)} independently drafted "
-                    f"sections with {len(urls)} unique source URLs."
+                    f"sections with {len(urls)} unique source URLs; removed intermediate notes from "
+                    f"{len(removed_notes)} checkpoint director{'y' if len(removed_notes) == 1 else 'ies'}."
                 ),
                 result=(
                     f"The complete report is available as a Word document ({words:,} words, "

@@ -10,6 +10,36 @@ from local_model_app.workflow_skills import WorkflowSkillRegistry
 
 
 class RuntimePluginRequestTests(unittest.TestCase):
+    def test_source_classifier_distinguishes_a_primary_paper_from_a_research_summary(self) -> None:
+        captured = {}
+
+        class FakeModel:
+            settings = SimpleNamespace(
+                research_classifier_max_new_tokens=256,
+                max_new_tokens=512,
+            )
+
+            def generate(self, messages, **kwargs):
+                captured["messages"] = messages
+                captured["kwargs"] = kwargs
+                return '{"keep_numbers":[],"needs_abstract_numbers":[],"assessments":[]}'
+
+        runtime = Runtime.__new__(Runtime)
+        runtime.model = FakeModel()
+        runtime._inference_lock = asyncio.Lock()
+        runtime._active_operations = {}
+        runtime.ensure_loaded = AsyncMock()
+
+        asyncio.run(runtime.classify_references("memory", [{"number": 1, "title": "Research summary"}]))
+
+        prompt = captured["messages"][0]["content"]
+        self.assertIn("genre of the document actually supplied", prompt)
+        self.assertIn("university research profile", prompt)
+        self.assertIn("merely describes original research", prompt)
+        self.assertIn("missing venue/publication identity", prompt)
+        self.assertIn("decisive genre clues", prompt)
+        self.assertEqual(captured["kwargs"]["generation_class"], "research_relevance")
+
     def test_task_planning_and_report_synthesis_use_separate_budgets(self) -> None:
         calls = []
 
