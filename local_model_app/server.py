@@ -195,7 +195,11 @@ class Runtime:
         self.store = ChatStore(self.paths.data_directory / "chats.sqlite3")
         self.store.discard_empty_chats()
         self.tasks = TaskStore(self.paths.data_directory / "tasks.sqlite3")
-        self.mcp = McpPluginManager(McpPluginRegistry(ROOT / "config" / "mcp.d", project_root=ROOT))
+        self.mcp = McpPluginManager(McpPluginRegistry(
+            ROOT / "config" / "mcp.d",
+            project_root=ROOT,
+            variables={"DATA_DIRECTORY": str(self.paths.data_directory)},
+        ))
         self.workflow_skills = WorkflowSkillRegistry(ROOT / "config" / "skills")
         self.load_error: str | None = None
         self.loading = False

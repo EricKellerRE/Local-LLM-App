@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -118,6 +119,30 @@ class DurableToolExecutorTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            research_root = root / "research" / "task-1"
+            (research_root / "source-analysis").mkdir(parents=True)
+            (research_root / "source-analysis" / "paper.json").write_text("{}", encoding="utf-8")
+            (research_root / "sections").mkdir()
+            (research_root / "sections" / "section.json").write_text("{}", encoding="utf-8")
+            (research_root / "paper-reports").mkdir()
+            (research_root / "paper-reports" / "paper.md").write_text(
+                "# Paper\n\nSource: https://example.com/paper\n\nDurable report.", encoding="utf-8"
+            )
+            (research_root / "sources").mkdir()
+            (research_root / "sources" / "paper.md").write_text("Source text", encoding="utf-8")
+            (research_root / "originals").mkdir()
+            (research_root / "originals" / "paper.pdf").write_bytes(b"%PDF fixture")
+            (research_root / "source-ledger.json").write_text(json.dumps({
+                "sources": [{
+                    "id": "paper",
+                    "title": "Paper",
+                    "url": "https://example.com/paper",
+                    "depth": 0,
+                    "status": "analyzed",
+                    "analysis_file": "research/task-1/source-analysis/paper.json",
+                    "paper_report_file": "research/task-1/paper-reports/paper.md",
+                }],
+            }), encoding="utf-8")
             executor = DurableSynthesisExecutor(unused_generate, root)
             task = {
                 "id": "task-1",
@@ -153,6 +178,18 @@ class DurableToolExecutorTests(unittest.TestCase):
             self.assertGreater(path.stat().st_size, 1000)
             markdown = path.with_name("report.md").read_text(encoding="utf-8")
             self.assertIn("durable synaptic change", markdown)
+            self.assertFalse((research_root / "source-analysis").exists())
+            self.assertFalse((research_root / "sections").exists())
+            self.assertTrue((research_root / "paper-reports" / "paper.md").is_file())
+            self.assertTrue((research_root / "sources" / "paper.md").is_file())
+            self.assertTrue((research_root / "originals" / "paper.pdf").is_file())
+            ledger = json.loads((research_root / "source-ledger.json").read_text(encoding="utf-8"))
+            self.assertNotIn("analysis_file", ledger["sources"][0])
+            self.assertTrue(ledger["sources"][0]["analysis_notes_deleted"])
+            self.assertEqual(
+                ledger["intermediate_note_cleanup"]["removed_directories"],
+                ["source-analysis", "sections"],
+            )
 
 
 if __name__ == "__main__":

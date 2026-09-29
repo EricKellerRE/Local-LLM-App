@@ -363,6 +363,23 @@ class ResearchSourceProcessor:
     def _path(self, task_id: str, source_key: str) -> Path:
         return self.data_directory / "research" / task_id / "source-analysis" / f"{source_key}.json"
 
+    def _paper_report_path(self, task_id: str, source_key: str) -> Path:
+        return self.data_directory / "research" / task_id / "paper-reports" / f"{source_key}.md"
+
+    def _save_paper_report(self, task_id: str, source: dict[str, Any], dossier: str) -> Path:
+        path = self._paper_report_path(task_id, source["id"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        title = str(source.get("title") or source["url"]).strip()
+        report = (
+            f"# {title}\n\n"
+            f"Source: {source['url']}\n\n"
+            f"{dossier.strip()}\n"
+        )
+        temporary = path.with_suffix(".md.tmp")
+        temporary.write_text(report, encoding="utf-8")
+        temporary.replace(path)
+        return path
+
     async def process(
         self,
         task: dict[str, Any],
@@ -396,6 +413,11 @@ class ResearchSourceProcessor:
                 "status": "in_progress",
             }
         if state.get("status") == "completed" and str(state.get("dossier") or "").strip():
+            report_path = self._paper_report_path(str(task["id"]), source["id"])
+            if not report_path.is_file():
+                self._save_paper_report(str(task["id"]), source, str(state["dossier"]))
+            state["paper_report_file"] = str(report_path.relative_to(self.data_directory))
+            _atomic_json(path, state)
             return state
 
         if state["mode"] == "whole_document":
@@ -484,8 +506,8 @@ class ResearchSourceProcessor:
 
         dossier = await self.build_dossier([
             {"role": "system", "content": (
-                "Create a reusable evidence dossier for exactly one scholarly source. Preserve the title and exact "
-                "URL, then organize the source-grounded methods, study system or population, principal findings, "
+                "Create a standalone report for exactly one scholarly source. Preserve the title and exact URL, then "
+                "organize the source-grounded methods, study system or population, principal findings, "
                 "mechanisms, causal strength, boundary conditions, limitations, disagreements, and useful cited leads. "
                 "Preserve or explicitly revise the candidate document-type qualifiers supplied in the source record. "
                 "Distinguish what the source reports from interpretation. Do not write a multi-source report."
@@ -502,6 +524,8 @@ class ResearchSourceProcessor:
             }, ensure_ascii=False)},
         ])
         state["dossier"] = dossier.strip()
+        paper_report_path = self._save_paper_report(str(task["id"]), source, state["dossier"])
+        state["paper_report_file"] = str(paper_report_path.relative_to(self.data_directory))
         state["status"] = "completed"
         _atomic_json(path, state)
         return state
@@ -540,7 +564,18 @@ class ResearchDiscoveryExecutor:
 
     @staticmethod
     def _counts_toward_target(source: dict[str, Any]) -> bool:
-        return source.get("evidence_role", "core") == "core" and source.get("status") != "dropped"
+        return (
+            source.get("evidence_role", "core") == "core"
+            and source.get("status") in {"fetched", "analyzed"}
+        )
+
+    @staticmethod
+    def _occupies_seed_slot(source: dict[str, Any]) -> bool:
+        return (
+            source.get("depth") == 0
+            and source.get("evidence_role", "core") == "core"
+            and source.get("status") in {"queued", "failed", "fetched", "analyzed"}
+        )
 
     @staticmethod
     def _annotate_candidate(candidate: dict[str, Any], policy: dict[str, Any], content: str = "") -> dict[str, Any]:
@@ -640,17 +675,44 @@ class ResearchDiscoveryExecutor:
         del url
         return source_rejection_reason(content)
 
-    async def _fetch_complete(self, url: str, max_characters: int) -> tuple[str, bool]:
+    async def _fetch_complete(
+        self,
+        url: str,
+        max_characters: int,
+        *,
+        task_id: str,
+        source_id: str,
+    ) -> tuple[str, bool, dict[str, Any]]:
         chunks: list[str] = []
         start = 0
         complete = False
+        archive: dict[str, Any] = {}
         chunk_size = min(30_000, max_characters)
         while start < max_characters:
-            payload = _structured(await self._call("fetch_url", {
+            arguments: dict[str, Any] = {
                 "url": url,
                 "start_index": start,
                 "max_length": min(chunk_size, max_characters - start),
-            }))
+            }
+            if start == 0:
+                arguments.update({
+                    "archive_task_id": task_id,
+                    "archive_source_id": source_id,
+                })
+            payload = _structured(await self._call("fetch_url", arguments))
+            if start == 0:
+                archive = {
+                    key: payload[key]
+                    for key in (
+                        "original_file",
+                        "original_url",
+                        "original_content_type",
+                        "original_bytes",
+                        "original_sha256",
+                        "original_archive_error",
+                    )
+                    if payload.get(key) is not None
+                }
             content = str(payload.get("content") or "")
             if start == 0:
                 obvious_rejection = _obvious_unreadable_reason(content)
@@ -663,7 +725,7 @@ class ResearchDiscoveryExecutor:
             if complete or not content or next_start <= start:
                 break
             start = next_start
-        return "\n\n".join(chunks), complete
+        return "\n\n".join(chunks), complete, archive
 
     @staticmethod
     def _new_ledger(goal: str, config: dict[str, int]) -> dict[str, Any]:
@@ -678,7 +740,14 @@ class ResearchDiscoveryExecutor:
 
     async def _seed(self, ledger: dict[str, Any], target: int, policy: dict[str, Any]) -> dict[str, Any]:
         goal = ledger["goal"]
-        queries = [goal, f'"{goal}" review', f"{goal} primary study"]
+        queries = [
+            goal,
+            f"{goal} primary research experiment",
+            f"{goal} empirical study",
+            f"site:pmc.ncbi.nlm.nih.gov {goal}",
+            f"site:pubmed.ncbi.nlm.nih.gov {goal}",
+            f'"{goal}" review',
+        ]
         initial_sources = len(ledger["sources"])
         initial_page_count = len(ledger.get("search_pages") or [])
         seen = {source["url"] for source in ledger["sources"]}
@@ -687,10 +756,7 @@ class ResearchDiscoveryExecutor:
         page_history = ledger.setdefault("search_pages", [])
         for query in queries:
             while int(pages.get(query) or 0) < MAX_SEED_SEARCH_PAGES:
-                active_count = sum(
-                    source["depth"] == 0 and self._counts_toward_target(source)
-                    for source in ledger["sources"]
-                )
+                active_count = sum(self._occupies_seed_slot(source) for source in ledger["sources"])
                 if active_count >= target:
                     break
                 page = int(pages.get(query) or 0) + 1
@@ -777,10 +843,7 @@ class ResearchDiscoveryExecutor:
                         break
                 if not selected:
                     break
-            if sum(
-                source["depth"] == 0 and self._counts_toward_target(source)
-                for source in ledger["sources"]
-            ) >= target:
+            if sum(self._occupies_seed_slot(source) for source in ledger["sources"]) >= target:
                 break
         activity = {
             "sources_added": len(ledger["sources"]) - initial_sources,
@@ -802,6 +865,9 @@ class ResearchDiscoveryExecutor:
         reference_cap: int,
         max_characters: int,
         policy: dict[str, Any],
+        *,
+        analyze_sources: bool = True,
+        extract_references: bool = True,
     ) -> list[dict[str, str]]:
         candidates: dict[str, dict[str, str]] = {}
         for source in [
@@ -813,7 +879,13 @@ class ResearchDiscoveryExecutor:
                     content = (sources_dir / source["content_file"]).read_text(encoding="utf-8")
                 else:
                     source["fetch_attempts"] = int(source.get("fetch_attempts") or 0) + 1
-                    content, complete = await self._fetch_complete(source["url"], max_characters)
+                    content, complete, archive = await self._fetch_complete(
+                        source["url"],
+                        max_characters,
+                        task_id=str(task["id"]),
+                        source_id=str(source["id"]),
+                    )
+                    source.update(archive)
                     rejection_reason = self._source_rejection_reason(source["url"], content)
                     if rejection_reason:
                         raise SourceRejectedError(rejection_reason)
@@ -844,14 +916,18 @@ class ResearchDiscoveryExecutor:
                 role = source.get("evidence_role") or str(policy.get("unresolved_role") or "disallowed")
                 if role == "supplemental":
                     source["status"] = "supplemental"
-                elif self.source_processor is not None and source.get("status") != "analyzed":
+                elif analyze_sources and self.source_processor is not None and source.get("status") != "analyzed":
                     analysis = await self.source_processor.process(task, source, content)
                     source["analysis_file"] = str(
                         self.source_processor._path(str(task["id"]), source["id"]).relative_to(self.data_directory)
                     )
+                    source["paper_report_file"] = analysis.get("paper_report_file")
                     source["analysis_mode"] = analysis["mode"]
                     source["content_tokens"] = analysis["token_count"]
                     source["status"] = "analyzed"
+                if not extract_references:
+                    _atomic_json(ledger_path, ledger)
+                    continue
                 if role == "supplemental" and not bool(policy.get("follow_supplemental_references")):
                     source["references_found"] = 0
                     _atomic_json(ledger_path, ledger)
@@ -1039,34 +1115,75 @@ class ResearchDiscoveryExecutor:
         )
 
         await self.manager.ensure_started(["local.web-research"])
-        active_seed_count = sum(
+        usable_seed_count = sum(
             source["depth"] == 0 and self._counts_toward_target(source)
             for source in ledger["sources"]
         )
-        seed_activity = {"sources_added": 0, "pages_examined": 0, "search_exhausted": False}
-        if active_seed_count < config["seed_sources"]:
-            seed_activity = await self._seed(ledger, config["seed_sources"], policy)
-            _atomic_json(ledger_path, ledger)
-        active_seed_count = sum(
-            source["depth"] == 0 and self._counts_toward_target(source)
-            for source in ledger["sources"]
-        )
-        if active_seed_count < config["seed_sources"]:
-            if not seed_activity["sources_added"] and not seed_activity["pages_examined"]:
-                ledger["stop_reason"] = "seed_discovery_exhausted"
+        if ledger.get("seed_phase") != "complete" or usable_seed_count < config["seed_sources"]:
+            ledger["seed_phase"] = "gathering"
+            gathering_rounds = 0
+            while usable_seed_count < config["seed_sources"]:
+                gathering_rounds += 1
+                pending_seed_sources = [
+                    source for source in ledger["sources"]
+                    if source.get("depth") == 0
+                    and source.get("evidence_role", "core") == "core"
+                    and source.get("status") in {"queued", "failed"}
+                ]
+                if pending_seed_sources:
+                    await self._fetch_depth(
+                        task,
+                        ledger,
+                        sources_dir,
+                        ledger_path,
+                        0,
+                        config["references_per_source"],
+                        config["source_max_characters"],
+                        policy,
+                        analyze_sources=False,
+                        extract_references=False,
+                    )
+                    usable_seed_count = sum(
+                        source["depth"] == 0 and self._counts_toward_target(source)
+                        for source in ledger["sources"]
+                    )
+                    if usable_seed_count >= config["seed_sources"]:
+                        break
+                seed_activity = await self._seed(ledger, config["seed_sources"], policy)
                 _atomic_json(ledger_path, ledger)
-                return WorkItemOutcome(
-                    outcome="failed",
-                    summary=(f"Seed discovery exhausted its configured search pages with "
-                             f"{active_seed_count} of {config['seed_sources']} admissible sources. "
-                             "The task stopped instead of retrying without new work."),
+                pending_after_refill = sum(
+                    source.get("depth") == 0
+                    and source.get("evidence_role", "core") == "core"
+                    and source.get("status") in {"queued", "failed"}
+                    for source in ledger["sources"]
                 )
-            return WorkItemOutcome(
-                outcome="retry",
-                summary=(f"Seed discovery found only {active_seed_count} unique sources; "
-                         f"{config['seed_sources']} are required before citation expansion."),
-                wait_seconds=30,
-            )
+                if (
+                    not seed_activity["sources_added"]
+                    and not seed_activity["pages_examined"]
+                    and not pending_after_refill
+                ):
+                    ledger["stop_reason"] = "seed_discovery_exhausted"
+                    _atomic_json(ledger_path, ledger)
+                    return WorkItemOutcome(
+                        outcome="failed",
+                        summary=(
+                            f"Seed gathering exhausted every configured search route with "
+                            f"{usable_seed_count} of {config['seed_sources']} reachable, admissible sources."
+                        ),
+                    )
+                if gathering_rounds >= max(64, config["max_sources"] * 4):
+                    return WorkItemOutcome(
+                        outcome="retry",
+                        summary=(
+                            f"Validated {usable_seed_count} of {config['seed_sources']} required seed sources; "
+                            f"{pending_after_refill} replacement candidate(s) remain queued after a bounded "
+                            "gathering episode."
+                        ),
+                        wait_seconds=1,
+                    )
+            ledger["seed_phase"] = "complete"
+            ledger["stop_reason"] = None
+            _atomic_json(ledger_path, ledger)
 
         known = {source["url"] for source in ledger["sources"]}
         existing_depths = {int(row["depth"]) for row in ledger.get("passes", [])}
@@ -1095,32 +1212,18 @@ class ResearchDiscoveryExecutor:
                     and source["status"] in {"fetched", "analyzed"}
                 ]
                 if len(readable_seeds) < config["seed_sources"]:
-                    for source in ledger["sources"]:
-                        if (source["depth"] == 0 and source.get("status") == "failed" and
-                                int(source.get("fetch_attempts") or 0) >= 2):
-                            source["status"] = "dropped"
-                    refill_activity = await self._seed(ledger, config["seed_sources"], policy)
+                    ledger["seed_phase"] = "gathering"
+                    ledger["passes"] = [
+                        row for row in ledger.get("passes", []) if int(row.get("depth") or 0) != 0
+                    ]
                     _atomic_json(ledger_path, ledger)
-                    queued_or_readable = sum(
-                        source["depth"] == 0 and self._counts_toward_target(source)
-                        for source in ledger["sources"]
-                    )
-                    if (queued_or_readable < config["seed_sources"] and
-                            not refill_activity["sources_added"] and
-                            not refill_activity["pages_examined"]):
-                        ledger["stop_reason"] = "seed_discovery_exhausted"
-                        _atomic_json(ledger_path, ledger)
-                        return WorkItemOutcome(
-                            outcome="failed",
-                            summary=(f"Only {len(readable_seeds)} of {config['seed_sources']} required seed "
-                                     "sources were readable, and replacement discovery was exhausted. "
-                                     "The task stopped instead of retrying without new work."),
-                        )
                     return WorkItemOutcome(
                         outcome="retry",
-                        summary=(f"Read {len(readable_seeds)} of {config['seed_sources']} required seed sources; "
-                                 "failed candidates were checkpointed and replacements queued."),
-                        wait_seconds=30,
+                        summary=(
+                            f"A seed became unusable during analysis; returning to quota gathering with "
+                            f"{len(readable_seeds)} of {config['seed_sources']} reachable sources preserved."
+                        ),
+                        wait_seconds=1,
                     )
             novel = [candidate for candidate in candidates if not candidate["url"] or candidate["url"] not in known]
             active_sources = sum(source.get("status") != "dropped" for source in ledger["sources"])

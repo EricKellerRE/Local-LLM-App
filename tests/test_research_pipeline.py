@@ -226,12 +226,22 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
             first = asyncio.run(processor.process(task, source, content))
             call_count = len(section_calls) + len(dossier_calls)
             second = asyncio.run(processor.process(task, source, content))
+            paper_report = (
+                root / "research" / "task-source" / "paper-reports" / "a.md"
+            ).read_text(encoding="utf-8")
 
         self.assertEqual(first["mode"], "sections")
         self.assertEqual(first["status"], "completed")
         self.assertGreaterEqual(len(first["sections"]), 3)
         self.assertEqual(second["dossier"], first["dossier"])
         self.assertEqual(len(section_calls) + len(dossier_calls), call_count)
+        self.assertEqual(
+            Path(first["paper_report_file"]),
+            Path("research") / "task-source" / "paper-reports" / "a.md",
+        )
+        self.assertIn("# A", paper_report)
+        self.assertIn("https://papers.test/a", paper_report)
+        self.assertIn("source dossier", paper_report)
 
     def test_source_processor_stops_after_first_unreadable_segment(self):
         section_calls = []
@@ -291,7 +301,7 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
             ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
 
         self.assertEqual(outcome.outcome, "failed")
-        self.assertIn("stopped instead of retrying", outcome.summary)
+        self.assertIn("exhausted every configured search route", outcome.summary)
         self.assertEqual(ledger["stop_reason"], "seed_discovery_exhausted")
 
     def test_discovery_fetches_a_long_source_in_exact_url_chunks(self):
@@ -306,12 +316,21 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
                 start = int(arguments.get("start_index") or 0)
                 length = int(arguments.get("max_length") or 30_000)
                 end = min(len(document), start + length)
-                return {"structuredContent": {
+                payload = {
                     "url": url,
                     "content": document[start:end],
                     "complete": end >= len(document),
                     "next_start": end if end < len(document) else None,
-                }}
+                }
+                if start == 0:
+                    payload.update({
+                        "original_file": "research/task-chunks/originals/source.pdf",
+                        "original_url": url,
+                        "original_content_type": "application/pdf",
+                        "original_bytes": 1234,
+                        "original_sha256": "a" * 64,
+                    })
+                return {"structuredContent": payload}
 
         async def keep_all(goal, candidates):
             return assessed_selection(candidates)
@@ -328,10 +347,18 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
             outcome = asyncio.run(executor.execute_work_item(task, {}, []))
             saved = (root / "research" / "task-chunks" / "sources").glob("*.md")
             content = next(saved).read_text(encoding="utf-8")
+            ledger = json.loads(
+                (root / "research" / "task-chunks" / "source-ledger.json").read_text(encoding="utf-8")
+            )
 
         fetch_calls = [args for name, args in manager.calls if name == "web__fetch_url"]
         self.assertEqual(outcome.outcome, "completed")
         self.assertEqual([call["start_index"] for call in fetch_calls], [0, 30000, 60000])
+        self.assertEqual(fetch_calls[0]["archive_task_id"], "task-chunks")
+        self.assertIn("archive_source_id", fetch_calls[0])
+        self.assertNotIn("archive_task_id", fetch_calls[1])
+        self.assertEqual(ledger["sources"][0]["original_bytes"], 1234)
+        self.assertEqual(ledger["sources"][0]["original_sha256"], "a" * 64)
         self.assertGreaterEqual(len(content), len(document))
 
     def test_unusable_seed_is_dropped_and_refilled(self):
@@ -363,14 +390,71 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
             task = {"id": "task-refill", "definition": {"goal": "memory", "metadata": {
                 "research_seed_sources": 1, "research_depth_passes": 0,
             }}}
-            first = asyncio.run(executor.execute_work_item(task, {}, []))
-            second = asyncio.run(executor.execute_work_item(task, {}, []))
+            outcome = asyncio.run(executor.execute_work_item(task, {}, []))
             ledger = json.loads((root / "research" / "task-refill" / "source-ledger.json").read_text())
 
-        self.assertEqual(first.outcome, "retry")
-        self.assertEqual(second.outcome, "completed")
+        self.assertEqual(outcome.outcome, "completed")
         self.assertEqual(next(source for source in ledger["sources"] if source["url"] == bad)["status"], "dropped")
         self.assertEqual(next(source for source in ledger["sources"] if source["url"] == good)["status"], "fetched")
+
+    def test_analysis_waits_until_the_reachable_seed_quota_is_full(self):
+        urls = ["https://papers.test/one", "https://papers.test/two"]
+        pages = {
+            url: " ".join([f"experimental memory evidence from {index}"] * 120)
+            for index, url in enumerate(urls, 1)
+        }
+        manager = FakeResearchManager(
+            [
+                {"title": f"Paper {index}", "href": url, "body": "primary memory study"}
+                for index, url in enumerate(urls, 1)
+            ],
+            pages,
+        )
+
+        async def keep_all(goal, candidates):
+            return assessed_selection(candidates)
+
+        class RecordingProcessor:
+            def __init__(self, root):
+                self.root = root
+                self.observed_reachable_counts = []
+
+            def _path(self, task_id, source_key):
+                return self.root / "research" / task_id / "source-analysis" / f"{source_key}.json"
+
+            async def process(self, task, source, content):
+                ledger_path = self.root / "research" / task["id"] / "source-ledger.json"
+                ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+                self.observed_reachable_counts.append(sum(
+                    row.get("depth") == 0
+                    and row.get("evidence_role", "core") == "core"
+                    and row.get("status") in {"fetched", "analyzed"}
+                    for row in ledger["sources"]
+                ))
+                path = self._path(task["id"], source["id"])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}", encoding="utf-8")
+                return {
+                    "mode": "whole_document",
+                    "token_count": len(content.split()),
+                    "paper_report_file": f"research/{task['id']}/paper-reports/{source['id']}.md",
+                }
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            processor = RecordingProcessor(root)
+            executor = ResearchDiscoveryExecutor(manager, root, keep_all, processor)
+            task = {"id": "task-seed-barrier", "definition": {"goal": "memory", "metadata": {
+                "research_seed_sources": 2, "research_depth_passes": 0,
+            }}}
+            outcome = asyncio.run(executor.execute_work_item(task, {}, []))
+            ledger = json.loads(
+                (root / "research" / "task-seed-barrier" / "source-ledger.json").read_text()
+            )
+
+        self.assertEqual(outcome.outcome, "completed")
+        self.assertEqual(ledger["seed_phase"], "complete")
+        self.assertEqual(processor.observed_reachable_counts, [2, 2])
 
     def test_canonical_url_removes_tracking_and_fragment(self):
         self.assertEqual(
@@ -569,7 +653,7 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
             }}}
             outcome = asyncio.run(executor.execute_work_item(task, {}, []))
 
-        self.assertEqual(outcome.outcome, "retry")
+        self.assertEqual(outcome.outcome, "failed")
         self.assertEqual(len(calls), 2)
 
     def test_notes_are_batched_and_persisted_for_restart(self):
