@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from local_model_app.generation_context import current_generation_context
 from local_model_app.task_engine import UniversalTaskEngine
 from local_model_app.task_models import (
     CompletionAudit,
@@ -46,6 +47,20 @@ class WaitingCoordinator(FakeCoordinator):
         )
 
 
+class ContextCoordinator(FakeCoordinator):
+    def __init__(self) -> None:
+        self.execution_context = {}
+        self.audit_context = {}
+
+    async def execute_work_item(self, task, item, completed_items):
+        self.execution_context = current_generation_context()
+        return await super().execute_work_item(task, item, completed_items)
+
+    async def audit_completion(self, task, work_items):
+        self.audit_context = current_generation_context()
+        return await super().audit_completion(task, work_items)
+
+
 class TaskEngineTests(unittest.TestCase):
     def test_bounded_episode_completes_and_audits_task(self) -> None:
         with TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -63,6 +78,28 @@ class TaskEngineTests(unittest.TestCase):
             self.assertEqual(detail["status"], "completed")
             self.assertEqual(detail["work_items"][0]["status"], "completed")
             self.assertTrue(detail["latest_audit"]["passed"])
+            store.close()
+
+    def test_generations_inherit_task_and_work_item_provenance(self) -> None:
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            store = TaskStore(Path(directory) / "tasks.sqlite3")
+            task = store.create_task(
+                "Do this",
+                TaskDefinition(title="Task", goal="Do this", success_criteria=["Done"]),
+            )
+            store.start_task(task["id"])
+            coordinator = ContextCoordinator()
+            engine = UniversalTaskEngine(store, coordinator, poll_seconds=0.01)
+
+            asyncio.run(engine.run_pending_once())
+
+            self.assertEqual(coordinator.execution_context["task_id"], task["id"])
+            self.assertTrue(coordinator.execution_context["work_item_id"])
+            self.assertEqual(coordinator.execution_context["task_phase"], "work_item_execution")
+            self.assertEqual(coordinator.audit_context, {
+                "task_id": task["id"],
+                "task_phase": "completion_audit",
+            })
             store.close()
 
     def test_missing_capability_waits_without_claiming_success(self) -> None:

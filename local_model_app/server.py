@@ -22,6 +22,7 @@ from local_model_app.chat_store import ChatStore
 from local_model_app.config import Settings, _load_dotenv
 from local_model_app.coordinator import Coordinator
 from local_model_app.durable_tools import DurableSectionExecutor, DurableSynthesisExecutor, DurableToolExecutor
+from local_model_app.generation_context import generation_context
 from local_model_app.model import TransformersModel
 from local_model_app.research_pipeline import (
     CandidateSelection,
@@ -273,6 +274,42 @@ class Runtime:
             finally:
                 self.loading = False
 
+    def _generate_resumable(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        generation_class: str,
+        maximum_segments: int = 4,
+    ) -> str:
+        """Continue bounded prose generations that stop only because their output budget was filled."""
+        active = [dict(message) for message in messages]
+        chunks: list[str] = []
+        for index in range(max(1, maximum_segments)):
+            reply = self.model.chat(
+                active,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                generation_class=generation_class,
+                telemetry_context={"continuation_index": index},
+            )
+            if reply.content.strip():
+                chunks.append(reply.content.strip())
+            if reply.stop_reason != "length":
+                break
+            active.extend([
+                {"role": "assistant", "content": reply.content.strip()},
+                {
+                    "role": "user",
+                    "content": (
+                        "Continue exactly where the preceding response stopped. Add only omitted source-grounded "
+                        "material needed to complete the requested structure. Do not restart or repeat prior text."
+                    ),
+                },
+            ])
+        return "\n\n".join(chunks)
+
     @asynccontextmanager
     async def activity(self, label: str):
         token = uuid.uuid4().hex
@@ -438,7 +475,7 @@ class Runtime:
         async with self._inference_lock:
             await self.ensure_loaded()
             return await asyncio.to_thread(
-                self.model.generate,
+                self._generate_resumable,
                 messages,
                 max_new_tokens=int(getattr(self.model.settings, "research_notes_max_new_tokens", 768)),
                 temperature=self.model.settings.tool_temperature,
@@ -450,7 +487,7 @@ class Runtime:
         async with self._inference_lock:
             await self.ensure_loaded()
             return await asyncio.to_thread(
-                self.model.generate,
+                self._generate_resumable,
                 messages,
                 max_new_tokens=int(getattr(
                     self.model.settings, "research_source_dossier_max_new_tokens", 1536
@@ -692,25 +729,27 @@ class Runtime:
                 selected_plugins = self.store.selected_plugins(chat_id)
         if self._durable_request(content, bool(selected_plugins)):
             return await self._start_durable_chat_task(chat, content, selected_plugins)
-        async with self._inference_lock:
-            await self.ensure_loaded()
-            if selected_plugins:
-                coordinator = ToolCoordinator(
-                    self.model,
-                    self.mcp,
-                    Scratchpad(self.data_directory / "scratchpads" / f"{chat_id}.jsonl"),
-                    self.data_directory / "tool_activity" / f"{chat_id}.jsonl",
-                    router=self.tool_router,
-                    max_calls=self.model.settings.max_tool_calls_per_step,
-                )
-                answer = await coordinator.respond(content, history, selected_plugins)
-            else:
-                coordinator = Coordinator(
-                    self.model,
-                    Scratchpad(self.data_directory / "scratchpads" / f"{chat_id}.jsonl"),
-                )
-                coordinator.history = history
-                answer = await asyncio.to_thread(coordinator.respond, content)
+        with generation_context(chat_id=chat_id, task_phase="chat_response"):
+            async with self._inference_lock:
+                await self.ensure_loaded()
+                if selected_plugins:
+                    coordinator = ToolCoordinator(
+                        self.model,
+                        self.mcp,
+                        Scratchpad(self.data_directory / "scratchpads" / f"{chat_id}.jsonl"),
+                        self.data_directory / "tool_activity" / f"{chat_id}.jsonl",
+                        router=self.tool_router,
+                        max_calls=self.model.settings.max_tool_calls_per_step,
+                        telemetry_context={"chat_id": chat_id},
+                    )
+                    answer = await coordinator.respond(content, history, selected_plugins)
+                else:
+                    coordinator = Coordinator(
+                        self.model,
+                        Scratchpad(self.data_directory / "scratchpads" / f"{chat_id}.jsonl"),
+                    )
+                    coordinator.history = history
+                    answer = await asyncio.to_thread(coordinator.respond, content)
         self.store.append_exchange(chat_id, content, answer)
         return answer
 

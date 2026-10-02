@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import gzip
+import hashlib
 import json
+import re
 import threading
 import time
 import uuid
@@ -11,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from local_model_app.config import Settings
+from local_model_app.generation_context import current_generation_context
 
 
 @dataclass(frozen=True)
@@ -27,10 +31,19 @@ class AssistantReply:
 class TransformersModel:
     """Lazy Hugging Face Transformers loader and text generator."""
 
-    def __init__(self, settings: Settings, telemetry_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        telemetry_path: Path | None = None,
+        generation_records_directory: Path | None = None,
+    ) -> None:
         self.settings = settings
         self.telemetry_path = telemetry_path
+        self.generation_records_directory = generation_records_directory or (
+            telemetry_path.parent / "generation_records" if telemetry_path is not None else None
+        )
         self._telemetry_lock = threading.Lock()
+        self._fit_state = threading.local()
         self.tokenizer: Any | None = None
         self.processor: Any | None = None
         self.model: Any | None = None
@@ -48,6 +61,42 @@ class TransformersModel:
         except OSError:
             # Diagnostics must never turn a successful model response into an error.
             return
+
+    @staticmethod
+    def _public_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Preserve model-visible messages without persisting private reasoning fields."""
+        public: list[dict[str, Any]] = []
+        for source in messages:
+            message = copy.deepcopy(source)
+            message.pop("reasoning", None)
+            message.pop("reasoning_content", None)
+            public.append(message)
+        return public
+
+    @staticmethod
+    def _safe_scope(value: Any) -> str:
+        cleaned = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(value or "unscoped")).strip("._")
+        return cleaned[:160] or "unscoped"
+
+    def _write_generation_record(self, record: dict[str, Any], context: dict[str, Any]) -> str | None:
+        """Atomically preserve an exact visible prompt/response record as compressed JSON."""
+        root = self.generation_records_directory
+        if root is None:
+            return None
+        scope = context.get("task_id") or context.get("chat_id") or "unscoped"
+        directory = root / self._safe_scope(scope)
+        path = directory / f"{record['generation_id']}.json.gz"
+        temporary = path.with_suffix(".json.gz.tmp")
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            with self._telemetry_lock:
+                with gzip.open(temporary, "wt", encoding="utf-8") as stream:
+                    json.dump(record, stream, ensure_ascii=False, separators=(",", ":"))
+                temporary.replace(path)
+            return str(path.relative_to(root.parent))
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            return None
 
     @staticmethod
     def _text_token_count(decoder: Any, text: str | None) -> int | None:
@@ -206,6 +255,16 @@ class TransformersModel:
         text = "\n\n".join(f"{message['role'].upper()}: {message['content']}" for message in messages) + "\nASSISTANT:"
         return tokenizer(text, return_tensors="pt")
 
+    def count_prompt_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> int:
+        """Count the complete model-facing prompt, including supplied tool schemas."""
+        self._load()
+        inputs = self._format_inputs(messages, tools, 1)
+        return int(inputs["input_ids"].shape[-1])
+
     @staticmethod
     def _without_oldest_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """Drop one complete old turn while retaining leading system messages and the latest turn."""
@@ -253,6 +312,9 @@ class TransformersModel:
     ) -> Any:
         context_window = self.effective_context_window
         if context_window is None:
+            self._fit_state.messages = copy.deepcopy(messages)
+            self._fit_state.dropped_turns = 0
+            self._fit_state.left_truncated = False
             return self._format_inputs(messages, tools, max_new_tokens)
         max_input_tokens = context_window - max_new_tokens
         if max_input_tokens < 1:
@@ -262,13 +324,21 @@ class TransformersModel:
             )
 
         retained = copy.deepcopy(messages)
+        dropped_turns = 0
         inputs = self._format_inputs(retained, tools, max_new_tokens)
         while int(inputs["input_ids"].shape[-1]) > max_input_tokens:
             shortened = self._without_oldest_turn(retained)
             if shortened is None:
+                self._fit_state.messages = retained
+                self._fit_state.dropped_turns = dropped_turns
+                self._fit_state.left_truncated = True
                 return self._truncate_token_inputs(inputs, max_input_tokens)
             retained = shortened
+            dropped_turns += 1
             inputs = self._format_inputs(retained, tools, max_new_tokens)
+        self._fit_state.messages = retained
+        self._fit_state.dropped_turns = dropped_turns
+        self._fit_state.left_truncated = False
         return inputs
 
     def chat(
@@ -285,6 +355,10 @@ class TransformersModel:
         import torch
 
         assert self.model is not None
+        generation_id = uuid.uuid4().hex
+        generated_at = datetime.now(timezone.utc).isoformat()
+        context = current_generation_context()
+        context.update(telemetry_context or {})
         tokenizer = self.tokenizer
         selected_max_new_tokens = max_new_tokens if max_new_tokens is not None else self.settings.max_new_tokens
         inputs = self._context_fitted_inputs(messages, tools, selected_max_new_tokens)
@@ -362,9 +436,28 @@ class TransformersModel:
             "eos" if generated_tokens and last_token in eos_ids else
             "completed"
         )
+        retained_messages = getattr(self._fit_state, "messages", messages)
+        dropped_turns = int(getattr(self._fit_state, "dropped_turns", 0))
+        left_truncated = bool(getattr(self._fit_state, "left_truncated", False))
+        public_messages = self._public_messages(retained_messages)
+        prompt_payload = {
+            "messages": public_messages,
+            "tools": copy.deepcopy(tools or []),
+        }
+        response_payload = {
+            "role": "assistant",
+            "content": content.strip(),
+            "tool_calls": tool_calls,
+        }
+        prompt_sha256 = hashlib.sha256(
+            json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        response_sha256 = hashlib.sha256(
+            json.dumps(response_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "generation_id": uuid.uuid4().hex,
+            "timestamp": generated_at,
+            "generation_id": generation_id,
             "generation_class": generation_class,
             "model_id": self.settings.model_id,
             "device": self.settings.device,
@@ -378,8 +471,44 @@ class TransformersModel:
             "tokens_per_second": round(generated_tokens / elapsed_seconds, 6) if elapsed_seconds else None,
             "stop_reason": stop_reason,
             "tool_call_count": len(tool_calls),
-            **(telemetry_context or {}),
+            "context_dropped_turns": dropped_turns,
+            "context_left_truncated": left_truncated,
+            "prompt_sha256": prompt_sha256,
+            "response_sha256": response_sha256,
+            **context,
         }
+        generation_record = {
+            "schema_version": 1,
+            "generation_id": generation_id,
+            "timestamp": generated_at,
+            "context": context,
+            "request": {
+                **prompt_payload,
+                "generation_class": generation_class,
+                "max_new_tokens": selected_max_new_tokens,
+                "temperature": selected_temperature,
+                "top_p": self.settings.top_p,
+                "effective_context_window": self.effective_context_window,
+                "prompt_tokens": prompt_tokens,
+                "submitted_message_count": len(messages),
+                "retained_message_count": len(retained_messages),
+                "dropped_turns": dropped_turns,
+                "left_truncated": left_truncated,
+                "sha256": prompt_sha256,
+            },
+            "response": {
+                **response_payload,
+                "generated_tokens": generated_tokens,
+                "content_tokens": record["content_tokens"],
+                "reasoning_was_generated": bool(reasoning),
+                "stop_reason": stop_reason,
+                "elapsed_seconds": record["elapsed_seconds"],
+                "sha256": response_sha256,
+            },
+        }
+        generation_record_path = self._write_generation_record(generation_record, context)
+        if generation_record_path:
+            record["generation_record"] = generation_record_path
         self._write_telemetry(record)
         return AssistantReply(
             content=content.strip(),

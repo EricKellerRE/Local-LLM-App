@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
+from local_model_app.generation_context import generation_context
 from local_model_app.task_coordinator import TaskCoordinatorProtocol, WorkItemExecutorProtocol
 from local_model_app.task_models import CompletionAudit, TaskStatus
 from local_model_app.task_store import TaskStore
@@ -121,7 +122,8 @@ class UniversalTaskEngine:
         try:
             items = self.store.work_items(task_id)
             if not items:
-                planned = await self.coordinator.plan_task(task)
+                with generation_context(task_id=task_id, task_phase="work_item_planning"):
+                    planned = await self.coordinator.plan_task(task)
                 self.store.add_work_items(task_id, planned)
 
             max_steps = int(policy["max_steps_per_episode"])
@@ -151,7 +153,14 @@ class UniversalTaskEngine:
                     )
                     return
                 try:
-                    outcome = await executor.execute_work_item(task, item, completed)
+                    with generation_context(
+                        task_id=task_id,
+                        work_item_id=str(item["id"]),
+                        work_item_key=item.get("key"),
+                        work_item_kind=item.get("kind"),
+                        task_phase="work_item_execution",
+                    ):
+                        outcome = await executor.execute_work_item(task, item, completed)
                 except Exception as exc:
                     await self._handle_execution_error(task, item, exc)
                     return
@@ -277,7 +286,8 @@ class UniversalTaskEngine:
                 )
             return
 
-        audit: CompletionAudit = await self.coordinator.audit_completion(task, items)
+        with generation_context(task_id=task_id, task_phase="completion_audit"):
+            audit: CompletionAudit = await self.coordinator.audit_completion(task, items)
         self.store.record_audit(task_id, audit.model_dump(mode="json"))
         if audit.passed:
             await self._release_task(task_id, TaskStatus.COMPLETED, summary=audit.summary)
