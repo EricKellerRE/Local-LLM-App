@@ -261,6 +261,69 @@ class ToolCoordinatorTests(unittest.TestCase):
         )
         self.assertGreaterEqual(events.count("tool_checkpoint"), 1)
 
+    def test_token_pressure_compacts_before_the_model_silently_drops_history(self) -> None:
+        tool = make_tool("lookup", required=["query"])
+
+        class PressureModel(FakeModel):
+            effective_context_window = 1024
+            settings = SimpleNamespace(
+                tool_action_max_new_tokens=192,
+                post_tool_decision_max_new_tokens=192,
+                max_new_tokens=192,
+                tool_temperature=0.0,
+            )
+
+            def count_prompt_tokens(self, messages, tools):
+                if any("Context checkpoint" in str(message.get("content") or "") for message in messages):
+                    return 180
+                if any(message.get("role") == "tool" for message in messages):
+                    return 900
+                return 200
+
+        model = PressureModel([
+            AssistantReply(content="", tool_calls=[{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": tool.exposed_name, "arguments": '{"query":"memory"}'},
+            }]),
+            AssistantReply(content="Lookup complete.", tool_calls=[]),
+        ])
+        manager = FakeManager([tool], {tool.exposed_name: {
+            "isError": False,
+            "structuredContent": {
+                "ok": True,
+                "source_id": "source-1",
+                "url": "https://example.test/source-1",
+            },
+        }})
+
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            activity = root / "activity.jsonl"
+            coordinator = ToolCoordinator(
+                model,
+                manager,
+                Scratchpad(root / "scratchpad.jsonl"),
+                activity,
+                max_calls=8,
+            )
+            answer = asyncio.run(coordinator.respond("Research memory", [], ["grid.plugin"]))
+            events = [json.loads(line) for line in activity.read_text(encoding="utf-8").splitlines()]
+            persisted_checkpoints = [
+                json.loads(line)
+                for line in activity.with_suffix(".checkpoints.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        checkpoints = [row for row in events if row["event"] == "tool_checkpoint"]
+        self.assertEqual(answer, "Lookup complete.")
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(checkpoints[0]["trigger"], "token_pressure")
+        self.assertEqual(checkpoints[0]["prompt_tokens"], 900)
+        self.assertEqual(persisted_checkpoints[0]["checkpoint_id"], checkpoints[0]["checkpoint_id"])
+        checkpoint_prompt = model.chat_calls[1]["messages"][0]["content"]
+        self.assertIn('"objective":"Research memory"', checkpoint_prompt)
+        self.assertIn('"source_id":"source-1"', checkpoint_prompt)
+
     def test_generic_router_exposes_only_top_schema_batch(self) -> None:
         weather = make_tool("weather_forecast", required=["city"])
         tools = [weather] + [make_tool(name) for name in (

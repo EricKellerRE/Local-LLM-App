@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 from pydantic import ValidationError
 
+from local_model_app.model import AssistantReply
 from local_model_app.server import Runtime, SettingsUpdateRequest
 from local_model_app.workflow_skills import WorkflowSkillRegistry
 
@@ -81,6 +82,36 @@ class RuntimePluginRequestTests(unittest.TestCase):
             "temperature": 0.7,
             "generation_class": "final_synthesis",
         })
+
+    def test_research_generation_continues_when_a_segment_hits_its_output_limit(self) -> None:
+        calls = []
+
+        class FakeModel:
+            def __init__(self):
+                self.replies = [
+                    AssistantReply(content="first half", tool_calls=[], stop_reason="length"),
+                    AssistantReply(content="second half", tool_calls=[], stop_reason="completed"),
+                ]
+
+            def chat(self, messages, **kwargs):
+                calls.append((messages, kwargs))
+                return self.replies.pop(0)
+
+        runtime = Runtime.__new__(Runtime)
+        runtime.model = FakeModel()
+
+        result = runtime._generate_resumable(
+            [{"role": "user", "content": "analyze this source"}],
+            max_new_tokens=768,
+            temperature=0.0,
+            generation_class="research_notes",
+        )
+
+        self.assertEqual(result, "first half\n\nsecond half")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][0][-2]["content"], "first half")
+        self.assertIn("Continue exactly where", calls[1][0][-1]["content"])
+        self.assertEqual(calls[1][1]["telemetry_context"]["continuation_index"], 1)
 
     def test_specific_mcp_name_is_detected_in_chat_request(self) -> None:
         runtime = Runtime.__new__(Runtime)

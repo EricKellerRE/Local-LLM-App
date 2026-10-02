@@ -1,3 +1,4 @@
+import gzip
 import json
 import unittest
 from pathlib import Path
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 
 import torch
 
+from local_model_app.generation_context import generation_context
 from local_model_app.model import TransformersModel
 
 
@@ -53,24 +55,35 @@ class GenerationTelemetryTests(unittest.TestCase):
                 "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
             }
 
-            reply = model.chat(
-                [{"role": "user", "content": "hello"}],
-                max_new_tokens=8,
-                temperature=0.0,
-                generation_class="post_tool_decision",
-                telemetry_context={"task_id": "task-1"},
-            )
+            with generation_context(work_item_id="item-1", source_id="source-1"):
+                reply = model.chat(
+                    [{"role": "user", "content": "hello"}],
+                    max_new_tokens=8,
+                    temperature=0.0,
+                    generation_class="post_tool_decision",
+                    telemetry_context={"task_id": "task-1"},
+                )
             record = json.loads(path.read_text(encoding="utf-8"))
+            generation_path = Path(directory) / record["generation_record"]
+            with gzip.open(generation_path, "rt", encoding="utf-8") as stream:
+                generation = json.load(stream)
 
         self.assertEqual(reply.generated_tokens, 2)
         self.assertEqual(reply.stop_reason, "eos")
         self.assertEqual(record["generation_class"], "post_tool_decision")
         self.assertEqual(record["task_id"], "task-1")
+        self.assertEqual(record["work_item_id"], "item-1")
+        self.assertEqual(record["source_id"], "source-1")
         self.assertEqual(record["prompt_tokens"], 3)
         self.assertEqual(record["generated_tokens"], 2)
         self.assertEqual(record["max_new_tokens"], 8)
         self.assertEqual(record["stop_reason"], "eos")
         self.assertGreaterEqual(record["elapsed_seconds"], 0)
+        self.assertEqual(generation["request"]["messages"], [{"role": "user", "content": "hello"}])
+        self.assertEqual(generation["response"]["content"], "done")
+        self.assertEqual(generation["context"]["task_id"], "task-1")
+        self.assertEqual(generation["request"]["sha256"], record["prompt_sha256"])
+        self.assertEqual(generation["response"]["sha256"], record["response_sha256"])
 
 
 if __name__ == "__main__":

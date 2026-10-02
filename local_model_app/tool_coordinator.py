@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from local_model_app.context_checkpoint import build_semantic_checkpoint, render_context_pack
 from local_model_app.mcp_manager import McpPluginManager
 from local_model_app.model import AssistantReply, TransformersModel
 from local_model_app.mcp_plugins import DiscoveredTool
@@ -146,6 +147,10 @@ class ToolCoordinator:
     def _state_path(self) -> Path:
         return self.activity_path.with_suffix(".state.json")
 
+    @property
+    def _checkpoint_history_path(self) -> Path:
+        return self.activity_path.with_suffix(".checkpoints.jsonl")
+
     def _load_state(self) -> dict[str, Any]:
         try:
             state = json.loads(self._state_path.read_text(encoding="utf-8"))
@@ -158,6 +163,11 @@ class ToolCoordinator:
         temporary = self._state_path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self._state_path)
+
+    def _record_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        self._checkpoint_history_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._checkpoint_history_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(checkpoint, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     def _clear_state(self) -> None:
         self._state_path.unlink(missing_ok=True)
@@ -372,33 +382,40 @@ class ToolCoordinator:
     def _setting(self, name: str, default: int | float) -> int | float:
         return getattr(getattr(self.model, "settings", None), name, default)
 
-    @staticmethod
-    def _checkpoint_summary(
+    def _estimated_prompt_tokens(
+        self,
         messages: list[dict[str, Any]],
-        data: dict[str, Any],
-        previous: str,
-    ) -> str:
-        """Build a deterministic bounded continuation record without ending the tool loop."""
-        recent: list[dict[str, Any]] = []
-        for message in messages[-8:]:
-            row: dict[str, Any] = {"role": message.get("role")}
-            if message.get("name"):
-                row["name"] = message["name"]
-            content = message.get("content")
-            if content:
-                row["content"] = str(content)[:3500]
-            if message.get("tool_calls"):
-                row["tool_calls"] = json.dumps(
-                    message["tool_calls"], ensure_ascii=False, separators=(",", ":")
-                )[:3500]
-            recent.append(row)
-        bounded_data, _ = _bounded_structured(data, 12_000)
-        record = {
-            "prior_checkpoint": previous[-12_000:] if previous else "",
-            "latest_structured_state": bounded_data,
-            "recent_messages": recent,
-        }
-        return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        tools: list[dict[str, Any]],
+    ) -> int:
+        counter = getattr(self.model, "count_prompt_tokens", None)
+        if callable(counter):
+            try:
+                return int(counter(messages, tools))
+            except Exception:
+                pass
+        serialized = json.dumps(
+            {"messages": messages, "tools": tools},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        return max(1, (len(serialized) + 3) // 4)
+
+    def _context_pressure(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        reserved_output_tokens: int,
+    ) -> tuple[bool, int, int | None, int]:
+        context_window = getattr(self.model, "effective_context_window", None)
+        if not isinstance(context_window, int):
+            context_window = getattr(getattr(self.model, "settings", None), "context_window", None)
+        prompt_tokens = self._estimated_prompt_tokens(messages, tools)
+        if not isinstance(context_window, int):
+            return False, prompt_tokens, None, 0
+        safety_margin = max(256, min(2048, context_window // 10))
+        pressured = prompt_tokens + reserved_output_tokens + safety_margin >= context_window
+        return pressured, prompt_tokens, context_window, safety_margin
 
     @staticmethod
     def _data_requires_action(data: dict[str, Any]) -> bool:
@@ -504,7 +521,16 @@ class ToolCoordinator:
             f"Planning note:\n{plan}"
         )
         base_system_prompt = system_prompt
-        checkpoint_summary = str(resumed_checkpoint.get("summary") or "")
+        checkpoint_record = (
+            dict(resumed_checkpoint.get("checkpoint") or {})
+            if isinstance(resumed_checkpoint.get("checkpoint"), dict)
+            else {}
+        )
+        checkpoint_summary = (
+            render_context_pack(checkpoint_record)
+            if checkpoint_record
+            else str(resumed_checkpoint.get("summary") or "")
+        )
         checkpoint_index = int(resumed_checkpoint.get("checkpoint_index") or 0)
         if checkpoint_summary:
             system_prompt += (
@@ -548,41 +574,80 @@ class ToolCoordinator:
             pending = (route_tool, {"request_text": user_message}, None, True)
 
         premature_retries = 0
+
+        def apply_checkpoint(
+            trigger: str,
+            *,
+            prompt_tokens: int | None = None,
+            context_window: int | None = None,
+            reserved_output_tokens: int | None = None,
+            next_action: str | None = None,
+        ) -> None:
+            nonlocal checkpoint_index, checkpoint_record, checkpoint_summary
+            nonlocal messages, call_count, premature_retries
+            checkpoint_index += 1
+            checkpoint_record = build_semantic_checkpoint(
+                objective=user_message,
+                plan=plan,
+                messages=messages,
+                structured_state=data,
+                previous=checkpoint_record or checkpoint_summary,
+                checkpoint_index=checkpoint_index,
+                trigger=trigger,
+                prompt_tokens=prompt_tokens,
+                context_window=context_window,
+                reserved_output_tokens=reserved_output_tokens,
+                next_action=next_action,
+            )
+            checkpoint_summary = render_context_pack(checkpoint_record)
+            self._save_state({
+                "status": "tool_checkpoint",
+                "user_message": user_message,
+                "checkpoint_index": checkpoint_index,
+                "checkpoint": checkpoint_record,
+                "summary": checkpoint_summary,
+                "data": data,
+            })
+            self._record_checkpoint(checkpoint_record)
+            self.scratchpad.add("tool_checkpoint", checkpoint_summary[:4000])
+            self._log(
+                "tool_checkpoint",
+                checkpoint_index=checkpoint_index,
+                checkpoint_id=checkpoint_record["checkpoint_id"],
+                trigger=trigger,
+                prompt_tokens=prompt_tokens,
+                context_window=context_window,
+                reserved_output_tokens=reserved_output_tokens,
+                continuing=True,
+            )
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        f"{base_system_prompt}\n\nContext checkpoint {checkpoint_index}. The host compacted "
+                        "working context without ending the task. Continue from this semantic record, preserve its "
+                        "constraints and identifiers, and do not repeat completed calls:\n"
+                        f"{checkpoint_summary}"
+                    ),
+                },
+                {"role": "user", "content": user_message},
+                {
+                    "role": "user",
+                    "content": "Continue the same work from the checkpoint. Call the next necessary tool.",
+                },
+            ]
+            call_count = 0
+            premature_retries = 0
+
         while True:
             if call_count >= max_calls:
-                checkpoint_index += 1
-                checkpoint_summary = self._checkpoint_summary(messages, data, checkpoint_summary)
-                self._save_state({
-                    "status": "tool_checkpoint",
-                    "user_message": user_message,
-                    "checkpoint_index": checkpoint_index,
-                    "summary": checkpoint_summary,
-                    "data": data,
-                })
-                self.scratchpad.add("tool_checkpoint", checkpoint_summary[:4000])
-                self._log(
-                    "tool_checkpoint",
-                    checkpoint_index=checkpoint_index,
-                    completed_calls=max_calls,
-                    continuing=True,
-                )
-                messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            f"{base_system_prompt}\n\nTool checkpoint {checkpoint_index}. The call count caused context "
-                            "compaction, not task termination. Continue from this exact bounded record and do not "
-                            f"repeat completed calls:\n{checkpoint_summary}"
-                        ),
-                    },
-                    {"role": "user", "content": user_message},
-                    {
-                        "role": "user",
-                        "content": "Continue the same work. Call the next necessary tool.",
-                    },
-                ]
-                call_count = 0
-                premature_retries = 0
+                pending_action = None
+                if pending:
+                    pending_action = (
+                        f"Call {pending[0].exposed_name} with "
+                        f"{json.dumps(pending[1], ensure_ascii=False, separators=(',', ':'))}."
+                    )
+                apply_checkpoint("call_interval", next_action=pending_action)
 
             if pending:
                 selected_tool, arguments, existing_call_id, append_assistant_call = pending
@@ -631,25 +696,46 @@ class ToolCoordinator:
 
             specs = self._narrowed_specs(tools, data, routed.visible)
             requires_action = self._data_requires_action(data) or not data
+            output_budget = int(
+                self._setting("tool_action_max_new_tokens", ACTION_TOKENS)
+                if requires_action
+                else self._setting(
+                    "post_tool_decision_max_new_tokens",
+                    self._setting("max_new_tokens", FINAL_TOKENS),
+                )
+            )
+            pressured, prompt_tokens, context_window, safety_margin = self._context_pressure(
+                messages,
+                specs,
+                output_budget,
+            )
+            if pressured:
+                apply_checkpoint(
+                    "token_pressure",
+                    prompt_tokens=prompt_tokens,
+                    context_window=context_window,
+                    reserved_output_tokens=output_budget,
+                    next_action=(
+                        str(data.get("next_step") or data.get("next_tool") or "")
+                        or "Ask the model to choose the next necessary tool from the supplied schemas."
+                    ),
+                )
+                self._log(
+                    "context_pressure_relieved",
+                    checkpoint_index=checkpoint_index,
+                    safety_margin=safety_margin,
+                )
+                specs = self._narrowed_specs(tools, data, routed.visible)
             reply: AssistantReply = await asyncio.to_thread(
                 self.model.chat,
                 messages,
                 tools=specs,
-                max_new_tokens=int(
-                    self._setting("tool_action_max_new_tokens", ACTION_TOKENS)
-                    if requires_action
-                    else self._setting(
-                        "post_tool_decision_max_new_tokens",
-                        self._setting("max_new_tokens", FINAL_TOKENS),
-                    )
-                ),
+                max_new_tokens=output_budget,
                 temperature=float(self._setting("tool_temperature", 0.0)),
                 generation_class="tool_action" if requires_action else "post_tool_decision",
                 telemetry_context=self.telemetry_context,
             )
             assistant_message: dict[str, Any] = {"role": "assistant", "content": reply.content}
-            if reply.reasoning_content:
-                assistant_message["reasoning_content"] = reply.reasoning_content
             if reply.tool_calls:
                 assistant_message["tool_calls"] = reply.tool_calls
             messages.append(assistant_message)

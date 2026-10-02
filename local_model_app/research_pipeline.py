@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
+from local_model_app.generation_context import generation_context
 from local_model_app.mcp_manager import McpPluginManager
 from local_model_app.task_models import WorkItemOutcome
 
@@ -432,27 +433,33 @@ class ResearchSourceProcessor:
                 if analysis_rejection:
                     raise SourceRejectedError(analysis_rejection)
                 continue
-            notes = await self.analyze_section([
-                {"role": "system", "content": (
-                    "Analyze one bounded portion of one scholarly source. Extract only source-grounded evidence: "
-                    "specific findings, mechanisms, methods, study system or population, causal strength, boundary "
-                    "conditions, limitations, disagreements, and important references mentioned in this portion. "
-                    "The source record includes the model's earlier candidate qualifiers; use them as provenance and "
-                    "revise them explicitly if the fetched text contradicts them. Do not write the report or infer "
-                    "beyond the supplied text. Preserve the exact source URL."
-                )},
-                {"role": "user", "content": json.dumps({
-                    "task_goal": task["definition"]["goal"],
-                    "source": {
-                        "id": source["id"], "title": source.get("title"), "url": source["url"],
-                        "depth": source.get("depth", 0),
-                        "candidate_assessment": source.get("model_assessment"),
-                        "source_type": source.get("source_type"),
-                        "evidence_role": source.get("evidence_role"),
-                    },
-                    "segment": {"label": section["label"], "content": section["content"]},
-                }, ensure_ascii=False)},
-            ])
+            with generation_context(
+                source_id=str(source["id"]),
+                source_url=str(source["url"]),
+                research_phase="source_section_notes",
+                source_section=section["key"],
+            ):
+                notes = await self.analyze_section([
+                    {"role": "system", "content": (
+                        "Analyze one bounded portion of one scholarly source. Extract only source-grounded evidence: "
+                        "specific findings, mechanisms, methods, study system or population, causal strength, boundary "
+                        "conditions, limitations, disagreements, and important references mentioned in this portion. "
+                        "The source record includes the model's earlier candidate qualifiers; use them as provenance and "
+                        "revise them explicitly if the fetched text contradicts them. Do not write the report or infer "
+                        "beyond the supplied text. Preserve the exact source URL."
+                    )},
+                    {"role": "user", "content": json.dumps({
+                        "task_goal": task["definition"]["goal"],
+                        "source": {
+                            "id": source["id"], "title": source.get("title"), "url": source["url"],
+                            "depth": source.get("depth", 0),
+                            "candidate_assessment": source.get("model_assessment"),
+                            "source_type": source.get("source_type"),
+                            "evidence_role": source.get("evidence_role"),
+                        },
+                        "segment": {"label": section["label"], "content": section["content"]},
+                    }, ensure_ascii=False)},
+                ])
             saved_by_key[section["key"]] = {
                 "key": section["key"], "label": section["label"], "notes": notes.strip(),
             }
@@ -479,13 +486,20 @@ class ResearchSourceProcessor:
             for index, chunk in enumerate(reduction_chunks):
                 if index < len(reductions) and str(reductions[index]).strip():
                     continue
-                reduced = await self.build_dossier([
-                    {"role": "system", "content": (
-                        "Compress these notes from one source without dropping methods, findings, mechanisms, "
-                        "evidence strength, limitations, disagreements, or the exact source URL. Do not add claims."
-                    )},
-                    {"role": "user", "content": chunk["content"]},
-                ])
+                with generation_context(
+                    source_id=str(source["id"]),
+                    source_url=str(source["url"]),
+                    research_phase="source_note_reduction",
+                    reduction_level=level,
+                    reduction_chunk=index,
+                ):
+                    reduced = await self.build_dossier([
+                        {"role": "system", "content": (
+                            "Compress these notes from one source without dropping methods, findings, mechanisms, "
+                            "evidence strength, limitations, disagreements, or the exact source URL. Do not add claims."
+                        )},
+                        {"role": "user", "content": chunk["content"]},
+                    ])
                 if index < len(reductions):
                     reductions[index] = reduced.strip()
                 else:
@@ -504,25 +518,30 @@ class ResearchSourceProcessor:
             level += 1
         consolidation_input = "\n\n".join(current_blocks)
 
-        dossier = await self.build_dossier([
-            {"role": "system", "content": (
-                "Create a standalone report for exactly one scholarly source. Preserve the title and exact URL, then "
-                "organize the source-grounded methods, study system or population, principal findings, "
-                "mechanisms, causal strength, boundary conditions, limitations, disagreements, and useful cited leads. "
-                "Preserve or explicitly revise the candidate document-type qualifiers supplied in the source record. "
-                "Distinguish what the source reports from interpretation. Do not write a multi-source report."
-            )},
-            {"role": "user", "content": json.dumps({
-                "task_goal": task["definition"]["goal"],
-                "source": {
-                    "id": source["id"], "title": source.get("title"), "url": source["url"],
-                    "candidate_assessment": source.get("model_assessment"),
-                    "source_type": source.get("source_type"),
-                    "evidence_role": source.get("evidence_role"),
-                },
-                "source_notes": consolidation_input,
-            }, ensure_ascii=False)},
-        ])
+        with generation_context(
+            source_id=str(source["id"]),
+            source_url=str(source["url"]),
+            research_phase="source_dossier",
+        ):
+            dossier = await self.build_dossier([
+                {"role": "system", "content": (
+                    "Create a standalone report for exactly one scholarly source. Preserve the title and exact URL, then "
+                    "organize the source-grounded methods, study system or population, principal findings, "
+                    "mechanisms, causal strength, boundary conditions, limitations, disagreements, and useful cited leads. "
+                    "Preserve or explicitly revise the candidate document-type qualifiers supplied in the source record. "
+                    "Distinguish what the source reports from interpretation. Do not write a multi-source report."
+                )},
+                {"role": "user", "content": json.dumps({
+                    "task_goal": task["definition"]["goal"],
+                    "source": {
+                        "id": source["id"], "title": source.get("title"), "url": source["url"],
+                        "candidate_assessment": source.get("model_assessment"),
+                        "source_type": source.get("source_type"),
+                        "evidence_role": source.get("evidence_role"),
+                    },
+                    "source_notes": consolidation_input,
+                }, ensure_ascii=False)},
+            ])
         state["dossier"] = dossier.strip()
         paper_report_path = self._save_paper_report(str(task["id"]), source, state["dossier"])
         state["paper_report_file"] = str(paper_report_path.relative_to(self.data_directory))
