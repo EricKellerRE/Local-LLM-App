@@ -137,6 +137,9 @@ class DurableToolExecutorTests(unittest.TestCase):
                     "id": "paper",
                     "title": "Paper",
                     "url": "https://example.com/paper",
+                    "authors": ["Ada Example"],
+                    "year": 2024,
+                    "venue": "Journal of Memory",
                     "depth": 0,
                     "status": "analyzed",
                     "analysis_file": "research/task-1/source-analysis/paper.json",
@@ -178,6 +181,9 @@ class DurableToolExecutorTests(unittest.TestCase):
             self.assertGreater(path.stat().st_size, 1000)
             markdown = path.with_name("report.md").read_text(encoding="utf-8")
             self.assertIn("durable synaptic change", markdown)
+            self.assertIn("## References", markdown)
+            self.assertIn("Ada Example. (2024).", markdown)
+            self.assertNotIn("## Research corpus", markdown)
             self.assertFalse((research_root / "source-analysis").exists())
             self.assertFalse((research_root / "sections").exists())
             self.assertTrue((research_root / "paper-reports" / "paper.md").is_file())

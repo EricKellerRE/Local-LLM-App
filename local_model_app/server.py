@@ -7,6 +7,7 @@ import re
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -18,12 +19,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
 from local_model_app.app_settings import AppSettingsStore
+from local_model_app.activity_view import track_chat, read_events, resume_record, save_resume
+from local_model_app.cancellation import check_stopped
 from local_model_app.chat_store import ChatStore
 from local_model_app.config import Settings, _load_dotenv
 from local_model_app.coordinator import Coordinator
 from local_model_app.durable_tools import DurableSectionExecutor, DurableSynthesisExecutor, DurableToolExecutor
 from local_model_app.generation_context import generation_context
 from local_model_app.model import TransformersModel
+from local_model_app.gguf_model import create_model
 from local_model_app.research_pipeline import (
     CandidateSelection,
     ResearchDiscoveryExecutor,
@@ -39,6 +43,8 @@ from local_model_app.task_engine import UniversalTaskEngine
 from local_model_app.task_models import TaskDefinition, TaskStatus, WorkItemOutcome
 from local_model_app.task_store import TaskStore
 from local_model_app.tool_coordinator import FINAL_TOKENS, ToolCoordinator, _compact_result
+from local_model_app.cancellation import ResponseStopped
+from local_model_app.atomic_files import write_json
 from local_model_app.tool_router import LocalEmbeddingEncoder, ToolRouter
 from local_model_app.workflow_skills import WorkflowSkillRegistry
 
@@ -111,6 +117,7 @@ class MoveChatRequest(BaseModel):
 
 class SettingsUpdateRequest(BaseModel):
     model_id: str = ""
+    research_classifier_model_id: str = ""
     model_kind: str = "auto"
     device: str = "auto"
     dtype: str = "auto"
@@ -125,7 +132,7 @@ class SettingsUpdateRequest(BaseModel):
     post_tool_decision_max_new_tokens: int = Field(default=256, ge=1, le=262_144)
     section_max_new_tokens: int = Field(default=768, ge=1, le=262_144)
     synthesis_max_new_tokens: int = Field(default=8192, ge=1, le=262_144)
-    research_classifier_max_new_tokens: int = Field(default=256, ge=1, le=262_144)
+    research_classifier_max_new_tokens: int = Field(default=5, ge=1, le=262_144)
     research_notes_max_new_tokens: int = Field(default=768, ge=1, le=262_144)
     research_source_dossier_max_new_tokens: int = Field(default=1536, ge=1, le=262_144)
     research_whole_source_max_tokens: int = Field(default=8192, ge=512, le=4_194_304)
@@ -183,10 +190,31 @@ class Runtime:
         self.app_settings = AppSettingsStore(ROOT)
         self.paths = self.app_settings.paths()
         settings = Settings.from_environment(ROOT)
-        self.model = TransformersModel(
+        self.model = create_model(
             settings,
             telemetry_path=self.paths.data_directory / "generation_telemetry.jsonl",
         )
+        classifier_model_id = settings.research_classifier_model_id.strip()
+        if not classifier_model_id or classifier_model_id == settings.model_id:
+            self.research_classifier_model = self.model
+        else:
+            classifier_settings = replace(
+                settings,
+                model_id=classifier_model_id,
+                model_kind="auto",
+                cpu_memory_gb=None,
+                offload_dir="",
+                context_window=None,
+                max_new_tokens=settings.research_classifier_max_new_tokens,
+                reasoning_budget=0,
+                temperature=0,
+                top_p=1,
+                trust_remote_code=False,
+            )
+            self.research_classifier_model = create_model(
+                classifier_settings,
+                telemetry_path=self.paths.data_directory / "generation_telemetry.jsonl",
+            )
         encoder = (
             LocalEmbeddingEncoder(settings.router_model_id, device=settings.router_device)
             if settings.router_model_id
@@ -204,9 +232,12 @@ class Runtime:
         self.workflow_skills = WorkflowSkillRegistry(ROOT / "config" / "skills")
         self.load_error: str | None = None
         self.loading = False
+        self.classifier_load_error: str | None = None
+        self.classifier_loading = False
         self.draining = False
         self._active_operations: dict[str, str] = {}
         self._load_lock = asyncio.Lock()
+        self._classifier_load_lock = asyncio.Lock()
         self._inference_lock = asyncio.Lock()
         self.task_coordinator = ModelTaskCoordinator(
             self.task_generate,
@@ -273,6 +304,26 @@ class Runtime:
                 raise
             finally:
                 self.loading = False
+
+    async def ensure_classifier_loaded(self) -> None:
+        classifier = self.research_classifier_model
+        if classifier is self.model:
+            await self.ensure_loaded()
+            return
+        if classifier.loaded:
+            return
+        async with self._classifier_load_lock:
+            if classifier.loaded:
+                return
+            self.classifier_loading = True
+            self.classifier_load_error = None
+            try:
+                await asyncio.to_thread(classifier.load)
+            except Exception as exc:
+                self.classifier_load_error = str(exc)
+                raise
+            finally:
+                self.classifier_loading = False
 
     def _generate_resumable(
         self,
@@ -383,48 +434,131 @@ class Runtime:
     @tracked_activity("research sources are being filtered")
     async def classify_references(self, goal: str, candidates: list[dict[str, Any]]) -> CandidateSelection:
         async with self._inference_lock:
-            await self.ensure_loaded()
+            classifier = getattr(self, "research_classifier_model", self.model)
+            ensure_classifier_loaded = getattr(self, "ensure_classifier_loaded", None)
+            if callable(ensure_classifier_loaded):
+                await ensure_classifier_loaded()
+            else:
+                await self.ensure_loaded()
+            candidate = candidates[0]
+            goal_text = str(goal)
+            compact_goal = " ".join(goal_text.splitlines()[0].split())
+            scope_match = re.search(
+                r"\bCover\s+(.+?)(?=\.\s+[A-Z]|$)",
+                goal_text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if scope_match:
+                requested_scope = " ".join(scope_match.group(1).split())
+                compact_goal = f"{compact_goal}. Requested scope: {requested_scope}"
+            compact_goal = compact_goal[:1800]
+            candidate_lines = [f"TITLE: {candidate.get('title') or ''}"]
+            for field, label in (("venue", "VENUE"), ("abstract", "ABSTRACT"), ("context", "CONTEXT")):
+                value = " ".join(str(candidate.get(field) or "").split())
+                if value:
+                    candidate_lines.append(f"{label}: {value[:1600]}")
+            excerpt = " ".join(str(candidate.get("document_excerpt") or "").split())
+            if excerpt:
+                candidate_lines.append(f"DOCUMENT EXCERPT: {excerpt[:2400]}")
             response = await asyncio.to_thread(
-                self.model.generate,
+                classifier.generate,
                 [
                     {"role": "system", "content": (
-                        "Select research candidates that are substantively relevant to the research goal and its explicit "
-                        "source requirements. Independently classify each item from the supplied title, authors, year, "
-                        "venue, locator, abstract, or labelled snippet/citation context. Do not assume that a search result "
-                        "is scholarly or primary. Distinguish topical relevance, the study being described, and the genre "
-                        "of the document actually supplied. Classify primary_study only when the supplied document itself "
-                        "is a scholarly report of original research with recognizable publication identity and study-level "
-                        "methods, results, or data. A university research profile, institutional project page, news or press "
-                        "summary, author-written lay summary, or other page that merely describes original research is "
-                        "popular_summary, even when it names investigators and reports methods or findings. Reviews remain "
-                        "reviews even when they summarize primary experiments. Treat missing venue/publication identity, "
-                        "promotional or explanatory page headings, future-work language, and a page-level host_type_hint as "
-                        "genre evidence; do not replace that evidence with an inference about the underlying study. When a "
-                        "fetched document_excerpt is supplied, re-evaluate the document's genre from the excerpt and record "
-                        "the decisive genre clues in qualifiers before preserving or revising previous_assessment. Use document_type "
-                        "primary_study, systematic_review, scholarly_review, book_chapter, reference_work, popular_summary, "
-                        "topic_index, or unknown. Set primary_source to true, false, or null. Preserve short descriptive "
-                        "qualifiers that justify the classification. Use needs_abstract_numbers only when the supplied "
-                        "information is genuinely insufficient; otherwise make a final keep/reject decision. When a "
-                        "previous_assessment and fetched document_excerpt are supplied, verify or revise the earlier "
-                        "qualifiers against the document rather than blindly repeating them. Reviews may "
-                        "be kept for reference mining when the user's requirements allow it. Return only list numbers, "
-                        "never URLs or titles. Return only JSON: {\"keep_numbers\":[integer],"
-                        "\"needs_abstract_numbers\":[integer],\"assessments\":[{\"number\":integer,"
-                        "\"document_type\":string,\"primary_source\":true|false|null,\"confidence\":\"high|medium|low\","
-                        "\"qualifiers\":[string]}]}."
+                        "Classify topical fit between one research goal and one candidate. DIRECT means the candidate "
+                        "directly investigates the goal or a specifically requested mechanism, method, or application. "
+                        "ADJACENT means it merely shares broad entities or keywords while its main research question is "
+                        "different. UNCLEAR means the supplied metadata is insufficient. Return one label only: "
+                        "DIRECT, ADJACENT, or UNCLEAR."
                     )},
-                    {"role": "user", "content": json.dumps({
-                        "goal": goal,
-                        "candidates": candidates,
-                    }, ensure_ascii=False)},
+                    {"role": "user", "content": (
+                        f"GOAL: {compact_goal}\nCANDIDATE:\n" + "\n".join(candidate_lines)
+                    )},
                 ],
-                max_new_tokens=int(getattr(self.model.settings, "research_classifier_max_new_tokens", 256)),
+                max_new_tokens=int(getattr(classifier.settings, "research_classifier_max_new_tokens", 5)),
                 temperature=0,
                 generation_class="research_relevance",
             )
         try:
             cleaned = response.strip()
+            topic_match = re.match(r"^\s*(DIRECT|ADJACENT|UNCLEAR)\b", cleaned.upper())
+            if topic_match and len(candidates) == 1:
+                label = topic_match.group(1)
+                candidate = candidates[0]
+                number = int(candidate["number"])
+                hint = str(candidate.get("host_type_hint") or "unknown_web").strip().lower()
+                title = str(candidate.get("title") or "").lower()
+                review_title = bool(re.search(
+                    r"\b(?:systematic review|meta-analysis|meta analysis|review|survey|perspective|overview)\b",
+                    title,
+                ))
+                document_type = "unknown"
+                primary_source: bool | None = None
+                keep = False
+                needs_metadata = label == "UNCLEAR"
+                if label == "DIRECT":
+                    if hint == "systematic_review":
+                        document_type, primary_source, keep = "systematic_review", False, True
+                    elif hint == "authoritative_review" or review_title:
+                        document_type, primary_source, keep = "scholarly_review", False, True
+                    elif hint in {"scholarly_article", "scholarly_candidate"}:
+                        document_type, primary_source, keep = "primary_study", True, True
+                    else:
+                        needs_metadata = True
+                return CandidateSelection(
+                    keep_numbers={number} if keep else set(),
+                    needs_abstract_numbers={number} if needs_metadata else set(),
+                    assessments={number: {
+                        "document_type": document_type,
+                        "primary_source": primary_source,
+                        "confidence": "medium",
+                        "qualifiers": [f"topic label: {label.lower()}; host genre: {hint}"],
+                    }},
+                )
+            single_code = re.match(r"^\s*([PRN?])(?:\s|[.!,:;]|$)", cleaned.upper())
+            if single_code and len(candidates) == 1:
+                code = single_code.group(1)
+                number = int(candidates[0]["number"])
+                if code == "P":
+                    document_type, primary_source = "primary_study", True
+                elif code == "R":
+                    document_type, primary_source = "scholarly_review", False
+                else:
+                    document_type, primary_source = "unknown", None
+                return CandidateSelection(
+                    keep_numbers={number} if code in {"P", "R"} else set(),
+                    needs_abstract_numbers={number} if code == "?" else set(),
+                    assessments={number: {
+                        "document_type": document_type,
+                        "primary_source": primary_source,
+                        "confidence": "medium",
+                        "qualifiers": [],
+                    }},
+                )
+            compact_match = re.search(r"(?<![A-Z?])([YN?])\s*:\s*([PSRBWMIU])(?![A-Z])", cleaned.upper())
+            if compact_match and len(candidates) == 1:
+                action, code = compact_match.groups()
+                compact_codes = {
+                    "P": ("primary_study", True),
+                    "S": ("systematic_review", False),
+                    "R": ("scholarly_review", False),
+                    "B": ("book_chapter", False),
+                    "W": ("reference_work", False),
+                    "M": ("popular_summary", False),
+                    "I": ("topic_index", False),
+                    "U": ("unknown", None),
+                }
+                number = int(candidates[0]["number"])
+                document_type, primary_source = compact_codes[code]
+                return CandidateSelection(
+                    keep_numbers={number} if action == "Y" else set(),
+                    needs_abstract_numbers={number} if action == "?" else set(),
+                    assessments={number: {
+                        "document_type": document_type,
+                        "primary_source": primary_source,
+                        "confidence": "medium",
+                        "qualifiers": [],
+                    }},
+                )
             if cleaned.startswith("```"):
                 cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
             payload = json.loads(cleaned[cleaned.find("{"):cleaned.rfind("}") + 1])
@@ -438,6 +572,43 @@ class Runtime:
                 if isinstance(value, int) and value in allowed and value not in kept
             }
             assessments: dict[int, dict[str, Any]] = {}
+            compact_codes = {
+                "P": ("primary_study", True),
+                "S": ("systematic_review", False),
+                "R": ("scholarly_review", False),
+                "B": ("book_chapter", False),
+                "W": ("reference_work", False),
+                "M": ("popular_summary", False),
+                "I": ("topic_index", False),
+                "U": ("unknown", None),
+            }
+            compact_assessments = payload.get("a")
+            compact_qualifiers = payload.get("q") if isinstance(payload.get("q"), dict) else {}
+            if isinstance(compact_assessments, dict):
+                kept = {
+                    int(value) for value in payload.get("k", [])
+                    if isinstance(value, int) and value in allowed
+                }
+                ambiguous = {
+                    int(value) for value in payload.get("u", [])
+                    if isinstance(value, int) and value in allowed and value not in kept
+                }
+                for raw_number, raw_code in compact_assessments.items():
+                    try:
+                        number = int(raw_number)
+                    except (TypeError, ValueError):
+                        continue
+                    code = str(raw_code or "U").strip().upper()
+                    if number not in allowed or code not in compact_codes:
+                        continue
+                    document_type, primary_source = compact_codes[code]
+                    qualifier = " ".join(str(compact_qualifiers.get(str(number)) or "").split())[:200]
+                    assessments[number] = {
+                        "document_type": document_type,
+                        "primary_source": primary_source,
+                        "confidence": "medium",
+                        "qualifiers": [qualifier] if qualifier else [],
+                    }
             for assessment in payload.get("assessments") or []:
                 if not isinstance(assessment, dict):
                     continue
@@ -535,7 +706,13 @@ class Runtime:
     @staticmethod
     def _explicit_source_policy(content: str) -> dict[str, Any] | None:
         normalized = " ".join(content.lower().split())
-        primary_requested = bool(re.search(r"\b(?:use|using|only|limited to)\s+(?:peer[- ]reviewed\s+)?primary\s+(?:sources|studies|research)\b", normalized))
+        primary_requested = bool(re.search(
+            r"\b(?:use|using|limited to)\s+(?:only\s+)?"
+            r"(?:peer[- ]reviewed\s+|scholarly\s+)?primary\s+"
+            r"(?:(?:peer[- ]reviewed|scholarly|original)\s+)*"
+            r"(?:sources|studies|research|articles|papers)\b",
+            normalized,
+        ))
         reviews_for_mining = bool(re.search(
             r"\b(?:literature|systematic|scholarly)?\s*reviews?\b.{0,100}\b(?:reference|citation)\s+(?:mining|leads?|discovery)\b",
             normalized,
@@ -707,6 +884,7 @@ class Runtime:
             await self.deliver_task_status(task)
 
     @tracked_activity("a response or tool action is in progress")
+    @track_chat
     async def respond(self, chat_id: str, content: str) -> str:
         history = [{"role": item["role"], "content": item["content"]} for item in self.store.messages(chat_id)]
         chat = self.store.get_chat(chat_id)
@@ -731,6 +909,8 @@ class Runtime:
             return await self._start_durable_chat_task(chat, content, selected_plugins)
         with generation_context(chat_id=chat_id, task_phase="chat_response"):
             async with self._inference_lock:
+                check_stopped()
+                self._log_activity(self.data_directory / "tool_activity" / f"{chat_id}.jsonl", "model_acquired")
                 await self.ensure_loaded()
                 if selected_plugins:
                     coordinator = ToolCoordinator(
@@ -769,6 +949,7 @@ class Runtime:
                 f"{normalize(manifest.tool_namespace)} mcp",
                 f"{short_id} server",
                 f"{short_id} mcp",
+                f"{normalize(manifest.id.split('.', 1)[0])} plugin",
             }
             if any(name and name in normalized for name in names):
                 requested.append(manifest.id)
@@ -791,6 +972,8 @@ class Runtime:
         reasons: list[str] = []
         if self.loading:
             reasons.append("the model is loading")
+        if getattr(self, "classifier_loading", False):
+            reasons.append("the research classifier is loading")
         active_operations = getattr(self, "_active_operations", {})
         reasons.extend(dict.fromkeys(active_operations.values()))
         if self._inference_lock.locked() and not active_operations:
@@ -845,10 +1028,7 @@ class Runtime:
 
     @staticmethod
     def _write_state(path: Path, state: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        write_json(path,state)
 
     @staticmethod
     def _log_activity(path: Path, event: str, **data: Any) -> None:
@@ -877,6 +1057,7 @@ class Runtime:
         }
 
     @tracked_activity("an approved tool action is in progress")
+    @track_chat
     async def approve_tool_call(self, chat_id: str) -> str:
         self.store.get_chat(chat_id)
         activity_path = self.data_directory / "tool_activity" / f"{chat_id}.jsonl"
@@ -894,6 +1075,8 @@ class Runtime:
             consuming = {**state, "status": "executing_approved_call", "approved_at": approved_at}
             self._write_state(state_path, consuming)
             self._log_activity(activity_path, "approved_tool_execution_started", tool=tool_name, arguments=arguments)
+            if state.get('structured_plan'):
+                return await self._approve_structured_plan(chat_id, state, consuming, activity_path)
             try:
                 await self.mcp.ensure_started([plugin_id])
                 durable_work_item_id = state.get("durable_work_item_id")
@@ -978,20 +1161,64 @@ class Runtime:
                     self.task_engine.wake()
                 return answer
             except Exception as exc:
+                error_message = str(exc)
+                backend_detail = getattr(getattr(exc, "error", None), "data", None)
+                if backend_detail is not None:
+                    detail_text = backend_detail if isinstance(backend_detail, str) else json.dumps(backend_detail, ensure_ascii=False)
+                    error_message += "\nBackend detail: " + detail_text[:12000]
                 self._write_state(state_path, {
                     **consuming,
                     "status": "failed",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
-                    "error": str(exc),
+                    "error": error_message,
                 })
                 self._log_activity(
                     activity_path,
                     "approved_tool_execution_failed",
                     tool=tool_name,
                     error=type(exc).__name__,
-                    message=str(exc),
+                    message=error_message,
                 )
-                raise
+                Scratchpad(self.data_directory / "scratchpads" / f"{chat_id}.jsonl").add(
+                    "failed_approved_tool",
+                    f"Approved call {tool_name} failed. Do not treat it as completed or repeat unchanged arguments. "
+                    f"Repair the input/tool choice before continuing. Error: {error_message[:2400]}",
+                )
+                raise RuntimeError(error_message) from exc
+
+    async def _approve_structured_plan(self, chat_id, state, consuming, activity_path):
+        """An approval completes one call, never the whole structured analysis."""
+        name=state['exposed_tool']
+        try:
+            await self.mcp.ensure_started([state['plugin_id']])
+            result=await self.mcp.call_tool(name,state.get('arguments',{}),approved=True)
+        except ResponseStopped:
+            raise
+        except Exception as exc:
+            result={'isError':True,'message':str(exc),
+                    'detail':getattr(getattr(exc,'error',None),'data',None)}
+        self._log_activity(activity_path,'approved_tool_execution_finished',tool=name,result=result)
+        self._write_state(activity_path.with_suffix('.state.json'),{
+            **consuming,'status':'failed' if result.get('isError') else 'complete','result':result})
+        coordinator=ToolCoordinator(self.model,self.mcp,
+            Scratchpad(self.data_directory/'scratchpads'/f'{chat_id}.jsonl'),activity_path,
+            telemetry_context={'chat_id':chat_id})
+        answer=await coordinator.respond(state['user_message'],[],self.store.selected_plugins(chat_id))
+        self.store.append_message(chat_id,'assistant',answer)
+        pending=coordinator._load_state()
+        save_resume(self.data_directory,chat_id,state['user_message'],
+                    'stopped' if pending.get('status')=='tool_checkpoint' else 'completed')
+        task_id=state.get('durable_task_id'); item_id=state.get('durable_work_item_id')
+        if task_id and item_id:
+            if pending:
+                pending.update(durable_task_id=task_id,durable_work_item_id=item_id)
+                self._write_state(activity_path.with_suffix('.state.json'),pending)
+            else:
+                self.tasks.complete_work_item(str(item_id),WorkItemOutcome(outcome='completed',
+                    summary='Structured plan completed after approval.',result=answer,
+                    completion_evidence=[answer[:2000]]).model_dump(mode='json'))
+                self.tasks.resume_task(str(task_id)); self.task_engine.wake()
+        return answer
 
     async def deny_tool_call(self, chat_id: str) -> str:
         self.store.get_chat(chat_id)
@@ -1029,6 +1256,10 @@ async def lifespan(app: FastAPI):
     finally:
         await runtime.task_engine.stop()
         await runtime.mcp.stop_all()
+        for model in {runtime.model, runtime.research_classifier_model}:
+            close = getattr(model, 'close', None)
+            if callable(close):
+                await asyncio.to_thread(close)
         runtime.tasks.close()
         runtime.store.close()
 
@@ -1060,11 +1291,15 @@ async def home():
 async def health(request: Request):
     service = runtime(request)
     return {
-        "status": "error" if service.load_error else ("ready" if service.model.loaded else "loading"),
+        "status": "error" if service.load_error else ("ready" if service.model.loaded else ("loading" if service.loading else "idle")),
         "loaded": service.model.loaded,
         "loading": service.loading,
         "error": service.load_error,
         "model": service.model.settings.model_id,
+        "research_classifier_model": service.research_classifier_model.settings.model_id,
+        "research_classifier_loaded": service.research_classifier_model.loaded,
+        "research_classifier_loading": service.classifier_loading,
+        "research_classifier_error": service.classifier_load_error,
     }
 
 
@@ -1283,6 +1518,51 @@ async def get_chat(chat_id: str, request: Request):
             return {**chat, "messages": runtime(request).store.archived_messages(chat_id)}
         except KeyError:
             raise HTTPException(status_code=404, detail="Chat not found") from exc
+
+
+@app.post("/api/chats/{chat_id}/stop")
+async def stop_chat(chat_id: str, request: Request):
+    service = runtime(request)
+    try:
+        service.store.get_chat(chat_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Chat not found") from exc
+    event = getattr(service, "_chat_stop_events", {}).get(chat_id)
+    if event is not None:
+        event.set()
+        service._log_activity(service.data_directory / "tool_activity" / f"{chat_id}.jsonl", "stop_requested")
+    return {"stopping": event is not None}
+
+
+@app.get("/api/chats/{chat_id}/activity")
+async def chat_activity(chat_id: str, request: Request):
+    service = runtime(request)
+    try:
+        service.store.get_chat(chat_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Chat not found") from exc
+    started = getattr(service, "_active_chat_requests", {}).get(chat_id)
+    saved = resume_record(service.data_directory, chat_id)
+    return {"active": started is not None, "started_at": started,
+            "resumable": started is None and saved.get('status') in {'running','stopped','failed'} and bool(saved.get('content')),
+            "loading_model": service.loading,
+            "events": read_events(service.data_directory / "tool_activity" / f"{chat_id}.jsonl")}
+
+
+@app.post('/api/chats/{chat_id}/resume')
+async def resume_chat(chat_id: str, request: Request):
+    service = runtime(request)
+    try:
+        service.store.get_chat(chat_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail='Chat not found') from exc
+    if chat_id in getattr(service, '_active_chat_requests', {}):
+        raise HTTPException(status_code=409, detail='This chat is already running.')
+    saved = resume_record(service.data_directory, chat_id)
+    if saved.get('status') not in {'running','stopped','failed'} or not saved.get('content'):
+        raise HTTPException(status_code=409, detail='No interrupted response to resume.')
+    answer = await service.respond(chat_id, saved['content'])
+    return {'role':'assistant', 'content':answer}
 
 
 @app.get("/api/chats/{chat_id}/plugins")

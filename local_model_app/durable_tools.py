@@ -12,7 +12,9 @@ from local_model_app.model import TransformersModel
 from local_model_app.report_documents import (
     assemble_research_report,
     build_report_docx,
+    report_substantive_word_count,
     report_word_count,
+    source_url_mentions,
     unique_urls,
 )
 from local_model_app.scratchpad import Scratchpad
@@ -94,12 +96,22 @@ class DurableToolExecutor:
                 self.store.checkpoint_work_item(item["id"], None)
                 raise
             serialized = json.dumps(result, ensure_ascii=False)
-            return WorkItemOutcome(
-                outcome="completed",
-                summary=f"Completed durable MCP task for checkpoint: {item['title']}",
-                result=serialized,
-                completion_evidence=[serialized[:2000]],
-            )
+            plan_path=activity_path.with_suffix('.plan.json')
+            plan=json.loads(plan_path.read_text(encoding='utf-8')) if plan_path.exists() else {}
+            inflight=plan.get('inflight')
+            if inflight:
+                from .atomic_files import write_json
+                write_json(activity_path.with_suffix('.state.json'),{
+                    'structured_plan':True,'status':'failed' if result.get('isError') else 'complete',
+                    'exposed_tool':inflight['tool'],'result':result})
+                self.store.checkpoint_work_item(item['id'],None)
+            else:
+                return WorkItemOutcome(
+                    outcome="completed",
+                    summary=f"Completed durable MCP task for checkpoint: {item['title']}",
+                    result=serialized,
+                    completion_evidence=[serialized[:2000]],
+                )
 
         async def save_task_handle(handle: dict[str, Any]) -> None:
             self.store.checkpoint_work_item(item["id"], {"pending_mcp_task": handle})
@@ -133,6 +145,9 @@ class DurableToolExecutor:
         async with self.inference_lock:
             answer = await coordinator.respond(prompt, [], plugin_ids)
         lowered = answer.lower()
+        saved = coordinator._load_state() if hasattr(coordinator, '_load_state') else {}
+        if saved.get('status') == 'tool_checkpoint':
+            return WorkItemOutcome(outcome='waiting_for_input', summary=answer)
         if "approval is required" in lowered:
             self._attach_task_to_approval(activity_path, task["id"], item["id"])
             return WorkItemOutcome(outcome="waiting_for_input", summary=answer)
@@ -260,14 +275,16 @@ class DurableSectionExecutor:
                 "Continue one existing research-report section using only the recorded evidence. Write a new, "
                 "non-redundant continuation only: do not repeat the title, opening, prior paragraphs, or source list. "
                 "Develop underexplained mechanisms, boundary conditions, causal strength, disagreements, and "
-                "limitations. Preserve exact source URLs beside new claims and do not invent evidence."
+                "limitations. Every paragraph that states a study result or nontrivial factual claim must include the "
+                "exact source URL that supports it. Preserve qualifications and do not invent evidence."
             )
         else:
             system = (
                 "Write exactly one substantive section of a longer research report from the recorded evidence. Use "
                 "connected explanatory prose, not a compressed checklist. Preserve mechanisms, conditions, timescales, "
-                "study systems, disagreements, and evidential limitations. Put exact source URLs beside the claims they "
-                "support. Do not invent evidence, do not write the entire report, and do not add a top-level document title."
+                "study systems, disagreements, and evidential limitations. Every paragraph that states a study result or "
+                "nontrivial factual claim must include the exact source URL that supports it. Do not invent evidence, do "
+                "not write the entire report, and do not add a top-level document title."
             )
         segment = await self.generate([
             {"role": "system", "content": system},
@@ -287,11 +304,14 @@ class DurableSectionExecutor:
         section = "\n\n".join(segments)
         words = report_word_count(section)
         urls = unique_urls(section)
-        if words < minimum_words or not urls:
+        citation_mentions = source_url_mentions(section)
+        required_mentions = max(1, (max(words, minimum_words) + 499) // 500)
+        if words < minimum_words or not urls or citation_mentions < required_mentions:
             reason = (
                 f"Section checkpoint did not meet its acceptance check yet: {words} words across "
                 f"{len(segments)} bounded segment(s) and {len(urls)} "
-                f"source URLs; continuing toward at least {minimum_words} words with traceable URLs."
+                f"unique source URLs with {citation_mentions} citation mentions; continuing toward at least "
+                f"{minimum_words} words and {required_mentions} traceable citation mentions."
             )
             max_segments = int((task["definition"].get("metadata") or {}).get("section_max_segments") or 6)
             if len(segments) < max_segments:
@@ -304,7 +324,10 @@ class DurableSectionExecutor:
             )
         return WorkItemOutcome(
             outcome="completed",
-            summary=f"Drafted {item['title']} ({words:,} words; {len(urls)} source URLs).",
+            summary=(
+                f"Drafted {item['title']} ({words:,} words; {len(urls)} unique source URLs; "
+                f"{citation_mentions} citation mentions)."
+            ),
             result=section,
             completion_evidence=urls,
         )
@@ -367,18 +390,9 @@ class DurableSynthesisExecutor:
                 ]
             except (OSError, json.JSONDecodeError, TypeError):
                 corpus_sources = []
-            if corpus_sources:
-                sections.append((
-                    "Research corpus",
-                    "\n".join(
-                        f"- {source.get('title') or source['url']} — {source['url']} "
-                        f"(citation depth {source.get('depth', 0)})"
-                        for source in corpus_sources
-                    ),
-                ))
             title = str(task["definition"].get("title") or "Research Report")
-            report = assemble_research_report(title, sections)
-            words = report_word_count(report)
+            report = assemble_research_report(title, sections, sources=corpus_sources)
+            words = report_substantive_word_count(report)
             urls = unique_urls(report)
             minimum_words = int(metadata.get("report_min_words") or 6000)
             minimum_sources = int(metadata.get("report_min_sources") or 12)

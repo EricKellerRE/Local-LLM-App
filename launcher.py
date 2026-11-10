@@ -279,6 +279,7 @@ def main() -> int:
             min_size=(760, 560),
             background_color="#f7f7f5",
             confirm_close=False,
+            text_select=True,
         )
         _desktop_window = window
         lifecycle = WindowLifecycle(base_url, window)

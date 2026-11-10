@@ -143,6 +143,18 @@ def source_type_hint(candidate: dict[str, Any], content: str = "") -> str:
         return "tertiary_overview"
     if host == "wikipedia.org" or host.endswith(".wikipedia.org"):
         return "reference_work"
+    popular_hosts = (
+        "popsci.com", "scitechdaily.com", "sciencedaily.com", "intelligentliving.co", "phys.org",
+        "livescience.com", "newscientist.com", "scientificamerican.com",
+        "eurekalert.org", "news-medical.net", "theconversation.com",
+        "wired.com", "arstechnica.com", "techcrunch.com", "medium.com",
+        "shroomwire.com", "ycm.group",
+    )
+    if (
+        any(host == value or host.endswith(f".{value}") for value in popular_hosts)
+        or (host.startswith("news.") and host.endswith(".edu"))
+    ):
+        return "popular_summary"
     if host == "amazon.com" or host.endswith(".amazon.com"):
         return "retail"
     if any(value in path for value in ("/subjects/", "/topics/", "/topic/")):
@@ -155,7 +167,9 @@ def source_type_hint(candidate: dict[str, Any], content: str = "") -> str:
         return "authoritative_review"
     if "/books/" in path or "bookshelf" in title:
         return "reference_work"
-    if any(candidate.get(field) for field in ("authors", "year", "venue", "abstract")):
+    if candidate.get("venue") and any(
+        candidate.get(field) for field in ("authors", "year", "abstract")
+    ):
         return "scholarly_article"
     if host == "doi.org" or "doi.org/10." in url.lower():
         return "scholarly_article"
@@ -163,8 +177,9 @@ def source_type_hint(candidate: dict[str, Any], content: str = "") -> str:
         "pubmed.ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov", "nature.com", "science.org",
         "sciencedirect.com", "cell.com", "jbc.org", "springer.com", "link.springer.com",
         "karger.com", "frontiersin.org", "plos.org", "wiley.com", "tandfonline.com",
+        "royalsocietypublishing.org",
     )
-    scholarly_paths = ("/article/", "/articles/", "/science/article/", "/fulltext/", "/chapter/")
+    scholarly_paths = ("/article/", "/articles/", "/science/article/", "/fulltext/", "/chapter/", "/doi/")
     if any(host == value or host.endswith(f".{value}") for value in scholarly_hosts):
         if any(value in path for value in scholarly_paths) or host in {
             "pubmed.ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov"
@@ -652,7 +667,7 @@ class ResearchDiscoveryExecutor:
     async def _enrich_candidate(self, candidate: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
         self._annotate_candidate(candidate, policy)
         assessment = candidate.get("model_assessment") or {}
-        if assessment.get("document_type") != "unknown" or not candidate.get("url"):
+        if (assessment and assessment.get("document_type") != "unknown") or not candidate.get("url"):
             return candidate
         try:
             metadata = _structured(await self._call("fetch_scholarly_metadata", {"url": candidate["url"]}))
@@ -989,8 +1004,22 @@ class ResearchDiscoveryExecutor:
         if self.classify_references is not None:
             try:
                 selected: set[str] = set()
-                for start in range(0, len(candidates), 4):
-                    batch = candidates[start:start + 4]
+                # Classification decoding is much more expensive than prompt
+                # ingestion on the CPU backend.  Evaluate one candidate at a
+                # time so the classifier can answer with a tiny fixed code
+                # instead of generating a multi-item JSON object.
+                for start in range(0, len(candidates), 1):
+                    batch = candidates[start:start + 1]
+                    candidate = batch[0]
+                    hinted_type = str(candidate.get("host_type_hint") or "unknown")
+                    if hinted_type in set((policy or {}).get("disallowed_types") or []):
+                        self._apply_model_assessment(candidate, {
+                            "document_type": hinted_type,
+                            "primary_source": False,
+                            "confidence": "high",
+                            "qualifiers": ["deterministic host or URL genre classification"],
+                        }, policy)
+                        continue
                     choices: list[dict[str, Any]] = []
                     for number, candidate in enumerate(batch, 1):
                         title = URL_PATTERN.sub("", candidate.get("title", ""))
@@ -1000,6 +1029,7 @@ class ResearchDiscoveryExecutor:
                             "number": number,
                             "title": " ".join(title.split())[:500],
                             "source_locator": candidate.get("source_locator") or "",
+                            "host_type_hint": candidate.get("host_type_hint") or "unknown_web",
                         }
                         if candidate.get("model_assessment"):
                             choice["previous_assessment"] = candidate["model_assessment"]
@@ -1046,6 +1076,7 @@ class ResearchDiscoveryExecutor:
                             for field in ("title", "authors", "year", "venue", "abstract", "abstract_source"):
                                 if metadata.get(field):
                                     candidate[field] = metadata[field]
+                            self._annotate_candidate(candidate, policy or {})
                             fallback_context = description or " ".join(
                                 URL_PATTERN.sub("", candidate.get("context", "")).split()
                             )
@@ -1063,6 +1094,7 @@ class ResearchDiscoveryExecutor:
                                     candidate.get("context_kind") or "citation_context"
                                 ) if not abstract else None,
                                 "source_locator": candidate.get("source_locator") or "",
+                                "host_type_hint": candidate.get("host_type_hint") or "unknown_web",
                                 "previous_assessment": candidate.get("model_assessment"),
                             }
                             enriched.append(enriched_candidate)
@@ -1118,9 +1150,12 @@ class ResearchDiscoveryExecutor:
         policy = self._policy(metadata)
         config = {
             "seed_sources": int(metadata.get("research_seed_sources") or 12),
-            "depth_passes": int(metadata.get("research_depth_passes") or 3),
-            "max_sources": int(metadata.get("research_max_sources") or 80),
-            "references_per_source": int(metadata.get("research_references_per_source") or 12),
+            "depth_passes": int(metadata["research_depth_passes"])
+            if metadata.get("research_depth_passes") is not None else 3,
+            "max_sources": int(metadata["research_max_sources"])
+            if metadata.get("research_max_sources") is not None else 80,
+            "references_per_source": int(metadata["research_references_per_source"])
+            if metadata.get("research_references_per_source") is not None else 12,
             "source_max_characters": int(metadata.get("research_source_max_characters") or 160000),
         }
         ledger_path, sources_dir = self._paths(str(task["id"]))

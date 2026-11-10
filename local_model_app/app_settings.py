@@ -9,6 +9,7 @@ from typing import Any
 
 MODEL_ENV_KEYS = {
     "model_id": "LOCAL_MODEL_ID",
+    "research_classifier_model_id": "LOCAL_RESEARCH_CLASSIFIER_MODEL_ID",
     "model_kind": "LOCAL_MODEL_KIND",
     "device": "LOCAL_MODEL_DEVICE",
     "dtype": "LOCAL_MODEL_DTYPE",
@@ -57,8 +58,8 @@ class AppSettingsStore:
             saved = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, TypeError):
             saved = {}
-        data_directory = Path(saved.get("data_directory") or self.root / "data").expanduser().resolve()
-        models_directory = Path(saved.get("models_directory") or self.root / "models").expanduser().resolve()
+        data_directory = (self.root / Path(saved.get("data_directory") or "data").expanduser()).resolve()
+        models_directory = (self.root / Path(saved.get("models_directory") or "models").expanduser()).resolve()
         return AppPaths(data_directory=data_directory, models_directory=models_directory)
 
     def _read_env(self) -> tuple[list[str], dict[str, str]]:
@@ -80,6 +81,7 @@ class AppSettingsStore:
         paths = self.paths()
         defaults: dict[str, Any] = {
             "model_id": "",
+            "research_classifier_model_id": "",
             "model_kind": "auto",
             "device": "auto",
             "dtype": "auto",
@@ -94,7 +96,7 @@ class AppSettingsStore:
             "post_tool_decision_max_new_tokens": 256,
             "section_max_new_tokens": 768,
             "synthesis_max_new_tokens": 8192,
-            "research_classifier_max_new_tokens": 256,
+            "research_classifier_max_new_tokens": 5,
             "research_notes_max_new_tokens": 768,
             "research_source_dossier_max_new_tokens": 1536,
             "research_whole_source_max_tokens": 8192,
@@ -213,4 +215,10 @@ class AppSettingsStore:
             models.append({"name": root.name, "path": str(root)})
         for config in root.glob("*/config.json"):
             models.append({"name": config.parent.name.replace("--", "/"), "path": str(config.parent)})
+        for model in root.rglob('*.gguf'):
+            if model.name.lower().startswith('mmproj'):
+                continue
+            if '-of-' in model.name and '-00001-of-' not in model.name:
+                continue
+            models.append({'name': model.stem, 'path': str(model)})
         return sorted(models, key=lambda item: item["name"].lower())

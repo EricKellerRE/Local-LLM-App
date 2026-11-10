@@ -13,7 +13,7 @@ async function api(path, options = {}) {
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    throw new Error(body.detail || `Request failed (${response.status})`);
+    throw new Error((Array.isArray(body.detail) ? body.detail.map((item) => item.msg).join("; ") : body.detail) || `Request failed (${response.status})`);
   }
   return response.status === 204 ? null : response.json();
 }
@@ -23,9 +23,27 @@ function escapeHtml(text) {
 }
 function renderMessageContent(text) {
   const escaped = escapeHtml(text);
-  return escaped
+  const inline = (value) => value
     .replace(/\[([^\]]+)\]\((\/api\/tasks\/[a-zA-Z0-9-]+\/artifacts\/[a-zA-Z0-9._-]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
-    .replace(/\n/g, "<br>");
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  const lines = escaped.split('\n');
+  const output = [];
+  const cells = (line) => line.trim().slice(1, -1).split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, '|'));
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim().startsWith('|') && /^\s*\|(?:\s*:?-+:?\s*\|)+\s*$/.test(lines[i + 1] || '')) {
+      const headers = cells(lines[i]);
+      const rows = [];
+      i += 2;
+      while (i < lines.length && lines[i].trim().startsWith('|') && lines[i].trim().endsWith('|')) {
+        rows.push('<tr>' + cells(lines[i]).map(cell => '<td>' + inline(cell) + '</td>').join('') + '</tr>');
+        i++;
+      }
+      i--;
+      output.push('<div class="report-table"><table><thead><tr>' + headers.map(cell => '<th>' + inline(cell) + '</th>').join('') + '</tr></thead><tbody>' + rows.join('') + '</tbody></table></div>');
+    } else output.push(inline(lines[i]));
+  }
+  return output.join('<br>');
 }
 function projectById(id) { return state.projects.find((project) => project.id === id) || null; }
 function setProjectLabel(id) {
@@ -179,12 +197,24 @@ function renderApproval(approval) {
 }
 async function loadApproval() { if (!state.chatId || state.currentArchived) return renderApproval(null); renderApproval(await api(`/api/chats/${state.chatId}/approval`)); }
 async function resolveApproval(action) {
-  if (!state.chatId || state.busy) return; setBusy(true);
-  try { await api(`/api/chats/${state.chatId}/approval/${action}`, { method: "POST" }); await openChat(state.chatId, { force: true }); await loadChats(); }
-  catch (error) { window.alert(`Could not ${action} this tool call: ${error.message}`); } finally { setBusy(false); }
+  if (!state.chatId || state.busy) return;
+  const chatId = state.chatId;
+  setBusy(true);
+  renderApproval(null);
+  let failure = null;
+  try { await api(`/api/chats/${chatId}/approval/${action}`, { method: "POST" }); if (state.chatId === chatId) await openChat(chatId, { force: true }); await loadChats(); }
+  catch (error) { failure = error; }
+  finally {
+    setBusy(false);
+    if (state.chatId === chatId) {
+      try { await loadApproval(); } catch (_) { renderApproval(null); }
+    }
+  }
+  if (failure) window.alert(`Could not ${action} this tool call: ${failure.message}`);
 }
 function setBusy(busy) { state.busy = busy; updateComposerState(); }
 function updateComposerState() {
+  el("stop-response").hidden = !state.busy;
   const disabled = state.busy || state.currentArchived; el("message-input").disabled = disabled; el("send").disabled = disabled;
   el("composer-note").textContent = state.currentArchived ? "Restore this chat before continuing it." : state.busy ? "Working in this chat until the current step is complete…" : "Press Enter to send · longer work stays in this chat";
 }
@@ -216,9 +246,9 @@ function renderProjectChoices() {
 }
 function openProjectChoice() { renderProjectChoices(); el("project-choice-dialog").showModal(); }
 async function chooseDirectory(targetId) {
-  try { if (window.pywebview?.api?.choose_directory) { const selected = await window.pywebview.api.choose_directory(); if (selected) el(targetId).value = selected; return; } }
+  try { if (window.pywebview?.api?.choose_directory) { const selected = await window.pywebview.api.choose_directory(); if (selected) { el(targetId).value = selected; el(targetId).dispatchEvent(new Event("change", { bubbles: true })); } return; } }
   catch (error) { console.warn(error); }
-  const selected = window.prompt("Enter the full folder path:", el(targetId).value); if (selected) el(targetId).value = selected;
+  const selected = window.prompt("Enter the full folder path:", el(targetId).value); if (selected) { el(targetId).value = selected; el(targetId).dispatchEvent(new Event("change", { bubbles: true })); }
 }
 async function openProjectDialog() {
   if (!state.plugins.length) await loadPlugins();
@@ -251,7 +281,7 @@ async function downloadModel(repoId, button) {
     let job = await api("/api/models/download", { method: "POST", body: JSON.stringify({ repo_id: repoId }) });
     while (["queued", "downloading"].includes(job.status)) { button.textContent = "Downloading…"; await new Promise((resolve) => setTimeout(resolve, 1000)); job = await api(`/api/models/download/${job.id}`); }
     if (job.status === "failed") throw new Error(job.error || "Download failed");
-    button.textContent = "Downloaded"; el("model-id").value = job.destination; el("hf-status").textContent = `${repoId} is ready. Save settings to make it the active model.`;
+    button.textContent = "Downloaded"; el("model-id").value = job.destination; el("model-id").dispatchEvent(new Event("change", { bubbles: true })); el("hf-status").textContent = `${repoId} is ready. Selected as the model; settings are saving.`;
   } catch (error) { button.disabled = false; button.textContent = "Retry"; el("hf-status").textContent = error.message; }
 }
 function updatePromptBudgetNote() {
@@ -307,11 +337,17 @@ async function loadGenerationTelemetry() {
   catch (error) { el("telemetry-summary").textContent = error.message; }
   finally { el("refresh-telemetry").disabled = false; }
 }
+let settingsSaveQueue = Promise.resolve();
+let settingsSaveTimer;
+let settingsReady = false;
+let settingsRestartRequired = false;
 async function openSettings() {
+  await settingsSaveQueue;
+  settingsReady = false;
   el("settings-status").textContent = "Loading…"; selectSettingsTab("general"); el("settings-dialog").showModal();
   try {
     const settings = await api("/api/settings");
-    const values = { "data-directory": settings.data_directory, "models-directory": settings.models_directory, "model-id": settings.model_id, "offload-directory": settings.offload_dir, "model-kind": settings.model_kind, "model-device": settings.device, "model-dtype": settings.dtype, "cpu-memory": settings.cpu_memory_gb ?? "", "context-window": settings.context_window ?? "", "max-tokens": settings.max_new_tokens, "reasoning-budget": settings.reasoning_budget ?? "", "max-tool-calls": settings.max_tool_calls_per_step, temperature: settings.temperature, "top-p": settings.top_p, "task-planner-tokens": settings.task_planner_max_new_tokens, "work-item-planner-tokens": settings.work_item_planner_max_new_tokens, "tool-action-tokens": settings.tool_action_max_new_tokens, "post-tool-tokens": settings.post_tool_decision_max_new_tokens, "section-tokens": settings.section_max_new_tokens, "synthesis-tokens": settings.synthesis_max_new_tokens, "research-classifier-tokens": settings.research_classifier_max_new_tokens, "research-notes-tokens": settings.research_notes_max_new_tokens, "research-source-dossier-tokens": settings.research_source_dossier_max_new_tokens, "research-seed-sources": settings.research_seed_sources, "research-depth-passes": settings.research_depth_passes, "research-max-sources": settings.research_max_sources, "research-references-per-source": settings.research_references_per_source, "research-whole-source-tokens": settings.research_whole_source_max_tokens, "research-section-input-tokens": settings.research_section_input_tokens, "research-source-max-characters": settings.research_source_max_characters };
+    const values = { "data-directory": settings.data_directory, "models-directory": settings.models_directory, "model-id": settings.model_id, "research-classifier-model-id": settings.research_classifier_model_id, "offload-directory": settings.offload_dir, "model-kind": settings.model_kind, "model-device": settings.device, "model-dtype": settings.dtype, "cpu-memory": settings.cpu_memory_gb ?? "", "context-window": settings.context_window ?? "", "max-tokens": settings.max_new_tokens, "reasoning-budget": settings.reasoning_budget ?? "", "max-tool-calls": settings.max_tool_calls_per_step, temperature: settings.temperature, "top-p": settings.top_p, "task-planner-tokens": settings.task_planner_max_new_tokens, "work-item-planner-tokens": settings.work_item_planner_max_new_tokens, "tool-action-tokens": settings.tool_action_max_new_tokens, "post-tool-tokens": settings.post_tool_decision_max_new_tokens, "section-tokens": settings.section_max_new_tokens, "synthesis-tokens": settings.synthesis_max_new_tokens, "research-classifier-tokens": settings.research_classifier_max_new_tokens, "research-notes-tokens": settings.research_notes_max_new_tokens, "research-source-dossier-tokens": settings.research_source_dossier_max_new_tokens, "research-seed-sources": settings.research_seed_sources, "research-depth-passes": settings.research_depth_passes, "research-max-sources": settings.research_max_sources, "research-references-per-source": settings.research_references_per_source, "research-whole-source-tokens": settings.research_whole_source_max_tokens, "research-section-input-tokens": settings.research_section_input_tokens, "research-source-max-characters": settings.research_source_max_characters };
     Object.entries(values).forEach(([id, value]) => { el(id).value = value; }); el("trust-remote-code").checked = settings.trust_remote_code;
     const nativeContext = settings.detected_context_window;
     const effectiveContext = settings.effective_context_window;
@@ -319,15 +355,27 @@ async function openSettings() {
     el("developer-model-summary").textContent = `${settings.model_id || "No model selected"} · ${settings.device} · ${settings.dtype} · effective context ${effectiveContext?.toLocaleString() || "unknown"}`;
     el("context-window-note").textContent = nativeContext ? `Detected model limit: ${nativeContext.toLocaleString()} tokens${effectiveContext && effectiveContext !== nativeContext ? ` · effective limit: ${effectiveContext.toLocaleString()}` : ""}.` : "The model's native context limit is detected after it loads.";
     updatePromptBudgetNote();
-    el("installed-models").innerHTML = settings.installed_models.map((model) => `<option value="${escapeHtml(model.path)}">${escapeHtml(model.name)}</option>`).join(""); el("settings-status").textContent = "";
+    el("installed-models").innerHTML = settings.installed_models.map((model) => `<option value="${escapeHtml(model.path)}">${escapeHtml(model.name)}</option>`).join(""); el("settings-status").textContent = settingsRestartRequired ? "Saved. Restart Local Model to apply changes." : "Changes save automatically.";
+    settingsReady = true;
   } catch (error) { el("settings-status").textContent = error.message; }
 }
 async function saveSettings() {
   const numeric = (id) => el(id).value === "" ? null : Number(el(id).value);
-  const body = { data_directory: el("data-directory").value, models_directory: el("models-directory").value, model_id: el("model-id").value.trim(), offload_dir: el("offload-directory").value.trim(), model_kind: el("model-kind").value, device: el("model-device").value, dtype: el("model-dtype").value, cpu_memory_gb: numeric("cpu-memory"), context_window: numeric("context-window"), max_new_tokens: numeric("max-tokens"), reasoning_budget: numeric("reasoning-budget"), task_planner_max_new_tokens: numeric("task-planner-tokens"), work_item_planner_max_new_tokens: numeric("work-item-planner-tokens"), tool_action_max_new_tokens: numeric("tool-action-tokens"), post_tool_decision_max_new_tokens: numeric("post-tool-tokens"), section_max_new_tokens: numeric("section-tokens"), synthesis_max_new_tokens: numeric("synthesis-tokens"), research_classifier_max_new_tokens: numeric("research-classifier-tokens"), research_notes_max_new_tokens: numeric("research-notes-tokens"), research_source_dossier_max_new_tokens: numeric("research-source-dossier-tokens"), research_seed_sources: numeric("research-seed-sources"), research_depth_passes: numeric("research-depth-passes"), research_max_sources: numeric("research-max-sources"), research_references_per_source: numeric("research-references-per-source"), research_whole_source_max_tokens: numeric("research-whole-source-tokens"), research_section_input_tokens: numeric("research-section-input-tokens"), research_source_max_characters: numeric("research-source-max-characters"), max_tool_calls_per_step: numeric("max-tool-calls"), temperature: numeric("temperature"), top_p: numeric("top-p"), trust_remote_code: el("trust-remote-code").checked };
-  el("save-settings").disabled = true;
-  try { const result = await api("/api/settings", { method: "PUT", body: JSON.stringify(body) }); el("settings-status").textContent = result.restart_required ? "Saved. Restart Local Model to apply these changes." : "Settings are up to date."; }
-  catch (error) { el("settings-status").textContent = error.message; } finally { el("save-settings").disabled = false; }
+  const body = { data_directory: el("data-directory").value, models_directory: el("models-directory").value, model_id: el("model-id").value.trim(), research_classifier_model_id: el("research-classifier-model-id").value.trim(), offload_dir: el("offload-directory").value.trim(), model_kind: el("model-kind").value, device: el("model-device").value, dtype: el("model-dtype").value, cpu_memory_gb: numeric("cpu-memory"), context_window: numeric("context-window"), max_new_tokens: numeric("max-tokens"), reasoning_budget: numeric("reasoning-budget"), task_planner_max_new_tokens: numeric("task-planner-tokens"), work_item_planner_max_new_tokens: numeric("work-item-planner-tokens"), tool_action_max_new_tokens: numeric("tool-action-tokens"), post_tool_decision_max_new_tokens: numeric("post-tool-tokens"), section_max_new_tokens: numeric("section-tokens"), synthesis_max_new_tokens: numeric("synthesis-tokens"), research_classifier_max_new_tokens: numeric("research-classifier-tokens"), research_notes_max_new_tokens: numeric("research-notes-tokens"), research_source_dossier_max_new_tokens: numeric("research-source-dossier-tokens"), research_seed_sources: numeric("research-seed-sources"), research_depth_passes: numeric("research-depth-passes"), research_max_sources: numeric("research-max-sources"), research_references_per_source: numeric("research-references-per-source"), research_whole_source_max_tokens: numeric("research-whole-source-tokens"), research_section_input_tokens: numeric("research-section-input-tokens"), research_source_max_characters: numeric("research-source-max-characters"), max_tool_calls_per_step: numeric("max-tool-calls"), temperature: numeric("temperature"), top_p: numeric("top-p"), trust_remote_code: el("trust-remote-code").checked };
+  clearTimeout(settingsSaveTimer);
+  el("settings-status").textContent = "Saving…";
+  settingsSaveQueue = settingsSaveQueue.then(async () => {
+    try {
+      const result = await api("/api/settings", { method: "PUT", body: JSON.stringify(body) });
+      settingsRestartRequired ||= result.restart_required;
+      el("settings-status").textContent = settingsRestartRequired ? "Saved. Restart Local Model to apply changes." : "Saved.";
+      return true;
+    } catch (error) {
+      el("settings-status").textContent = `Not saved: ${error.message}`;
+      return false;
+    }
+  });
+  return settingsSaveQueue;
 }
 
 async function toggleArchiveView() { if (state.busy) return; state.showArchived = !state.showArchived; await loadChats(); showBlankChat(); }
@@ -344,13 +392,13 @@ async function chatAction(chatId, action) {
   if (state.chatId === chatId) showBlankChat();
 }
 async function updateHealth() {
-  try { const health = await api("/health"); el("status-dot").className = health.status === "ready" ? "ready" : health.status === "error" ? "error" : ""; el("status-text").textContent = health.status === "ready" ? "Model ready" : health.status === "error" ? "Model error" : "Loading model…"; el("model-name").textContent = health.model ? health.model.split(/[\\/]/).pop() : ""; }
+  try { const health = await api("/health"); el("status-dot").className = health.status === "ready" ? "ready" : health.status === "error" ? "error" : ""; el("status-text").textContent = health.status === "ready" ? "Model ready" : health.status === "error" ? "Model error" : health.loading ? "Loading model…" : "Loads on first message"; el("model-name").textContent = health.model ? health.model.split(/[\\/]/).pop() : ""; }
   catch { el("status-dot").className = "error"; el("status-text").textContent = "Local Model unavailable"; }
 }
 
 el("new-chat").addEventListener("click", () => startBlankChat()); el("new-project").addEventListener("click", openProjectDialog); el("chat-project").addEventListener("click", openProjectChoice);
 el("close-project-dialog").addEventListener("click", () => el("project-dialog").close()); el("browse-project").addEventListener("click", () => chooseDirectory("project-path")); el("create-project").addEventListener("click", createProject); el("close-project-choice").addEventListener("click", () => el("project-choice-dialog").close());
-el("open-settings").addEventListener("click", openSettings); el("close-settings").addEventListener("click", () => el("settings-dialog").close()); el("save-settings").addEventListener("click", saveSettings); el("search-models").addEventListener("click", searchModels); el("hf-search").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); searchModels(); } });
+el("open-settings").addEventListener("click", openSettings); el("close-settings").addEventListener("click", () => el("settings-dialog").close()); el("search-models").addEventListener("click", searchModels); el("hf-search").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); searchModels(); } });
 document.querySelectorAll("[data-settings-tab]").forEach((button) => button.addEventListener("click", () => selectSettingsTab(button.dataset.settingsTab))); el("refresh-telemetry").addEventListener("click", loadGenerationTelemetry); el("reset-tuning-defaults").addEventListener("click", resetTuningFields);
 el("context-window").addEventListener("input", updatePromptBudgetNote); el("max-tokens").addEventListener("input", updatePromptBudgetNote);
 document.querySelectorAll(".browse-directory").forEach((button) => button.addEventListener("click", () => chooseDirectory(button.dataset.target)));
@@ -359,7 +407,8 @@ el("add-plugin").addEventListener("click", () => el("plugin-file").click()); el(
 document.addEventListener("click", (event) => { if (!event.target.closest(".plugin-control")) { el("plugin-menu").hidden = true; el("plugin-menu-button").classList.remove("active"); } });
 el("archive-view").addEventListener("click", toggleArchiveView); el("composer").addEventListener("submit", sendMessage); el("sidebar-toggle").addEventListener("click", () => document.querySelector(".shell").classList.toggle("sidebar-open"));
 el("message-input").addEventListener("input", (event) => { event.target.style.height = "auto"; event.target.style.height = `${Math.min(event.target.scrollHeight, 180)}px`; }); el("message-input").addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); el("composer").requestSubmit(); } });
-el("messages").addEventListener("click", () => { if (!state.currentArchived) el("message-input").focus(); });
+// Leave focus and selection in message text. Focusing the composer on click
+// also fires after a selection drag, clearing the selection before Ctrl+C.
 document.addEventListener("keydown", (event) => {
   if (state.busy || state.currentArchived || event.ctrlKey || event.metaKey || event.altKey || event.key.length !== 1) return;
   if (event.target.closest("input, textarea, select, button, dialog")) return;
@@ -372,3 +421,111 @@ document.addEventListener("keydown", (event) => {
 Promise.all([loadChats(), loadProjects(), updateHealth(), loadPlugins()]).then(() => showBlankChat()).catch((error) => { el("status-dot").className = "error"; el("status-text").textContent = error.message; });
 setInterval(updateHealth, 15000);
 setInterval(refreshOpenChat, 5000);
+
+let activityPolling = false;
+let activitySignature = "";
+const activityLabels = {
+  analysis_plan_saved: "Analysis plan validated", analysis_step_active: "Executing analysis step", analysis_retry: "Retrying temporary tool failure",
+  plan_step_active: "Executing plan step", plan_step_completed: "Plan step completed",
+  plan_step_result: "Saved step result", plan_action_rejected: "Repairing plan action", incomplete: "Paused with progress saved",
+  scratchpad_loaded: "Loaded working notes", checkpoint_loaded: "Restored saved progress",
+  tool_call_rejected: "Regenerating invalid tool call", tool_selection: "Tool schemas selected",
+  repeated_observation: "Repeated result detected", loop_stopped: "Stopped tool loop",
+  stop_requested: "Stopping — waiting for current operation", request_stopped: "Stopped by user",
+  request_started: "Waiting for model", model_acquired: "Preparing model",
+  planning_started: "Planning tool use", plan: "Choosing next action",
+  tool_call: "Calling tool", tool_result: "Tool finished",
+  answer: "Answer composed", request_finished: "Request finished",
+  request_failed: "Request failed or interrupted", waiting_for_input: "Waiting for input",
+  context_checkpoint: "Saving progress", approved_tool_execution_started: "Calling approved tool",
+  approved_tool_execution_finished: "Approved tool finished",
+};
+async function refreshActivity() {
+  const chatId = state.chatId;
+  const panel = el("activity-panel");
+  if (!chatId || state.currentArchived) {
+    el("stop-response").hidden = true;
+    panel.hidden = false;
+    el("activity-status").textContent = "Activity · Send a message to see progress";
+    el("activity-events").textContent = "";
+    activitySignature = "";
+    return;
+  }
+  if (activityPolling) return;
+  activityPolling = true;
+  try {
+    const data = await api(`/api/chats/${chatId}/activity`);
+    if (state.chatId !== chatId) return;
+    el("stop-response").hidden = !data.active && !data.resumable;
+    el("stop-response").textContent = data.active ? "Stop" : "Resume";
+    el("stop-response").dataset.action = data.active ? "stop" : "resume";
+    const events = data.events || [];
+    panel.hidden = false;
+    const latest = events[events.length - 1];
+    let phase = "No active foreground request · recent activity below";
+    if (data.active) {
+      phase = data.loading_model ? "Loading model" : activityLabels[latest?.event] || "Working";
+      if (latest?.event === "tool_result") phase = "Generating next action";
+      const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(data.started_at)) / 1000));
+      phase += ` · ${Math.floor(seconds / 60)}m ${seconds % 60}s elapsed`;
+    }
+    el("activity-status").textContent = `Activity · ${phase}`;
+    const signature = chatId + JSON.stringify(events);
+    if (signature !== activitySignature) {
+      activitySignature = signature;
+      el("activity-events").innerHTML = [...events].reverse().map((item) => {
+        const time = item.timestamp ? new Date(item.timestamp).toLocaleTimeString() : "";
+        const label = item.failed ? "Tool failed" : activityLabels[item.event] || item.event;
+        const heading = `${time} · ${label}${item.step_id ? ` · ${item.step_id}` : ""}${item.tool ? ` · ${item.tool}` : ""}${item.error_type ? ` · ${item.error_type}` : ""}`;
+        return item.arguments
+          ? `<details><summary>${escapeHtml(heading)}</summary><pre>${escapeHtml(item.arguments)}</pre></details>`
+          : `<div>${escapeHtml(heading)}</div>`;
+      }).join("");
+    }
+  } catch (error) {
+    if (state.chatId === chatId) {
+      panel.hidden = false;
+      el("activity-status").textContent = `Activity unavailable · ${error.message}`;
+    }
+  } finally { activityPolling = false; }
+}
+setInterval(refreshActivity, 2000);
+el("stop-response").addEventListener("click", async () => {
+  if (!state.chatId) return;
+  const button = el("stop-response");
+  const chatId = state.chatId;
+  const resuming = button.dataset.action === "resume";
+  button.disabled = true;
+  try {
+    if (resuming) {
+      button.dataset.action = "stop";
+      button.textContent = "Stop";
+      setBusy(true);
+      const pending = api(`/api/chats/${chatId}/resume`, { method: "POST" });
+      button.disabled = false;
+      await pending;
+      if (state.chatId === chatId) await openChat(chatId, { force: true });
+      await loadChats();
+    } else {
+      await api(`/api/chats/${chatId}/stop`, { method: "POST" });
+      el("activity-status").textContent = "Stopping · current token computation or tool operation may need to finish";
+    }
+  } catch (error) { window.alert(`Response control failed: ${error.message}`); }
+  finally { if (resuming) setBusy(false); button.disabled = false; await refreshActivity(); }
+});
+
+// Persist configuration controls, excluding the model search box.
+const settingsControls = [...document.querySelectorAll("#settings-dialog input, #settings-dialog select")]
+  .filter((control) => control.id !== "hf-search");
+for (const control of settingsControls) {
+  control.addEventListener("change", () => { if (settingsReady) void saveSettings(); });
+  control.addEventListener("input", () => {
+    if (!settingsReady) return;
+    clearTimeout(settingsSaveTimer);
+    el("settings-status").textContent = "Saving…";
+    const selectedModel = control.list && [...control.list.options].some((option) => option.value === control.value);
+    if (selectedModel || control.tagName === "SELECT" || control.type === "checkbox") void saveSettings();
+    else settingsSaveTimer = setTimeout(() => void saveSettings(), 400);
+  });
+}
+el("settings-dialog").addEventListener("close", () => { if (settingsReady) void saveSettings(); });

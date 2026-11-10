@@ -92,6 +92,18 @@ class ResearchPipelineTests(unittest.TestCase):
             "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC123",
             "title": "Memory mechanisms",
         }), "scholarly_candidate")
+        self.assertEqual(source_type_hint({
+            "url": "https://www.popsci.com/technology/mushroom-computers/",
+            "title": "A look inside the lab building mushroom computers",
+        }), "popular_summary")
+        self.assertEqual(source_type_hint({
+            "url": "https://news.osu.edu/powered-by-mushrooms/",
+            "title": "Powered by mushrooms",
+        }), "popular_summary")
+        self.assertEqual(source_type_hint({
+            "url": "https://royalsocietypublishing.org/doi/10.1098/rsfs.2018.0029",
+            "title": "Towards fungal computer",
+        }), "scholarly_candidate")
         self.assertEqual(evidence_role("tertiary_overview", policy), "supplemental")
         self.assertEqual(evidence_role("topic_index", policy), "disallowed")
 
@@ -152,7 +164,6 @@ class ResearchPipelineTests(unittest.TestCase):
             ledger = json.loads((root / "research" / "task-policy" / "source-ledger.json").read_text())
 
         self.assertEqual(outcome.outcome, "completed", f"{outcome.summary}: {ledger}")
-        self.assertTrue(all("source_type_hint" not in fields for fields in presented_fields))
         self.assertTrue(all("evidence_role" not in fields for fields in presented_fields))
         by_url = {source["url"]: source for source in ledger["sources"]}
         self.assertEqual(by_url[tertiary]["status"], "supplemental")
@@ -489,8 +500,10 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
             "https://papers.test/d": "## References\n[Grandchild E memory](https://papers.test/e)",
             "https://papers.test/e": "## References\n[Further F memory](https://papers.test/f)",
         }
+        classification_batch_sizes = []
 
         async def classify(goal, candidates):
+            classification_batch_sizes.append(len(candidates))
             self.assertTrue(all("url" not in candidate for candidate in candidates))
             return assessed_selection(candidates)
 
@@ -517,6 +530,8 @@ Please enable JavaScript to proceed. A required part of this site couldn’t loa
         self.assertEqual([row["depth"] for row in ledger["passes"]], [0, 1, 2])
         self.assertEqual(len([row for row in ledger["sources"] if row["depth"] == 0]), 2)
         self.assertEqual(len(ledger["sources"]), 5)
+        self.assertTrue(classification_batch_sizes)
+        self.assertEqual(set(classification_batch_sizes), {1})
         grandchild = next(row for row in ledger["sources"] if row["url"] == "https://papers.test/e")
         self.assertEqual(len(grandchild["parents"]), 2)
 

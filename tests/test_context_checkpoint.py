@@ -5,6 +5,20 @@ from local_model_app.context_checkpoint import build_semantic_checkpoint, render
 
 
 class ContextCheckpointTests(unittest.TestCase):
+    def test_entire_pack_obeys_budget_with_large_independent_sections(self):
+        record = {'checkpoint_id': 'synthetic-checkpoint', 'objective': 'x' * 8000,
+                  'acceptance_and_execution_plan': 'y' * 6000,
+                  'latest_structured_state': {'rows': ['z' * 2000] * 20},
+                  'completed_actions': [{'tool': 'lookup', 'arguments': {'q':'q'*2000},
+                                         'result': {'values':['v'*2000]*10}}] * 24,
+                  'artifacts_and_identifiers': [{'path':'p'*1000}] * 128}
+        for limit in (32000, 12000, 4000, 1024):
+            rendered = render_context_pack(record, max_characters=limit)
+            self.assertLessEqual(len(rendered), limit)
+            parsed = json.loads(rendered)
+            self.assertEqual(parsed['checkpoint_id'], 'synthetic-checkpoint')
+            self.assertTrue(parsed['context_truncated'])
+
     def test_repeated_compaction_merges_semantic_state_without_nesting_previous_pack(self) -> None:
         first_messages = [
             {"role": "assistant", "content": "", "tool_calls": [{

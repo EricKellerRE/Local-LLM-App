@@ -43,7 +43,10 @@ if (-not (Test-Path -LiteralPath $Settings)) {
 $SettingsLines = @(Get-Content -LiteralPath $Settings)
 $GridLine = $SettingsLines | Where-Object { $_ -match '^GRID_WORKSHOP_ROOT=' } | Select-Object -First 1
 $GridRoot = if ($GridLine) { ($GridLine -replace '^GRID_WORKSHOP_ROOT=', '').Trim().Trim('"').Trim("'") } else { '' }
-if (-not $GridRoot -or $GridRoot -match 'your-name') {
+if ($GridRoot -and -not [System.IO.Path]::IsPathRooted($GridRoot)) {
+    $GridRoot = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $GridRoot))
+}
+if (-not $GridRoot -or $GridRoot -match 'your-name' -or -not (Test-Path -LiteralPath $GridRoot)) {
     $GridCandidate = Join-Path (Split-Path -Parent $ProjectRoot) 'Grid-Workshop'
     if (Test-Path -LiteralPath (Join-Path $GridCandidate 'powerworld-aux-agent\pyproject.toml')) {
         $GridRoot = $GridCandidate.Replace('\', '/')

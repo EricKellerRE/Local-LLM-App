@@ -1,0 +1,14 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync('local_model_app/static/app.js', 'utf8');
+const sandbox = {escapeHtml: text => String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')};
+vm.createContext(sandbox);
+vm.runInContext(source.slice(source.indexOf('function renderMessageContent('), source.indexOf('function projectById(')), sandbox);
+const html = sandbox.renderMessageContent('Results\n\n| Case | GW |\n| --- | ---: |\n| Synthetic | 1.5 |\n\n**Units**: MW to GW.\n<script>alert(1)</script>');
+assert.ok(html.includes('<table>'));
+assert.ok(html.includes('<td>1.5</td>'));
+assert.ok(html.includes('<strong>Units</strong>'));
+assert.ok(!html.includes('<script>'));
+assert.ok(html.includes('&lt;script&gt;'));
+console.log('Synthetic report table and HTML escaping passed');

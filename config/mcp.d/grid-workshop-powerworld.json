@@ -45,6 +45,7 @@
     }
   ],
   "guidance": [
+    {"path": "${PROJECT_ROOT}/config/guidance/grid-analysis.md"},
     {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/llm_operator_guide.md", "capability": "case"},
     {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/context_management.md", "capability": "session"},
     {"path": "${GRID_WORKSHOP_ROOT}/powerworld-aux-agent/skills/scenario.md", "capability": "tornado"},
@@ -53,6 +54,8 @@
   "policy": {
     "default_access": "ask",
     "allow_tools": [
+      "workspace.resolve_inputs",
+      "case.query_objects",
       "regulatory.list_tests",
       "case.list_object_fields",
       "case.search_object_fields",

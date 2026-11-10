@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local Model</title>
-    <link rel="stylesheet" href="/static/styles.css?v=desktop-chat-8" />
+    <link rel="stylesheet" href="/static/styles.css?v=desktop-chat-selection-9" />
   </head>
   <body>
     <div class="shell">
@@ -38,11 +38,16 @@
 
         <section id="messages" class="messages" aria-live="polite"></section>
         <section id="approval-panel" class="approval-panel" hidden></section>
+        <details id="activity-panel" class="activity-panel" hidden>
+          <summary id="activity-status" aria-live="polite">Activity</summary>
+          <p>Execution events update every two seconds. Tool arguments are expandable.</p>
+          <div id="activity-events"></div>
+        </details>
 
         <form id="composer" class="composer">
           <div class="input-wrap">
             <div class="plugin-control">
-              <button id="plugin-menu-button" class="plus-button" type="button" aria-label="Tools and plugins" aria-expanded="false">＋</button>
+              <button id="plugin-menu-button" class="plus-button" type="button" aria-label="Tools and plugins" aria-expanded="false">⚡</button>
               <section id="plugin-menu" class="plugin-menu" hidden>
                 <div class="plugin-menu-heading">
                   <div><strong>Tools</strong><small>Choose what this chat can use</small></div>
@@ -54,6 +59,7 @@
             </div>
             <textarea id="message-input" rows="1" tabindex="0" placeholder="Message your local model" aria-label="Message" autofocus></textarea>
             <button id="send" type="submit" aria-label="Send message">↑</button>
+            <button id="stop-response" type="button" hidden aria-label="Stop response">■ Stop</button>
           </div>
           <p id="composer-note">Press Enter to send · Shift+Enter for a new line</p>
         </form>
@@ -78,7 +84,7 @@
     </dialog>
 
     <dialog id="settings-dialog" class="modal-dialog settings-dialog">
-      <div class="dialog-heading"><div><h2>Settings</h2><p>Model and storage changes take effect after restarting Local Model.</p></div><button id="close-settings" class="text-button" type="button">Close</button></div>
+      <div class="dialog-heading"><div><h2>Settings</h2><p>Changes save automatically. Restart Local Model to apply them.</p></div><button id="close-settings" class="text-button" type="button">Close</button></div>
       <div class="settings-tabs" role="tablist" aria-label="Settings sections">
         <button class="settings-tab active" type="button" role="tab" aria-selected="true" data-settings-tab="general">General</button>
         <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="developer">Developer</button>
@@ -98,10 +104,13 @@
           <label for="model-id">Model ID or local folder</label>
           <input id="model-id" type="text" list="installed-models" placeholder="organization/model or C:\\models\\model" />
           <datalist id="installed-models"></datalist>
+          <label for="research-classifier-model-id">Research triage model (optional)</label>
+          <input id="research-classifier-model-id" type="text" list="installed-models" placeholder="Blank uses the active model" />
+          <small>Filters source candidates only; analysis and report writing continue to use the active model.</small>
           <label>Offload folder (optional)</label>
           <div class="path-row"><input id="offload-directory" type="text" placeholder="Used when a model exceeds available memory" /><button class="text-button browse-directory" data-target="offload-directory" type="button">Browse…</button></div>
           <div class="settings-grid">
-            <label>Kind<select id="model-kind"><option value="auto">Auto</option><option value="text">Text</option><option value="multimodal">Multimodal</option></select></label>
+            <label>Kind<select id="model-kind"><option value="auto">Auto</option><option value="text">Text</option><option value="multimodal">Multimodal</option><option value="gguf">GGUF (llama.cpp)</option></select></label>
             <label>Device<select id="model-device"><option value="auto">Auto</option><option value="cpu">CPU</option><option value="cuda">CUDA</option></select></label>
             <label>Data type<select id="model-dtype"><option value="auto">Auto</option><option value="float16">float16</option><option value="bfloat16">bfloat16</option><option value="float32">float32</option></select></label>
             <label>CPU memory (GB)<input id="cpu-memory" type="number" min="1" placeholder="No limit" /></label>
@@ -170,9 +179,9 @@
         </section>
       </div>
       <p id="settings-status" class="dialog-status"></p>
-      <div class="dialog-actions"><button id="save-settings" class="primary-button" type="button">Save settings</button></div>
+
     </dialog>
 
-    <script src="/static/app.js?v=desktop-chat-9" defer></script>
+    <script src="/static/app.js?v=structured-plan-12" defer></script>
   </body>
 </html>

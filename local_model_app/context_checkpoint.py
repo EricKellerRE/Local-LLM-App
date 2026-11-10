@@ -236,7 +236,7 @@ def build_semantic_checkpoint(
     return record
 
 
-def render_context_pack(record: dict[str, Any]) -> str:
+def _render_context_pack(record: dict[str, Any]) -> str:
     """Render a bounded model-facing pack while the full structured record stays on disk."""
     pack = {
         key: record.get(key)
@@ -289,3 +289,31 @@ def render_context_pack(record: dict[str, Any]) -> str:
     pack["latest_structured_state"] = _bounded(pack["latest_structured_state"], 4000)
     pack["recent_messages"] = []
     return json.dumps(pack, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def render_context_pack(record: dict[str, Any], *, max_characters: int = 32000) -> str:
+    """Bound the entire pack, not just each of its independently bounded fields.
+
+    The full record remains on disk. Keep valid JSON and explicitly mark omissions.
+    """
+    limit = max(1024, max_characters)
+    pack = json.loads(_render_context_pack(record))
+    serialize = lambda: json.dumps(pack, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
+    if len(serialize()) > limit:
+        pack['context_truncated'] = True
+        pack['recent_messages'] = []
+        pack['user_requirements'] = []  # The original user request is sent separately.
+    while len(serialize()) > limit:
+        candidates = [(len(json.dumps(value, ensure_ascii=False)), key) for key, value in pack.items()
+                      if key not in {'checkpoint_id', 'context_truncated'}]
+        size, key = max(candidates)
+        value = pack[key]
+        if isinstance(value, list) and len(value) > 1:
+            pack[key] = value[len(value)//2:]
+        elif isinstance(value, str) and len(value) > 128:
+            pack[key] = value[:len(value)//2] + ' [truncated]'
+        elif size > 256:
+            pack[key] = _bounded(value, max(64, size//3))
+        else:
+            del pack[key]
+    return serialize()
