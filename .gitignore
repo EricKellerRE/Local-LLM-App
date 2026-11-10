@@ -17,3 +17,11 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
+runtimes/
+portable-dist/
+readiness_patch/
+synthetic-workflow-check/
+synthetic-script-experiment/
+config/app-settings.json
+deliverables/
+verification-*.json

@@ -15,6 +15,7 @@ class AppSettingsStoreTests(unittest.TestCase):
             self.assertEqual(paths.data_directory, (root / "data").resolve())
             self.assertEqual(paths.models_directory, (root / "models").resolve())
             self.assertEqual(store.public_settings()["max_new_tokens"], 8192)
+            self.assertEqual(store.public_settings()["research_classifier_model_id"], "")
             self.assertEqual(store.public_settings()["tool_action_max_new_tokens"], 192)
             self.assertEqual(store.public_settings()["post_tool_decision_max_new_tokens"], 256)
             self.assertEqual(store.public_settings()["section_max_new_tokens"], 768)
@@ -37,6 +38,7 @@ class AppSettingsStoreTests(unittest.TestCase):
                 "data_directory": str(root / "chosen-data"),
                 "models_directory": str(root / "chosen-models"),
                 "model_id": "owner/model",
+                "research_classifier_model_id": "google/gemma-3-1b-it",
                 "device": "cuda",
                 "context_window": 32768,
                 "max_new_tokens": 900,
@@ -63,6 +65,7 @@ class AppSettingsStoreTests(unittest.TestCase):
             })
 
             self.assertEqual(saved["model_id"], "owner/model")
+            self.assertEqual(saved["research_classifier_model_id"], "google/gemma-3-1b-it")
             self.assertEqual(saved["device"], "cuda")
             self.assertEqual(saved["context_window"], 32768)
             self.assertEqual(saved["reasoning_budget"], 400)

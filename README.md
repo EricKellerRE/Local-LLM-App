@@ -80,6 +80,7 @@ The usual settings are in `.env`:
 | Setting | Purpose |
 | --- | --- |
 | `LOCAL_MODEL_ID` | Hugging Face repository ID or local model directory. |
+| `LOCAL_RESEARCH_CLASSIFIER_MODEL_ID` | Optional lightweight Transformers model for research-source triage; blank uses the main model. |
 | `LOCAL_MODEL_DEVICE` | `auto`, `cpu`, or `cuda`. |
 | `LOCAL_MODEL_DTYPE` | `auto`, `float16`, `bfloat16`, or `float32`. |
 | `LOCAL_MODEL_CPU_MEMORY_GB` | Optional CPU memory ceiling. |
@@ -124,3 +125,25 @@ For architecture and roadmap details, see [PROJECT.md](PROJECT.md). For plugin m
 - `scripts/mcp_everything_smoke.py` checks interoperability with the official MCP Everything reference server.
 
 The Grid Workshop plugin's HTTP backend is declared as an owned companion process. Enabling the plugin starts the backend and MCP bridge together; disabling it or closing Local Model stops both. A detached Grid MCP task worker can finish independently; Local Model reconnects to its persisted task record on the next launch.
+
+### Structured tool execution
+
+Tool-enabled chats use a persisted execution plan. Each step declares its dependencies, input/output variable names, and eligible tools. The host validates the plan and tool arguments, substitutes exact variable references, and stores full observations separately from the model context. The model receives the current step, bounded previews, and tool schemas; it can read stored results by JSON pointer instead of rediscovering them. Scratchpad prose is supplementary, not execution state.
+
+Plans live in `data/tool_activity/<chat-id>.plan.json`; referenced observations live beside them in `<chat-id>.plan.results/`. Successful identical calls reuse stored evidence. Failed identical calls require repair rather than automatic reexecution. Outputs bind to successful result values, and a step cannot complete before its declared outputs exist. Approval resumes the same plan. An interrupted call with an unknown outcome pauses rather than risking a duplicate execution. Activity shows step IDs and completion events. A completed plan is execution evidence, not an independent guarantee that the model interpreted the data correctly.
+
+Numeric variables include a unit report with source evidence. Supported tool unit metadata takes precedence over explicit unit-bearing column labels such as `InstalledMW`; a variable's chosen name never determines its unit. Unrecognized units remain unknown. MW quantities include a host-computed GW equivalent. `host__convert_units` records conversions as result evidence and requires an explicit power factor for MVA/GVA to MW/GW. Generic arithmetic results without unit metadata remain unknown rather than receiving guessed units.
+
+Run `python -m unittest tests.test_plan_execution` for synthetic execution-state coverage and `python scripts/gguf_workflow_smoke.py` for the real GGUF plus synthetic CSV workflow. The legacy coordinator remains available explicitly with `structured_plans=False` for regression testing.
+
+### Flexible case analysis
+
+Read-only case questions now use a model-authored per-case analysis plan instead of the fixed 345 kV report. The model chooses fields, filters, measures, and output columns. The host validates the entire plan before querying a case, executes one case at a time, and saves each completed operation before advancing. The Activity panel shows the case number and current step.
+
+The supported operations are selection, filtering, aggregation (`count`, `sum`, `mean`, `min`, `max`), unit conversion, and binary arithmetic on saved quantities. Initial object types are Branch, Gen, and Bus. Organizational tag inspection supports attribution decisions without putting raw object exports into model context. Selections use complete exports, verify row counts, and deduplicate identities; conflicting duplicates fail explicitly. Catalog units take precedence. Unknown units require a stated assumption; MVA-to-GW conversion requires a power factor. Unmatched organizational searches remain unknown rather than reporting zero assets.
+
+Plans and typed intermediate values persist outside chat context. Resume reuses completed operations. Invalid fields, references, and unit combinations return a bounded correction opportunity with the rejected plan. Explicit transient read-only transport failures receive one retry; successful requests and unknown-outcome calls are never blindly repeated. Failed cases remain visible in the report while subsequent cases continue. This validates execution, not the model's interpretation of ownership or the user's intended question.
+
+Examples include “Count Alpha branches whose endpoints are both 138 kV,” “Find Alpha's average installed generator capacity in GW,” and “Find the longest Alpha 345 kV line in miles.” Grouped reports, arbitrary Python execution, and simulator mutations are not part of this analysis interface; other plugin tasks retain the general planner.
+
+Run `python -m unittest tests.test_analysis_plan` for synthetic operation and recovery checks. `python scripts/flexible_analysis_smoke.py` asks the configured local GGUF three different questions using two fresh synthetic PowerWorld cases and an isolated plugin backend. It never opens user cases. `--replay <synthetic-run-directory>` reexecutes saved model-authored plans for executor regression testing without regenerating them.

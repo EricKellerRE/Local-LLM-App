@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from local_model_app.config import Settings
+from local_model_app.cancellation import check_stopped, generation_stop_requested, stop_event
 from local_model_app.generation_context import current_generation_context
 
 
@@ -351,7 +352,9 @@ class TransformersModel:
         generation_class: str = "ordinary_response",
         telemetry_context: dict[str, Any] | None = None,
     ) -> AssistantReply:
+        check_stopped()
         self._load()
+        check_stopped()
         import torch
 
         assert self.model is not None
@@ -381,8 +384,13 @@ class TransformersModel:
         else:
             generate_kwargs["do_sample"] = False
         started = time.monotonic()
+        if stop_event.get() is not None:
+            from transformers import StoppingCriteriaList
+            generate_kwargs['stopping_criteria'] = StoppingCriteriaList([generation_stop_requested])
+        check_stopped()
         with torch.inference_mode():
             output = self.model.generate(**inputs, **generate_kwargs)
+        check_stopped()
         elapsed_seconds = time.monotonic() - started
         new_tokens = output[0][inputs["input_ids"].shape[-1] :]
         generated_tokens = int(new_tokens.shape[-1])
@@ -410,6 +418,9 @@ class TransformersModel:
             except (ImportError, AttributeError, KeyError, TypeError, ValueError):
                 content, reasoning, parsed_tool_calls = cleaned_content, None, []
 
+        # Some Transformers parsers use ``None`` rather than an empty list
+        # when a normal assistant response contains no tool calls.
+        parsed_tool_calls = parsed_tool_calls or []
         tool_calls = []
         for call in parsed_tool_calls:
             if isinstance(call, dict):

@@ -36,6 +36,33 @@ class FakeApprovalModel:
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_failed_approval_records_repair_context_without_reexecution(self):
+        from unittest.mock import AsyncMock
+        with TemporaryDirectory(dir=Path.cwd()) as directory:
+            root=Path(directory)
+            store=ChatStore(root/'data'/'chats.sqlite3')
+            chat=store.create_chat()
+            store.set_plugin_selected(chat['id'],'grid-workshop.powerworld',selected=True)
+            state_path=root/'data'/'tool_activity'/f"{chat['id']}.state.json"
+            state_path.parent.mkdir(parents=True,exist_ok=True)
+            state_path.write_text(json.dumps({'status':'waiting_for_approval',
+                'plugin_id':'grid-workshop.powerworld','exposed_tool':'grid__synthetic','arguments':{}}))
+            runtime=Runtime.__new__(Runtime)
+            runtime.store=store
+            runtime.mcp=FakeApprovalManager()
+            runtime.mcp.call_tool=AsyncMock(side_effect=RuntimeError('Synthetic missing AUX artifact'))
+            runtime._inference_lock=asyncio.Lock()
+            with patch('local_model_app.server.ROOT',root):
+                with self.assertRaisesRegex(RuntimeError,'Synthetic missing'):
+                    asyncio.run(runtime.approve_tool_call(chat['id']))
+                with self.assertRaisesRegex(RuntimeError,'already been consumed'):
+                    asyncio.run(runtime.approve_tool_call(chat['id']))
+            note=(root/'data'/'scratchpads'/f"{chat['id']}.jsonl").read_text()
+            self.assertIn('Synthetic missing AUX artifact',note)
+            self.assertIn('Repair the input/tool choice',note)
+            runtime.mcp.call_tool.assert_awaited_once()
+            store.close()
+
     def test_pending_approval_executes_and_resumes_exactly_once(self) -> None:
         with TemporaryDirectory(dir=Path.cwd()) as directory:
             root = Path(directory)

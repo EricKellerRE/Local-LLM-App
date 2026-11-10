@@ -340,7 +340,8 @@ class TaskStore:
                     return None
                 updated = self._connection.execute(
                     """UPDATE tasks SET status = ?, lease_owner = ?, lease_expires_at = ?,
-                       episode_count = episode_count + 1, updated_at = ?
+                       episode_count = episode_count + 1, next_run_at = NULL,
+                       waiting_reason = NULL, last_error = NULL, updated_at = ?
                        WHERE id = ? AND status = ?""",
                     (
                         TaskStatus.RUNNING.value,

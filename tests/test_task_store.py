@@ -156,8 +156,15 @@ class TaskStoreTests(unittest.TestCase):
             self.assertEqual(store.claim_task("new-worker")["id"], task["id"])
 
             retry_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-            store.release_task(task["id"], TaskStatus.WAITING, next_run_at=retry_at)
-            self.assertEqual(store.claim_task("new-worker")["id"], task["id"])
+            store.release_task(
+                task["id"], TaskStatus.WAITING, next_run_at=retry_at,
+                waiting_reason="retry_scheduled", error="transient",
+            )
+            reclaimed = store.claim_task("new-worker")
+            self.assertEqual(reclaimed["id"], task["id"])
+            self.assertIsNone(reclaimed["next_run_at"])
+            self.assertIsNone(reclaimed["waiting_reason"])
+            self.assertIsNone(reclaimed["last_error"])
             store.close()
 
 

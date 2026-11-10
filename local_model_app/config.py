@@ -13,12 +13,20 @@ def _load_dotenv(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        path_keys = {'GRID_WORKSHOP_ROOT', 'LOCAL_LLAMA_SERVER', 'LOCAL_MODEL_OFFLOAD_DIR'}
+        if value and (key in path_keys or (key in {'LOCAL_MODEL_ID', 'LOCAL_RESEARCH_CLASSIFIER_MODEL_ID'} and value.lower().endswith('.gguf'))):
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute():
+                value = str((path.parent / candidate).resolve())
+        os.environ.setdefault(key, value)
 
 
 @dataclass(frozen=True)
 class Settings:
     model_id: str
+    research_classifier_model_id: str
     model_kind: str
     device: str
     cpu_memory_gb: int | None
@@ -58,6 +66,7 @@ class Settings:
         response_budget = int(os.getenv("LOCAL_MODEL_MAX_NEW_TOKENS", "8192"))
         return cls(
             model_id=os.getenv("LOCAL_MODEL_ID", "").strip(),
+            research_classifier_model_id=os.getenv("LOCAL_RESEARCH_CLASSIFIER_MODEL_ID", "").strip(),
             model_kind=os.getenv("LOCAL_MODEL_KIND", "auto").strip().lower(),
             device=os.getenv("LOCAL_MODEL_DEVICE", "auto").strip().lower(),
             cpu_memory_gb=(int(os.environ["LOCAL_MODEL_CPU_MEMORY_GB"]) if os.getenv("LOCAL_MODEL_CPU_MEMORY_GB") else None),
@@ -76,7 +85,7 @@ class Settings:
             ),
             section_max_new_tokens=int(os.getenv("LOCAL_SECTION_MAX_NEW_TOKENS", "768")),
             synthesis_max_new_tokens=int(os.getenv("LOCAL_SYNTHESIS_MAX_NEW_TOKENS", str(response_budget))),
-            research_classifier_max_new_tokens=int(os.getenv("LOCAL_RESEARCH_CLASSIFIER_MAX_NEW_TOKENS", "256")),
+            research_classifier_max_new_tokens=int(os.getenv("LOCAL_RESEARCH_CLASSIFIER_MAX_NEW_TOKENS", "5")),
             research_notes_max_new_tokens=int(os.getenv("LOCAL_RESEARCH_NOTES_MAX_NEW_TOKENS", "768")),
             research_source_dossier_max_new_tokens=int(
                 os.getenv("LOCAL_RESEARCH_SOURCE_DOSSIER_MAX_NEW_TOKENS", "1536")

@@ -11,7 +11,7 @@ from local_model_app.workflow_skills import WorkflowSkillRegistry
 
 
 class RuntimePluginRequestTests(unittest.TestCase):
-    def test_source_classifier_distinguishes_a_primary_paper_from_a_research_summary(self) -> None:
+    def test_source_classifier_combines_topic_label_with_deterministic_genre(self) -> None:
         captured = {}
 
         class FakeModel:
@@ -23,23 +23,38 @@ class RuntimePluginRequestTests(unittest.TestCase):
             def generate(self, messages, **kwargs):
                 captured["messages"] = messages
                 captured["kwargs"] = kwargs
-                return '{"keep_numbers":[],"needs_abstract_numbers":[],"assessments":[]}'
+                return "DIRECT"
 
         runtime = Runtime.__new__(Runtime)
-        runtime.model = FakeModel()
+        runtime.model = Mock()
+        runtime.research_classifier_model = FakeModel()
         runtime._inference_lock = asyncio.Lock()
         runtime._active_operations = {}
-        runtime.ensure_loaded = AsyncMock()
+        runtime.ensure_classifier_loaded = AsyncMock()
 
-        asyncio.run(runtime.classify_references("memory", [{"number": 1, "title": "Research summary"}]))
+        result = asyncio.run(runtime.classify_references(
+            "fungal computing\nUser requirements: Cover electrical signaling, logic, and sensing. Produce a report.", [{
+            "number": 1,
+            "title": "A review of fungal computing",
+            "host_type_hint": "scholarly_candidate",
+        }]))
 
         prompt = captured["messages"][0]["content"]
-        self.assertIn("genre of the document actually supplied", prompt)
-        self.assertIn("university research profile", prompt)
-        self.assertIn("merely describes original research", prompt)
-        self.assertIn("missing venue/publication identity", prompt)
-        self.assertIn("decisive genre clues", prompt)
+        self.assertIn("Classify topical fit", prompt)
+        self.assertIn("shares broad entities or keywords", prompt)
+        self.assertIn("DIRECT, ADJACENT, or UNCLEAR", prompt)
+        self.assertIn("GOAL: fungal computing", captured["messages"][1]["content"])
+        self.assertIn("Requested scope: electrical signaling, logic, and sensing", captured["messages"][1]["content"])
+        self.assertIn("TITLE: A review of fungal computing", captured["messages"][1]["content"])
         self.assertEqual(captured["kwargs"]["generation_class"], "research_relevance")
+        self.assertEqual(result.keep_numbers, {1})
+        self.assertEqual(result.assessments[1]["document_type"], "scholarly_review")
+        self.assertEqual(
+            result.assessments[1]["qualifiers"],
+            ["topic label: direct; host genre: scholarly_candidate"],
+        )
+        runtime.ensure_classifier_loaded.assert_awaited_once()
+        runtime.model.generate.assert_not_called()
 
     def test_task_planning_and_report_synthesis_use_separate_budgets(self) -> None:
         calls = []
@@ -129,6 +144,7 @@ class RuntimePluginRequestTests(unittest.TestCase):
             ["grid-workshop.powerworld"],
         )
         self.assertEqual(runtime.requested_plugins("Just explain this paragraph."), [])
+        self.assertEqual(runtime.requested_plugins("Using the Grid Workshop plugin, examine these cases."), ["grid-workshop.powerworld"])
 
     def test_settings_reject_impossible_token_budgets(self) -> None:
         common = {
@@ -156,6 +172,16 @@ class RuntimePluginRequestTests(unittest.TestCase):
         self.assertTrue(policy["follow_supplemental_references"])
         self.assertFalse(policy["supplemental_counts_toward_target"])
         self.assertIsNone(Runtime._explicit_source_policy("Write a broad report using appropriate sources."))
+
+        scholarly_policy = Runtime._explicit_source_policy(
+            "Use primary scholarly sources for the evidence corpus; literature reviews may be used only for "
+            "reference mining and should not count toward the primary-source target."
+        )
+        self.assertEqual(scholarly_policy["core_types"], ["primary_study"])
+        self.assertEqual(
+            scholarly_policy["supplemental_types"],
+            ["systematic_review", "scholarly_review"],
+        )
 
     def test_durable_research_chat_instantiates_the_workflow_skill(self) -> None:
         captured = {}

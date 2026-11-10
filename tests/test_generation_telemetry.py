@@ -18,7 +18,8 @@ class FakeTokenizer:
         return "done"
 
     def parse_response(self, tokens, prefix=None, tools=None):
-        return {"content": "done", "tool_calls": []}
+        # Transformers parsers may use None for an ordinary response.
+        return {"content": "done", "tool_calls": None}
 
     def encode(self, text, add_special_tokens=False):
         return [10] * len(text.split())
@@ -69,6 +70,7 @@ class GenerationTelemetryTests(unittest.TestCase):
                 generation = json.load(stream)
 
         self.assertEqual(reply.generated_tokens, 2)
+        self.assertEqual(reply.tool_calls, [])
         self.assertEqual(reply.stop_reason, "eos")
         self.assertEqual(record["generation_class"], "post_tool_decision")
         self.assertEqual(record["task_id"], "task-1")
