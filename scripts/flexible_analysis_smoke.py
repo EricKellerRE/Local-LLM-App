@@ -19,6 +19,7 @@ from local_model_app.tool_coordinator import ToolCoordinator
 from synthetic_grid_fixture import create_fixture
 
 async def main():
+    only=int(sys.argv[sys.argv.index('--question')+1]) if '--question' in sys.argv else None
     replay=Path(sys.argv[sys.argv.index('--replay')+1]).resolve() if '--replay' in sys.argv else None
     if replay and not replay.is_relative_to((ROOT/'synthetic-workflow-check').resolve()): raise ValueError('Replay must be a synthetic experiment')
     out=ROOT/'synthetic-workflow-check'/('flexible-'+uuid.uuid4().hex);out.mkdir(parents=True)
@@ -56,7 +57,11 @@ async def main():
             ('What is the average installed maximum generator capacity in GW for Alpha? Do not use dispatch.',[.75,1.5]),
             ('What is the maximum line length in miles among Alpha branches with BOTH endpoints at 345 kV? The synthetic fixture defines line length in miles.',[20,40]),
         ]
+        if not replay:
+            tests.append(('List the matching Alpha branch objects with BOTH endpoints at 345 kV. Return the matching objects, not only a count.',[2,2]))
+        if only is not None and not 1<=only<=len(tests): raise ValueError('Question index is out of range')
         for index,(question,expected) in enumerate(tests):
+            if only is not None and index+1!=only: continue
             started=time.monotonic(); path=out/str(index);path.mkdir()
             if replay:
                 from tests.test_tool_coordinator import FakeModel
@@ -74,8 +79,8 @@ async def main():
             actual=[]
             for case in cases:
                 row=execution.get(case,{})
-                actual.append([row.get('values',{}).get(o['source'],{}).get('value') for o in program.get('outputs',[])])
-            passed=actual==[[value] for value in expected] and all(r.get('status')=='completed' for r in execution.values())
+                actual.append([row.get('values',{}).get(o['source'],{}).get('value',row.get('values',{}).get(o['source'],{}).get('count')) for o in program.get('outputs',[])])
+            passed=(actual==[[value] for value in expected] if index<3 else all(values and all(v==expected[i] for v in values) for i,values in enumerate(actual)) and any(r.get('values',{}).get(o['source'],{}).get('kind')=='selection' for r in execution.values() for o in program.get('outputs',[]))) and all(r.get('status')=='completed' for r in execution.values())
             results.append({'question':question,'passed':passed,'expected':expected,'actual':actual,'seconds':round(time.monotonic()-started,2)})
             print(json.dumps(results[-1]),flush=True)
             (out/'results.json').write_text(json.dumps(results,indent=2),encoding='utf-8')

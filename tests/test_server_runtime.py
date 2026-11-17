@@ -11,6 +11,34 @@ from local_model_app.workflow_skills import WorkflowSkillRegistry
 
 
 class RuntimePluginRequestTests(unittest.TestCase):
+    def test_planner_discards_truncated_json_and_retries_within_context(self):
+        runtime=Runtime.__new__(Runtime)
+        runtime._inference_lock=asyncio.Lock();runtime._active_operations={}
+        runtime.ensure_loaded=AsyncMock()
+        runtime.model=SimpleNamespace(
+            settings=SimpleNamespace(max_new_tokens=8192,tool_action_max_new_tokens=1024,tool_temperature=0),
+            native_context_window=4096,count_prompt_tokens=Mock(return_value=2000),
+            chat=Mock(side_effect=[AssistantReply(content='{"unfinished":',tool_calls=[],stop_reason='length'),
+                                   AssistantReply(content='{"work_items": []}',tool_calls=[],stop_reason='completed')]))
+        answer=asyncio.run(runtime.task_generate([{'role':'user','content':'Plan synthetic work'}]))
+        self.assertEqual(answer,'{"work_items": []}')
+        calls=runtime.model.chat.call_args_list
+        self.assertEqual(calls[0].kwargs['max_new_tokens'],1024)
+        self.assertEqual(calls[1].kwargs['max_new_tokens'],1968)
+        self.assertNotIn('{"unfinished":',str(calls[1].args))
+
+    def test_planner_reports_repeated_overflow_without_returning_partial_json(self):
+        runtime=Runtime.__new__(Runtime)
+        runtime._inference_lock=asyncio.Lock();runtime._active_operations={}
+        runtime.ensure_loaded=AsyncMock()
+        runtime.model=SimpleNamespace(
+            settings=SimpleNamespace(max_new_tokens=8192,tool_action_max_new_tokens=1024,tool_temperature=0),
+            native_context_window=None,
+            chat=Mock(return_value=AssistantReply(content='{',tool_calls=[],stop_reason='length')))
+        with self.assertRaisesRegex(RuntimeError,'output limit twice'):
+            asyncio.run(runtime.task_generate([{'role':'user','content':'Plan'}]))
+        self.assertEqual(runtime.model.chat.call_count,2)
+
     def test_source_classifier_combines_topic_label_with_deterministic_genre(self) -> None:
         captured = {}
 
@@ -67,6 +95,12 @@ class RuntimePluginRequestTests(unittest.TestCase):
                 temperature=0.7,
                 section_max_new_tokens=3072,
             )
+
+            native_context_window = None
+
+            def chat(self, messages, **kwargs):
+                calls.append(kwargs)
+                return AssistantReply(content='ok',tool_calls=[],stop_reason='completed')
 
             def generate(self, messages, **kwargs):
                 calls.append(kwargs)
@@ -162,6 +196,7 @@ class RuntimePluginRequestTests(unittest.TestCase):
         self.assertTrue(Runtime._durable_request("Research the literature and write a report", False))
         self.assertTrue(Runtime._durable_request("Optimize this grid until the metric improves", True))
         self.assertFalse(Runtime._durable_request("Explain voltage stability", True))
+        self.assertFalse(Runtime._durable_request('Find lines in case.pwb; investigate the organizational tags.', True))
 
     def test_explicit_primary_source_policy_keeps_reviews_only_for_reference_mining(self) -> None:
         policy = Runtime._explicit_source_policy(

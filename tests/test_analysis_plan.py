@@ -167,7 +167,7 @@ class AnalysisTests(unittest.TestCase):
             root=Path(directory); case=str(root/'synthetic.pwb')
             search=make_tool('case.search_object_fields'); query=make_tool('case.query_objects')
             bad=gen_plan(); bad['steps'][0]['fields'].append('BadField')
-            model=FakeModel([action('host__run_analysis',**bad),action('host__run_analysis',**gen_plan())])
+            model=FakeModel([action('host__run_analysis',**bad),*[action('host__add_step',step=step) for step in gen_plan()['steps']],action('host__finish_analysis',outputs=gen_plan()['outputs'])])
             manager=FakeManager([search,query],{})
             async def call(name,args):
                 manager.calls.append((name,args))

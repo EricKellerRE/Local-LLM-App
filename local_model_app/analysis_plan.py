@@ -108,7 +108,7 @@ def validate_plan(program, catalogs):
             else: unit=calculation_unit(step['method'],types[refs[0]]['unit'],types[refs[1]]['unit'])
             types[name]={'kind':'quantity','unit':unit}
     for output in program['outputs']:
-        if types.get(output['source'],{}).get('kind')!='quantity': raise ValueError('Report outputs must reference computed quantities.')
+        if output['source'] not in types: raise ValueError('Report outputs must reference saved selections or quantities.')
     return types
 
 def calculation_unit(method,left,right):
@@ -241,21 +241,39 @@ class Executor:
             else: record['status']='completed'; self.save()
         return state
 
-def render(program,state):
+def render(program,state,artifact_base=None):
     def safe(v): return str(v).replace('|','\\|').replace('\n',' ')
     lines=['| Case | '+' | '.join(safe(o['label']) for o in program['outputs'])+' | Status |',
            '| --- | '+' | '.join('---:' for _ in program['outputs'])+' | --- |']
-    notes=[]
+    notes=[]; selections=[]
     names=[case.replace('\\','/').rsplit('/',1)[-1] for case in state['cases']]
     for case,record in state['cases'].items():
         cells=[]
         for output in program['outputs']:
             quantity=record['values'].get(output['source'],{}); value=quantity.get('value')
-            cells.append('Unknown' if value is None else f'{value:,.6g} '+safe(quantity['unit']))
+            if quantity.get('kind')=='selection':
+                cells.append(('Unresolved; ' if quantity.get('unresolved') else '')+str(quantity['count'])+' objects')
+                notes.append(output['label']+' in '+case+': complete selection at '+quantity['path'])
+                selections.append((case,output['label'],quantity))
+            else:
+                cells.append('Unknown' if value is None else f'{value:,.6g} '+safe(quantity['unit']))
             notes.extend(quantity.get('notes',[]))
-        status=record['status'] if record['status']=='failed' else ('unresolved' if 'Unknown' in cells else 'completed')
+        status=record['status'] if record['status']!='completed' else ('unresolved' if any(c=='Unknown' or c.startswith('Unresolved;') for c in cells) else 'completed')
         parts=case.replace('\\','/').split('/')
         display=parts[-1] if names.count(parts[-1])==1 else '/'.join(parts[-2:])
         lines.append('| '+safe(display)+' | '+' | '.join(cells)+' | '+status+' |')
         if record.get('error'): notes.append(case+': '+record['error'])
+    # A readable bounded preview, with the complete selection retained on disk.
+    from .analysis_context import inspect_selection
+    for case,label,selection in selections:
+        page=inspect_selection(selection,limit=5)
+        lines.extend(['',safe(label)+' — '+safe(case.replace('\\','/').rsplit('/',1)[-1])+':'])
+        if artifact_base:
+            lines.append('[Download complete matching objects]('+artifact_base+'/'+Path(selection['path']).name+')')
+        if page['rows']:
+            fields=list(page['rows'][0])
+            lines.extend(['','| '+' | '.join(safe(f) for f in fields)+' |','| '+' | '.join('---' for f in fields)+' |'])
+            lines.extend('| '+' | '.join(safe(row[f]) for f in fields)+' |' for row in page['rows'])
+        else: lines.append('No matching objects'+(' were established; attribution remains unresolved.' if selection.get('unresolved') else '.'))
+        if page['next_offset'] is not None: lines.append('Showing 5 of '+str(page['count'])+' objects; the saved selection contains all rows.')
     return '\n'.join(lines+['']+['- '+safe(n) for n in dict.fromkeys(notes)])

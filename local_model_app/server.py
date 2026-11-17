@@ -395,13 +395,27 @@ class Runtime:
                 settings.max_new_tokens,
                 int(getattr(settings, "task_planner_max_new_tokens", max(1024, settings.tool_action_max_new_tokens))),
             )
-            return await asyncio.to_thread(
-                self.model.generate,
-                messages,
-                max_new_tokens=planner_budget,
-                temperature=settings.tool_temperature,
-                generation_class="task_planning",
-            )
+            wire = list(messages)
+            for attempt in range(2):
+                window = self.model.native_context_window
+                if window:
+                    used = await asyncio.to_thread(self.model.count_prompt_tokens, wire)
+                    planner_budget = min(planner_budget, window - used - 128)
+                if planner_budget < 128:
+                    raise RuntimeError("Task planning has insufficient context space for a complete response. Shorten the request or increase the context window.")
+                reply = await asyncio.to_thread(
+                    self.model.chat, wire, max_new_tokens=planner_budget,
+                    temperature=settings.tool_temperature, generation_class="task_planning",
+                )
+                if reply.stop_reason != "length":
+                    return reply.content
+                if attempt:
+                    raise RuntimeError("Task planning reached its output limit twice. The incomplete response was discarded; no partial plan was executed. Use a smaller task or increase the planning output budget.")
+                planner_budget = min(settings.max_new_tokens, max(planner_budget * 2, 2048), 4096)
+                wire.append({"role":"user", "content":
+                    "The previous response reached the output limit and was discarded. Return a complete, compact JSON response. "
+                    "Use short descriptions and only the minimum necessary work items. Do not repeat the request or capability catalog. "
+                    "Do not continue the unfinished JSON; regenerate the complete object."})
 
     @tracked_activity("a final report is being written")
     async def task_synthesize(self, messages: list[dict[str, Any]]) -> str:
@@ -686,7 +700,7 @@ class Runtime:
         durable_markers = (
             "overnight", "while i am away", "while i'm away", "keep working", "long-running",
             "long running", "comprehensive report", "detailed report", "literature review",
-            "deep research", "research this", "research the", "investigate the", "investigate this",
+            "deep research", "research this", "research the",
         )
         iterative_markers = (
             "optimize", "optimise", "improve the grid", "improve this grid", "iterate until",
@@ -1532,6 +1546,30 @@ async def stop_chat(chat_id: str, request: Request):
         event.set()
         service._log_activity(service.data_directory / "tool_activity" / f"{chat_id}.jsonl", "stop_requested")
     return {"stopping": event is not None}
+
+
+@app.get('/api/chats/{chat_id}/analysis/selections/{filename}')
+async def analysis_selection_artifact(chat_id: str, filename: str, request: Request):
+    service=runtime(request)
+    try:
+        service.store.get_chat(chat_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404,detail='Chat not found') from exc
+    if not re.fullmatch(r'[a-f0-9]{20}\.json',filename):
+        raise HTTPException(status_code=404,detail='Selection not found')
+    root=service.data_directory/'tool_activity'
+    plan_path=root/f'{chat_id}.plan.json'
+    try:
+        state=json.loads(plan_path.read_text(encoding='utf-8'))
+        selection_root=(root/f'{chat_id}.plan.results'/'selections').resolve()
+        paths={Path(value['path']).resolve() for record in state.get('analysis_execution',{}).get('cases',{}).values()
+               for value in record.get('values',{}).values() if value.get('kind')=='selection'}
+        target=(selection_root/filename).resolve()
+        if target.parent!=selection_root or target not in paths or not target.is_file():
+            raise ValueError('Unregistered selection')
+    except (OSError,ValueError,KeyError) as exc:
+        raise HTTPException(status_code=404,detail='Selection not found') from exc
+    return FileResponse(target,filename=filename,media_type='application/json')
 
 
 @app.get("/api/chats/{chat_id}/activity")

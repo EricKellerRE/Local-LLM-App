@@ -25,6 +25,7 @@ function renderMessageContent(text) {
   const escaped = escapeHtml(text);
   const inline = (value) => value
     .replace(/\[([^\]]+)\]\((\/api\/tasks\/[a-zA-Z0-9-]+\/artifacts\/[a-zA-Z0-9._-]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/\[([^\]]+)\]\((\/api\/chats\/[a-zA-Z0-9-]+\/analysis\/selections\/[a-f0-9]{20}\.json)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
     .replace(/`([^`\n]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   const lines = escaped.split('\n');
